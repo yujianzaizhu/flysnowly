@@ -1,0 +1,1399 @@
+"""任务控制：自动建图（含孤岛识别）、自动分区、割草、回充与断点续作。"""
+
+import math
+import threading
+from collections import deque
+
+import planner
+import world
+
+LOW_BATTERY = 30.0
+RESUME_BATTERY = 80.0
+DEFAULT_MOWING_MODE = "A"
+MAX_ZONE_PLAN_PASSES = 8
+
+NAV_SPEED = 0.38
+MAP_SPEED = 0.50
+MOW_SPEED = 0.48
+
+MIN_OUTER_AREA = 12.0
+ISLAND_AREA = 8.0
+
+PHASE_LABELS = {
+    "idle": "待机",
+    "map_seek": "寻找场地边界",
+    "map_follow": "逆时针巡边建图",
+    "map_escape": "脱离孤岛",
+    "to_zone": "前往割草区域",
+    "zone_edge": "沿区域边缘割草",
+    "zone_plan": "规划弓字轨迹",
+    "to_segment": "前往弓字起点",
+    "zone_stripes": "弓字割草",
+    "detour": "绕障并回到历史路径",
+    "ring": "绕障碍物一周",
+    "charge_go": "返回充电桩",
+    "charging": "充电中",
+    "charge_return": "返回任务断点",
+    "align": "对齐断点航向",
+    "to_dock": "返回充电桩",
+    "done": "任务完成",
+}
+
+MOW_PHASES = {"zone_edge", "zone_stripes", "detour", "ring"}
+CHARGE_EXEMPT = {
+    "charging", "charge_go", "charge_return", "align", "done", "idle", "to_dock",
+}
+
+
+class TaskManager(object):
+    def __init__(self, robot, grid):
+        self.robot = robot
+        self.grid = grid
+        self.lock = threading.RLock()
+        self.task_serial = 0
+        self._last_collisions = 0
+        self._reset_state()
+
+    # ----------------------------------------------------------- 基础状态
+    def _reset_state(self):
+        self.task = None
+        self.phase = "idle"
+        self.message = "等待任务"
+        self.zone_order = []
+        self.zone_index = 0
+        self.zone_id = None
+        self.zone_stage = None
+        self.edge_points = []
+        self.edge_index = 0
+        self.segments = []
+        self.segment_index = 0
+        self.segment = None
+        self.segment_end = None
+        self.route = []
+        self.route_index = 0
+        self.nav_goal = None
+        self.route_kind = None
+        self.replan_cooldown = 0.0
+        self.breakpoint = None
+        self.charge_reason = None
+        self.resume_requested = False
+        self.zone_plan_passes = 0
+        self.failed_segments = set()
+        self.lane_axis = "h"
+        self.rings_done = False
+        self.mowing_mode = DEFAULT_MOWING_MODE
+        self.edge_done = False
+        self.edge_resume_target = -1
+        self.edge_resume_attempts = 0
+        self.edge_start_sim = None
+        self.edge_guard_log_time = 0.0
+        self.ring_clipped = False
+        self.ring_lost_time = 0.0
+        self.ring_scan_time = 0.0
+        self.ring_scan_heading = 0.0
+        self.task_start_sim = None
+        self.task_end_sim = None
+        self.ring_points = []
+        self.ring_index = 0
+        self.ring_after = None
+        self.ring_started = False
+        self.ring_circles = []
+        self.ring_circle = None
+        self.phase_time = 0.0
+        self.last_phase = None
+        self.stuck_time = 0.0
+        self.stuck_ref = None
+        self.detour_start = None
+        self.detour_distance = 0.0
+        self.detour_source = None
+        self.align_target = 0.0
+        self.bypassed_circles = []
+        self.history = deque(maxlen=800)
+        self._prev_pose = None
+
+        self.map_path = []
+        self.map_path_dist = 0.0
+        self.map_islands = []
+        self.map_seek_log_time = 0.0
+        self.map_escape_heading = 0.0
+        self.map_escape_time = 0.0
+        self.map_escape_dist = 0.0
+
+    def _log(self, level, message):
+        self.message = message
+        self.robot.log(level, message)
+
+    def _pose(self):
+        return self.robot.pose[0], self.robot.pose[1], self.robot.pose[2]
+
+    def _zone(self, zone_id=None):
+        target = self.zone_id if zone_id is None else zone_id
+        for zone in self.grid.zones:
+            if zone["id"] == target:
+                return zone
+        return None
+
+    # ----------------------------------------------------------- 对外指令
+    def start_mapping(self):
+        with self.lock:
+            self._reset_state()
+            self.grid.reset_map()
+            self.task_serial += 1
+            self.task_start_sim = self.robot.sim_time
+            self.task_end_sim = None
+            self.task = {"type": "map", "mode": self.mowing_mode}
+            self.phase = "map_seek"
+            self._log("event", "开始自动建图：从当前位置逆时针巡边")
+
+    def start_mowing(self, zone_order, mode=None):
+        with self.lock:
+            available = [zone["id"] for zone in self.grid.zones]
+            if not available:
+                raise ValueError("请先完成自动建图，生成割草区域")
+            selected_mode = str(mode or DEFAULT_MOWING_MODE).upper()
+            if selected_mode not in ("A", "B"):
+                raise ValueError("割草模式仅支持 A/B")
+            order = _validate_zones(zone_order, available)
+            self._reset_state()
+            self.mowing_mode = selected_mode
+            self.task_serial += 1
+            self.task_start_sim = self.robot.sim_time
+            self.task_end_sim = None
+            self.grid.reset_mowed()
+            self.task = {"type": "mow", "zones": order, "mode": selected_mode}
+            self.zone_order = order
+            self.zone_index = 0
+            self.zone_id = order[0]
+            self.phase = "to_zone"
+            self._log(
+                "event",
+                "开始自动割草（{} 模式），区域顺序：{}".format(
+                    selected_mode, ", ".join(str(z) for z in order)
+                ),
+            )
+            self._plan_to_zone_corner()
+
+    def stop_task(self, reason="任务已停止"):
+        with self.lock:
+            if self.task is not None or self.charge_reason is not None:
+                self._log("warn", reason)
+            self._reset_state()
+            self.robot.stop()
+
+    def request_charge(self):
+        with self.lock:
+            if self.phase in ("charge_go", "charge_return", "charging"):
+                return
+            self._save_breakpoint()
+            self.charge_reason = "manual"
+            self.resume_requested = False
+            self.phase = "charge_go"
+            self._log("event", "收到手动回充指令，保存任务并返回充电桩")
+            self._set_route((world.DOCK["x"], world.DOCK["y"]), "to_dock")
+
+    def request_resume(self):
+        with self.lock:
+            if self.phase not in ("charging", "charge_go"):
+                return
+            self.resume_requested = True
+            self._log("event", "收到继续任务指令")
+
+    def reset(self):
+        with self.lock:
+            self._reset_state()
+
+    # ----------------------------------------------------------- 主循环
+    def tick(self, dt):
+        with self.lock:
+            readings = self.robot.scan()
+            pose = self._pose()
+            self.grid.update_from_scan(pose, readings, world.VISION_RANGE)
+
+            step = 0.0
+            if self._prev_pose is not None:
+                step = math.hypot(pose[0] - self._prev_pose[0], pose[1] - self._prev_pose[1])
+            self._prev_pose = pose
+            if step > 0.02:
+                self.history.append((pose[0], pose[1]))
+
+            self._check_battery()
+            if self.task is None and self.phase == "idle":
+                controls = None
+            else:
+                controls = self._control(dt, step)
+                self.robot.drive(*controls)
+            self.robot.step(dt)
+
+            if self.phase in MOW_PHASES:
+                self.grid.mark_mowed(self.robot.pose[0], self.robot.pose[1])
+
+            self._update_progress(dt)
+
+            if self.robot.collisions > self._last_collisions:
+                self._last_collisions = self.robot.collisions
+                self._on_bump()
+
+            self.replan_cooldown = max(0.0, self.replan_cooldown - dt)
+
+    def _update_progress(self, dt):
+        if self.phase != self.last_phase:
+            self.last_phase = self.phase
+            self.phase_time = 0.0
+            self.stuck_ref = None
+        else:
+            self.phase_time += dt
+
+        pose = (self.robot.pose[0], self.robot.pose[1])
+        if self.stuck_ref is None:
+            self.stuck_ref = pose
+            self.stuck_time = 0.0
+        elif math.hypot(pose[0] - self.stuck_ref[0], pose[1] - self.stuck_ref[1]) > 0.05:
+            self.stuck_ref = pose
+            self.stuck_time = 0.0
+        else:
+            self.stuck_time += dt
+
+        if self.phase == "to_segment" and (self.phase_time > 25.0 or self.stuck_time > 5.0):
+            self._skip_segment()
+        if self.phase == "ring" and self.phase_time > 35.0:
+            self._log("warn", "绕障超时，结束本次绕障并重新规划")
+            self._finish_ring()
+        if (
+            self.phase == "zone_edge"
+            and self.edge_start_sim is not None
+            and self.robot.sim_time - self.edge_start_sim > 90.0
+        ):
+            self._log("warn", "沿边超时，跳过剩余边缘并继续任务")
+            self._finish_edge_phase()
+        if self.phase == "map_follow" and self.stuck_time > 2.2:
+            nearest = _front_distance(self.robot.vision, 50.0)
+            x, y, theta = self._pose()
+            if nearest is not None:
+                hit_x = x + math.cos(theta + nearest[1]) * nearest[0]
+                hit_y = y + math.sin(theta + nearest[1]) * nearest[0]
+                self.map_escape_heading = math.atan2(y - hit_y, x - hit_x)
+            else:
+                self.map_escape_heading = world.wrap_angle(theta + math.pi)
+            self.map_escape_time = 0.0
+            self.map_escape_dist = 0.0
+            self.map_path = []
+            self.map_path_dist = 0.0
+            self.phase = "map_escape"
+            self.last_phase = None
+            self._log("warn", "巡边受阻，脱离障碍物后重新寻找外墙")
+
+    def _skip_segment(self):
+        self._log("warn", "弓字线段起点不可达，跳过并重新规划剩余区域")
+        if self.segment is not None:
+            self.failed_segments.add(_segment_key(self.segment))
+        self.segment_index += 1
+        if self.segment_index < len(self.segments):
+            self.phase = "to_segment"
+            self._goto_segment(self.segment_index)
+            self.last_phase = None
+        else:
+            self.phase = "zone_plan"
+            self.last_phase = None
+
+    def _check_battery(self):
+        if not self.task:
+            return
+        if self.phase in CHARGE_EXEMPT:
+            return
+        if self.charge_reason:
+            return
+        if self.robot.battery <= LOW_BATTERY:
+            self._save_breakpoint()
+            self.charge_reason = "low"
+            self.phase = "charge_go"
+            self._log(
+                "warn",
+                "电量低于 {:.0f}%，保存任务并自动返回充电桩".format(LOW_BATTERY),
+            )
+            self._set_route((world.DOCK["x"], world.DOCK["y"]), "to_dock")
+
+    # ----------------------------------------------------------- 控制分发
+    def _control(self, dt, step):
+        phase = self.phase
+        if phase in ("idle", "done"):
+            return 0.0, 0.0
+        if phase == "map_seek":
+            return self._map_seek()
+        if phase == "map_follow":
+            return self._map_follow(dt)
+        if phase == "map_escape":
+            return self._map_escape(dt, step)
+        if phase == "to_zone":
+            return self._nav_step(NAV_SPEED)
+        if phase == "zone_edge":
+            return self._edge_step()
+        if phase == "zone_plan":
+            self._plan_stripes()
+            return 0.0, 0.0
+        if phase == "to_segment":
+            return self._nav_step(NAV_SPEED)
+        if phase == "zone_stripes":
+            return self._stripe_step()
+        if phase == "detour":
+            return self._detour_step(step)
+        if phase == "ring":
+            return self._ring_step(dt)
+        if phase in ("charge_go", "to_dock", "charge_return"):
+            return self._nav_step(NAV_SPEED)
+        if phase == "charging":
+            return self._charging_step()
+        if phase == "align":
+            return self._align_step()
+        return 0.0, 0.0
+
+    # ----------------------------------------------------------- 建图
+    def _map_seek(self):
+        nearest = _front_distance(self.robot.vision, 20.0)
+        x, y, theta = self._pose()
+        if nearest is not None and nearest[0] < 0.85:
+            hit_x = x + math.cos(theta + nearest[1]) * nearest[0]
+            hit_y = y + math.sin(theta + nearest[1]) * nearest[0]
+            if self._near_known_island(hit_x, hit_y):
+                return 0.12, 1.3
+            # 只有贴近场地外墙的命中才作为建图起点；
+            # 场内障碍物先绕开，避免把孤岛当作场地边界。
+            if world.boundary_distance(hit_x, hit_y) > 0.42:
+                if self.robot.sim_time - self.map_seek_log_time > 2.0:
+                    self.map_seek_log_time = self.robot.sim_time
+                    self._log("info", "视觉命中场内障碍物，绕开后继续寻找外墙")
+                steer = -1.0 if nearest[1] >= 0.0 else 1.0
+                return 0.26, steer
+            self.phase = "map_follow"
+            self.map_path = [(x, y)]
+            self.map_path_dist = 0.0
+            self._log("event", "视觉发现边界，开始逆时针巡边")
+            return self._map_follow(0.02)
+        return MAP_SPEED, 0.0
+
+    def _map_follow(self, dt):
+        v, w = self._follow_surface(MAP_SPEED, 0.45)
+        x, y, _ = self._pose()
+        if not self.map_path:
+            self.map_path.append((x, y))
+        else:
+            last_x, last_y = self.map_path[-1]
+            moved = math.hypot(x - last_x, y - last_y)
+            if moved > 0.08:
+                self.map_path.append((x, y))
+                self.map_path_dist += moved
+                if len(self.map_path) > 4000:
+                    del self.map_path[:1000]
+
+        result = self._check_mapping_loop()
+        if result is not None:
+            return 0.0, 0.0
+        return v, w
+
+    def _check_mapping_loop(self):
+        path = self.map_path
+        if len(path) < 20:
+            return None
+        x, y, _ = self._pose()
+
+        if (
+            self.map_path_dist > 10.0
+            and math.hypot(x - path[0][0], y - path[0][1]) < 0.55
+        ):
+            area = abs(_polygon_area(path))
+            if area >= MIN_OUTER_AREA:
+                self._finish_mapping()
+                return "complete"
+            self._escape_island(path)
+            return "island"
+
+        for index in range(len(path) - 20):
+            previous = path[index]
+            if math.hypot(x - previous[0], y - previous[1]) < 0.30:
+                segment = path[index:]
+                if _path_length(segment) > 1.8:
+                    area = abs(_polygon_area(segment))
+                    if 0.2 < area < ISLAND_AREA:
+                        self._escape_island(segment)
+                        return "island"
+                break
+        return None
+
+    def _escape_island(self, path):
+        if not path:
+            self.phase = "map_seek"
+            return
+        cx = sum(point[0] for point in path) / len(path)
+        cy = sum(point[1] for point in path) / len(path)
+        radius = max(math.hypot(point[0] - cx, point[1] - cy) for point in path) + 0.2
+        self.map_islands.append({"x": round(cx, 2), "y": round(cy, 2), "r": round(radius, 2)})
+        x, y, _ = self._pose()
+        self.map_escape_heading = math.atan2(y - cy, x - cx)
+        self.map_escape_time = 0.0
+        self.map_escape_dist = 0.0
+        self.phase = "map_escape"
+        self.map_path = []
+        self.map_path_dist = 0.0
+        self._log("warn", "识别到孤岛，已脱离并重新寻找真正的场地边界")
+
+    def _map_escape(self, dt, step):
+        x, y, theta = self._pose()
+        self.map_escape_time += dt
+        self.map_escape_dist += step
+        err = world.wrap_angle(self.map_escape_heading - theta)
+        v = 0.45 if abs(err) < 1.0 else 0.0
+        w = world.clamp(2.0 * err, -1.5, 1.5)
+        front = _front_distance(self.robot.vision, 18.0)
+        if front is not None and front[0] < 0.45:
+            v = 0.15
+            w = 1.2
+        if self.map_escape_dist > 2.5 or self.map_escape_time > 5.0:
+            self.phase = "map_seek"
+            self._log("info", "脱离完成，继续寻找场地边界")
+        return v, w
+
+    def _near_known_island(self, x, y):
+        for island in self.map_islands:
+            if math.hypot(x - island["x"], y - island["y"]) < island["r"] + 0.5:
+                return True
+        return False
+
+    def _finish_mapping(self):
+        self.grid.build_free_area(self._pose()[:2])
+        zones = self.grid.partition_zones()
+        self._log(
+            "event",
+            "建图完成：自动划分 {} 个割草区域，返回充电桩".format(len(zones)),
+        )
+        self.phase = "to_dock"
+        self._set_route((world.DOCK["x"], world.DOCK["y"]), "map_dock")
+
+    # ----------------------------------------------------------- 区域导航
+    def _plan_to_zone_corner(self):
+        zone = self._zone()
+        if zone is None:
+            self.phase = "idle"
+            return
+        x, y, _ = self._pose()
+        corners = self._zone_edge_points(zone)
+        target = min(corners, key=lambda p: math.hypot(p[0] - x, p[1] - y))
+        self._set_route(target, "to_zone")
+
+    def _zone_edge_points(self, zone):
+        width = max(1e-6, (zone["x1"] - zone["x0"]) * (zone["y1"] - zone["y0"]))
+        fill = zone["free"] * self.grid.cell * self.grid.cell / width
+        if fill < 0.92:
+            return planner.edge_route_grid(self.grid, zone, self._pose()[:2])
+        return planner.edge_route(zone, self._pose()[:2])
+
+    def _enter_zone(self):
+        zone = self._zone()
+        if zone is None:
+            self.phase = "zone_plan"
+            return
+        self.edge_points = []
+        self.edge_index = 0
+        self.edge_resume_target = -1
+        self.edge_resume_attempts = 0
+        self.zone_plan_passes = 0
+        self.failed_segments = set()
+        self.lane_axis = "h"
+        self.rings_done = False
+        self.edge_done = False
+        if self.mowing_mode == "B":
+            self.zone_stage = "stripes"
+            self.phase = "zone_plan"
+            self._log("event", "进入区域 {}：B 模式，先规划弓字覆盖".format(self.zone_id))
+        else:
+            self.edge_points = self._zone_edge_points(zone)
+            self.zone_stage = "edge"
+            self.edge_start_sim = self.robot.sim_time
+            self.phase = "zone_edge"
+            self._log("event", "进入区域 {}：先沿边缘割草一周".format(self.zone_id))
+
+    def _edge_step(self):
+        if not self.edge_points:
+            self.phase = "zone_plan"
+            return 0.0, 0.0
+        x, y, theta = self._pose()
+        target = self.edge_points[self.edge_index]
+        distance = math.hypot(target[0] - x, target[1] - y)
+        if distance < 0.22:
+            self.edge_index += 1
+            self.edge_resume_target = -1
+            self.edge_resume_attempts = 0
+            if self.edge_index >= len(self.edge_points):
+                self._finish_edge_phase()
+            return 0.0, 0.0
+        if self._front_hits_zone():
+            self._begin_detour("edge")
+            return 0.0, 0.0
+        err = world.wrap_angle(math.atan2(target[1] - y, target[0] - x) - theta)
+        v = 0.42 * max(0.2, 1.0 - abs(err) / 1.5) if abs(err) < 1.2 else 0.0
+        w = world.clamp(2.2 * err, -1.4, 1.4)
+        return self._wall_guard(v, w)
+
+    def _wall_guard(self, v, w):
+        readings = self.robot.vision
+        if not readings:
+            return v, w
+        relative, distance = min(readings, key=lambda item: item[1])
+        if distance < 0.20:
+            steer = -1.4 if relative >= 0.0 else 1.4
+            return 0.0, world.clamp(w + steer, -1.6, 1.6)
+        return v, w
+
+    # ----------------------------------------------------------- 弓字覆盖
+    def _plan_stripes(self):
+        zone = self._zone()
+        if not self.task or zone is None:
+            if self.task and self.task["type"] == "mow":
+                self._complete_zone()
+            else:
+                self.phase = "idle"
+            return
+        for circle in self.grid.obstacle_circles(zone):
+            self.grid.stamp_obstacle(circle["x"], circle["y"], circle["r"])
+        raw_segments = planner.lane_segments(self.grid, zone, axis=self.lane_axis)
+        filtered = [
+            segment for segment in raw_segments if _segment_key(segment) not in self.failed_segments
+        ]
+        pose = self._pose()
+        self.segments = planner.order_segments(filtered, pose[:2], pose[2])
+        self.segment_index = 0
+        self.zone_plan_passes += 1
+        if self.zone_plan_passes > MAX_ZONE_PLAN_PASSES:
+            self._finish_zone_coverage()
+            return
+        if not self.segments and self.lane_axis == "h":
+            coverage = self.grid.zone_coverage(self.zone_id)
+            if coverage < 0.93:
+                self.lane_axis = "v"
+                self.zone_plan_passes = 0
+                vertical = planner.lane_segments(self.grid, zone, axis="v")
+                filtered = [
+                    segment
+                    for segment in vertical
+                    if _segment_key(segment) not in self.failed_segments
+                ]
+                self.segments = planner.order_segments(filtered, pose[:2], pose[2])
+                if self.segments:
+                    self._log("info", "区域 {} 进行纵向补割".format(self.zone_id))
+        if not self.segments:
+            self._finish_zone_coverage()
+            return
+        self._log(
+            "info",
+            "区域 {} 规划弓字线段 {} 条".format(self.zone_id, len(self.segments)),
+        )
+        self._goto_segment(0)
+
+    def _start_final_edge(self):
+        zone = self._zone()
+        if zone is None:
+            self._complete_zone()
+            return
+        self.edge_points = self._zone_edge_points(zone)
+        self.edge_index = 0
+        self.zone_stage = "edge_final"
+        self.edge_done = False
+        self.edge_start_sim = self.robot.sim_time
+        self.phase = "zone_edge"
+        self._log("info", "区域 {} 弓字完成，开始沿边割草".format(self.zone_id))
+
+    def _finish_zone_coverage(self):
+        """B 模式先补割再沿边；A 模式先沿边再补割。"""
+        if self.mowing_mode == "B":
+            if not self.edge_done:
+                self._start_final_edge()
+            else:
+                self._complete_zone()
+            return
+        if self.lane_axis == "v" and self._plan_rings():
+            return
+        self._complete_zone()
+
+    def _goto_segment(self, index):
+        if index >= len(self.segments):
+            self.phase = "zone_plan"
+            return
+        self.segment_index = index
+        a, b = self.segments[index]
+        self.segment = (a, b)
+        self.segment_end = b
+        x, y, _ = self._pose()
+        if math.hypot(a[0] - x, a[1] - y) < 0.25:
+            self.route = []
+            self.phase = "zone_stripes"
+        else:
+            self._set_route(a, "to_segment")
+            self.phase = "to_segment"
+
+    def _stripe_step(self):
+        if not self.segment:
+            self.phase = "zone_plan"
+            return 0.0, 0.0
+        x, y, theta = self._pose()
+        target = self.segment_end
+        distance = math.hypot(target[0] - x, target[1] - y)
+        if distance < 0.12:
+            self.segment_index += 1
+            if self.segment_index < len(self.segments):
+                self._goto_segment(self.segment_index)
+            else:
+                self.phase = "zone_plan"
+            return 0.0, 0.0
+
+        if self._front_hits_zone():
+            self._begin_detour("stripes")
+            return 0.0, 0.0
+
+        err = world.wrap_angle(math.atan2(target[1] - y, target[0] - x) - theta)
+        v = MOW_SPEED * max(0.18, 1.0 - abs(err) / 1.5) if abs(err) < 1.2 else 0.0
+        w = world.clamp(2.4 * err, -1.5, 1.5)
+        return self._wall_guard(v, w)
+
+    def _complete_zone(self):
+        coverage = self.grid.zone_coverage(self.zone_id)
+        self._log(
+            "event",
+            "区域 {} 割草完成，覆盖率 {:.0f}%".format(self.zone_id, coverage * 100.0),
+        )
+        self.segments = []
+        self.segment = None
+        self.zone_index += 1
+        if self.zone_index < len(self.zone_order):
+            self.zone_id = self.zone_order[self.zone_index]
+            self.zone_stage = None
+            self.zone_plan_passes = 0
+            self.phase = "to_zone"
+            self._plan_to_zone_corner()
+            self._log("info", "前往下一个区域 {}".format(self.zone_id))
+        else:
+            self.zone_id = None
+            self.phase = "to_dock"
+            self._log("event", "全部区域割草完成，返回充电桩")
+            self._set_route((world.DOCK["x"], world.DOCK["y"]), "mow_dock")
+
+    # ----------------------------------------------------------- 绕障
+    def _front_hits_zone(self, max_angle=18.0, max_distance=0.55):
+        x, y, theta = self._pose()
+        best = None
+        for relative, distance in self.robot.vision:
+            if abs(math.degrees(relative)) > max_angle:
+                continue
+            if distance >= max_distance:
+                continue
+            if best is None or distance < best[1]:
+                best = (relative, distance)
+        if best is None:
+            return False
+        hit_x = x + math.cos(theta + best[0]) * best[1]
+        hit_y = y + math.sin(theta + best[0]) * best[1]
+        zone = self._zone()
+        if zone is None:
+            return False
+        margin = 0.10
+        return (
+            zone["x0"] + margin <= hit_x <= zone["x1"] - margin
+            and zone["y0"] + margin <= hit_y <= zone["y1"] - margin
+        )
+
+    def _begin_detour(self, source):
+        if self.phase in ("detour", "ring"):
+            return
+        x, y, _ = self._pose()
+        circle = self._nearest_circle(x, y, 1.0)
+
+        if circle is not None and self._is_bypassed(circle):
+            self._log("info", "该障碍物已绕行过，跳过二次绕障并重新规划")
+            if source == "edge":
+                self._resume_edge_route()
+            else:
+                if self.segment is not None:
+                    self.failed_segments.add(_segment_key(self.segment))
+                self.phase = "zone_plan"
+            self.last_phase = None
+            return
+
+        if (
+            self.mowing_mode == "B"
+            and source == "stripes"
+            and circle is not None
+            and circle.get("kind") == "large"
+        ):
+            self.grid.stamp_obstacle(circle["x"], circle["y"], circle["r"])
+            self.bypassed_circles.append(dict(circle))
+            if self.segment is not None:
+                self.failed_segments.add(_segment_key(self.segment))
+            self.phase = "zone_plan"
+            self.last_phase = None
+            self._log("info", "遇到大型障碍物：掉头并重新规划弓字")
+            return
+
+        if circle is not None:
+            zone = self._zone()
+            points = planner.ring_route(circle, (x, y), grid=self.grid, zone=zone)
+            if not points:
+                self.bypassed_circles.append(dict(circle))
+                self._log("warn", "障碍物周围被其他障碍遮挡，跳过绕障并重新规划")
+                if source == "edge":
+                    self._resume_edge_route()
+                else:
+                    if self.segment is not None:
+                        self.failed_segments.add(_segment_key(self.segment))
+                    self.phase = "zone_plan"
+                self.last_phase = None
+                return
+            self.detour_source = source
+            self.ring_circle = circle
+            self.ring_points = points
+            self.ring_index = 0
+            self.ring_after = "detour"
+            self.ring_started = False
+            self.ring_clipped = len(points) < planner.RING_STEPS
+            self.ring_lost_time = 0.0
+            self.ring_scan_time = 0.0
+            self.phase = "ring"
+            self.route = []
+            self._log(
+                "warn",
+                "巡迹遇到障碍物，绕障碍物一周（半径 {:.2f} m）".format(circle["r"]),
+            )
+            if self.ring_clipped:
+                self._log("info", "绕障路径触及区域边界，只沿本区域内的弧段绕行")
+            return
+
+        self.detour_start = (x, y)
+        self.detour_distance = 0.0
+        self.detour_source = source
+        self.phase = "detour"
+        self.route = []
+        self._log("warn", "巡迹遇到障碍物，开始绕障一周")
+
+    def _nearest_circle(self, x, y, limit):
+        zone = self._zone()
+        circles = self.grid.obstacle_circles(zone)
+        best = None
+        for circle in circles:
+            distance = math.hypot(circle["x"] - x, circle["y"] - y)
+            if distance <= circle["r"] + limit and (best is None or distance < best[0]):
+                best = (distance, circle)
+        return best[1] if best else None
+
+    def _is_bypassed(self, circle):
+        for known in self.bypassed_circles:
+            if math.hypot(circle["x"] - known["x"], circle["y"] - known["y"]) < max(
+                0.55, known["r"] + 0.4
+            ):
+                return True
+        return False
+
+    def _ring_step(self, dt=0.02):
+        if not self.ring_points:
+            self._finish_ring()
+            return 0.0, 0.0
+        x, y, theta = self._pose()
+        circle = self.ring_circle
+        if circle is not None and circle.get("kind") == "small":
+            if self.ring_scan_time > 0.0:
+                err = world.wrap_angle(self.ring_scan_heading - theta)
+                self.ring_scan_time -= dt
+                if abs(err) < 0.18 or self.ring_scan_time <= 0.0:
+                    self.ring_scan_time = 0.0
+                    self.ring_lost_time = 0.0
+                else:
+                    return 0.0, world.clamp(2.2 * err, -1.5, 1.5)
+            elif self._obstacle_visible(circle):
+                self.ring_lost_time = 0.0
+            else:
+                self.ring_lost_time += dt
+                if self.ring_lost_time > 0.5:
+                    self.ring_lost_time = 0.0
+                    self.ring_scan_time = 0.8
+                    self.ring_scan_heading = math.atan2(circle["y"] - y, circle["x"] - x)
+                    self._log("info", "小障碍物进入视觉盲区，花瓣式旋转探明后继续绕障")
+                    err = world.wrap_angle(self.ring_scan_heading - theta)
+                    return 0.0, world.clamp(2.2 * err, -1.5, 1.5)
+        if not self.ring_started:
+            target = self.ring_points[min(1, len(self.ring_points) - 1)]
+            err = world.wrap_angle(math.atan2(target[1] - y, target[0] - x) - theta)
+            if abs(err) > 0.30:
+                return 0.0, world.clamp(2.0 * err, -1.5, 1.5)
+            self.ring_started = True
+        target = self.ring_points[self.ring_index]
+        if math.hypot(target[0] - x, target[1] - y) < 0.15:
+            self.ring_index += 1
+            if self.ring_index >= len(self.ring_points):
+                self._finish_ring()
+                return 0.0, 0.0
+            target = self.ring_points[self.ring_index]
+        err = world.wrap_angle(math.atan2(target[1] - y, target[0] - x) - theta)
+        v = 0.34 * max(0.2, 1.0 - abs(err) / 1.5) if abs(err) < 1.3 else 0.0
+        w = world.clamp(2.2 * err, -1.4, 1.4)
+        return v, w
+
+    def _obstacle_visible(self, circle):
+        range_limit = world.VISION_RANGE - 0.02
+        for relative, distance in self.robot.vision:
+            if distance >= range_limit:
+                continue
+            x, y, theta = self._pose()
+            hit_x = x + math.cos(theta + relative) * distance
+            hit_y = y + math.sin(theta + relative) * distance
+            if math.hypot(hit_x - circle["x"], hit_y - circle["y"]) < circle["r"] + 0.30:
+                return True
+        return False
+
+    def _finish_ring(self):
+        self.ring_points = []
+        self.ring_index = 0
+        self.ring_started = False
+        after = self.ring_after
+        self.ring_after = None
+        if self.ring_circle is not None:
+            self.bypassed_circles.append(dict(self.ring_circle))
+            self.ring_circle = None
+        clipped = self.ring_clipped
+        self.ring_clipped = False
+        self.ring_scan_time = 0.0
+        self.ring_lost_time = 0.0
+        if after == "detour":
+            if clipped:
+                self._log("info", "绕障在区域边界结束，沿区域边界继续任务")
+            self._finish_detour()
+        elif after == "rings":
+            self._next_ring()
+        else:
+            self.phase = "zone_plan"
+
+    def _detour_step(self, step):
+        self.detour_distance += step
+        v, w = self._follow_surface(0.32, 0.45, front_limit=0.55)
+        x, y, _ = self._pose()
+        zone = self._zone()
+        if zone is not None and not (
+            zone["x0"] + 0.05 <= x <= zone["x1"] - 0.05
+            and zone["y0"] + 0.05 <= y <= zone["y1"] - 0.05
+        ):
+            if self.robot.sim_time - self.edge_guard_log_time > 2.0:
+                self.edge_guard_log_time = self.robot.sim_time
+                self._log("info", "沿边绕障触及区域边界，返回本区域边缘")
+            self._finish_detour()
+            return 0.0, 0.0
+        if self.detour_start is not None:
+            returned = math.hypot(x - self.detour_start[0], y - self.detour_start[1]) < 0.20
+            if self.detour_distance > 2.2 and returned:
+                self._finish_detour()
+                return 0.0, 0.0
+        if self.detour_distance > 9.0:
+            self._finish_detour()
+            return 0.0, 0.0
+        return self._wall_guard(v, w)
+
+    def _finish_detour(self):
+        self._log("event", "绕障完成并回到历史路径")
+        if self.detour_source == "edge" and self.edge_points:
+            self._resume_edge_route()
+        else:
+            self.phase = "zone_plan"
+        self.detour_start = None
+        self.detour_distance = 0.0
+
+    def _finish_edge_phase(self):
+        self.edge_done = True
+        self.edge_resume_target = -1
+        self.edge_resume_attempts = 0
+        self.edge_start_sim = None
+        self._log("info", "区域 {} 边缘已完成".format(self.zone_id))
+        if self.zone_stage == "edge_final":
+            self._complete_zone()
+        else:
+            self.zone_stage = "stripes"
+            self.phase = "zone_plan"
+
+    def _resume_edge_route(self):
+        if not self.edge_points:
+            self.zone_stage = "stripes"
+            self.phase = "zone_plan"
+            return
+        if self.edge_index >= len(self.edge_points):
+            self._finish_edge_phase()
+            return
+        if self.edge_resume_target == self.edge_index:
+            self.edge_resume_attempts += 1
+        else:
+            self.edge_resume_target = self.edge_index
+            self.edge_resume_attempts = 1
+        if self.edge_resume_attempts > 3:
+            self.edge_index += 1
+            self.edge_resume_target = -1
+            self.edge_resume_attempts = 0
+            self._log("warn", "区域边缘存在不可达点，跳过并继续沿边")
+            if self.edge_index >= len(self.edge_points):
+                self._finish_edge_phase()
+            else:
+                self._resume_edge_route()
+            return
+        target = self.edge_points[self.edge_index]
+        x, y, _ = self._pose()
+        # 沿区域边缘继续，不走跨区域的全局 A*，避免绕障后离开当前区域。
+        if math.hypot(target[0] - x, target[1] - y) < 0.25:
+            self.phase = "zone_edge"
+            return
+        self.phase = "zone_edge"
+
+    def _on_bump(self):
+        if self.phase == "ring":
+            self._log("warn", "环形绕障受阻，跳过该障碍并重新规划")
+            if self.ring_circle is not None:
+                self.bypassed_circles.append(dict(self.ring_circle))
+                self.ring_circle = None
+            self.ring_points = []
+            self.ring_index = 0
+            if self.ring_after == "detour":
+                self._finish_detour()
+            elif self.ring_after == "rings":
+                self._next_ring()
+            else:
+                self.phase = "zone_plan"
+            return
+        if self.phase == "detour":
+            self._log("warn", "沿边绕障受阻，跳过该段并重新规划")
+            self.detour_start = None
+            self.detour_distance = 0.0
+            if self.detour_source == "edge":
+                self._finish_edge_phase()
+            else:
+                if self.segment is not None:
+                    self.failed_segments.add(_segment_key(self.segment))
+                self.phase = "zone_plan"
+            return
+        if self.phase == "zone_plan":
+            circle = self._nearest_circle(self._pose()[0], self._pose()[1], 1.0)
+            if circle is not None:
+                self.grid.stamp_obstacle(circle["x"], circle["y"], circle["r"])
+                self.bypassed_circles.append(dict(circle))
+            self.phase = "zone_plan"
+        elif self.phase in ("zone_edge", "zone_stripes"):
+            self._begin_detour(self.phase)
+        elif self.phase in ("to_zone", "to_segment", "charge_go", "charge_return", "to_dock"):
+            self._replan_route()
+
+    # ----------------------------------------------------------- 沿边控制
+    def _follow_surface(self, speed, desired, front_limit=0.38):
+        readings = self.robot.vision
+        front = _front_distance(readings, 15.0)
+        right = _right_surface_distance(readings)
+        if front is not None and front[0] < front_limit:
+            return 0.16, 1.6
+        nearest = min(d for _, d in readings) if readings else world.VISION_RANGE
+        if nearest < 0.30:
+            return 0.14, 1.6
+        if right is None:
+            return 0.35, -0.9
+        if right < 0.30:
+            return 0.30, 1.2
+        if right < desired - 0.08:
+            return min(speed, 0.40), 0.7
+        if right > desired + 0.20:
+            return min(speed, 0.40), -0.8
+        return speed, 0.0
+
+    # ----------------------------------------------------------- 导航
+    def _set_route(self, goal, kind):
+        goal = (float(goal[0]), float(goal[1]))
+        self.nav_goal = goal
+        self.route_kind = kind
+        x, y, _ = self._pose()
+        path = self.grid.plan((x, y), goal)
+        if not path:
+            path = [goal]
+        self.route = path
+        self.route_index = 1 if len(path) > 1 else 0
+
+    def _replan_route(self):
+        if self.nav_goal is None or self.replan_cooldown > 0.0:
+            return
+        x, y, _ = self._pose()
+        path = self.grid.plan((x, y), self.nav_goal)
+        if path:
+            self.route = path
+            self.route_index = 1 if len(path) > 1 else 0
+        self.replan_cooldown = 0.8
+
+    def _nav_step(self, speed):
+        if not self.route or self.route_index >= len(self.route):
+            self._on_route_done()
+            return 0.0, 0.0
+
+        x, y, theta = self._pose()
+        target = self.route[self.route_index]
+        distance = math.hypot(target[0] - x, target[1] - y)
+        if distance < 0.20:
+            self.route_index += 1
+            if self.route_index >= len(self.route):
+                self._on_route_done()
+                return 0.0, 0.0
+            target = self.route[self.route_index]
+            distance = math.hypot(target[0] - x, target[1] - y)
+
+        err = world.wrap_angle(math.atan2(target[1] - y, target[0] - x) - theta)
+        v = speed * max(0.15, 1.0 - abs(err) / 1.6) if abs(err) < 1.15 else 0.0
+        w = world.clamp(2.4 * err, -1.5, 1.5)
+
+        front = _front_distance(self.robot.vision, 16.0)
+        if front is not None and front[0] < 0.42:
+            v = 0.0
+            w = 1.3
+            self._replan_route()
+            return v, w
+
+        readings = self.robot.vision
+        if readings:
+            relative, distance = min(readings, key=lambda item: item[1])
+            if distance < 0.34:
+                v = min(v, 0.22)
+                w += -1.3 if relative >= 0.0 else 1.3
+        return v, w
+
+    def _on_route_done(self):
+        kind = self.route_kind
+        self.route = []
+        self.route_index = 0
+        self.nav_goal = None
+        self.route_kind = None
+        if kind == "to_zone":
+            self._enter_zone()
+        elif kind == "to_segment":
+            self.phase = "zone_stripes"
+        elif kind == "edge_resume":
+            self.phase = "zone_edge"
+        elif kind == "breakpoint":
+            self._arrive_breakpoint()
+        elif kind in ("to_dock", "map_dock", "mow_dock"):
+            self.robot.stop()
+            if self.charge_reason:
+                self.phase = "charging"
+            else:
+                self.phase = "done"
+                self.task_end_sim = self.robot.sim_time
+                self._log("event", "任务完成，已停靠充电桩")
+        else:
+            self.phase = "idle"
+
+    # ----------------------------------------------------------- 环形补割
+    def _plan_rings(self):
+        if self.rings_done:
+            return False
+        zone = self._zone()
+        if zone is None:
+            return False
+        circles = [
+            circle
+            for circle in self.grid.obstacle_circles(zone)
+            if not self._is_bypassed(circle)
+        ]
+        self.ring_circles = circles
+        if not self.ring_circles:
+            self.rings_done = True
+            return False
+        self._log(
+            "info",
+            "区域 {} 对 {} 个障碍物进行环形补割".format(self.zone_id, len(self.ring_circles)),
+        )
+        self._next_ring()
+        return True
+
+    def _next_ring(self):
+        if not self.ring_circles:
+            self.rings_done = True
+            self.phase = "zone_plan"
+            return
+        circle = self.ring_circles.pop(0)
+        points = planner.ring_route(
+            circle, self._pose()[:2], grid=self.grid, zone=self._zone()
+        )
+        if not points:
+            self.bypassed_circles.append(dict(circle))
+            self._next_ring()
+            return
+        self.ring_circle = circle
+        self.ring_points = points
+        self.ring_index = 0
+        self.ring_after = "rings"
+        self.ring_started = False
+        self.ring_clipped = len(points) < planner.RING_STEPS
+        self.phase = "ring"
+
+    # ----------------------------------------------------------- 充电与断点
+    def _save_breakpoint(self):
+        if not self.task:
+            return
+        self.breakpoint = {
+            "pose": self._pose(),
+            "phase": self.phase,
+            "zone_id": self.zone_id,
+            "zone_index": self.zone_index,
+            "zone_stage": self.zone_stage,
+            "edge_points": list(self.edge_points),
+            "edge_index": self.edge_index,
+            "map_path": list(self.map_path),
+            "map_path_dist": self.map_path_dist,
+            "map_islands": list(self.map_islands),
+            "lane_axis": self.lane_axis,
+            "bypassed": [dict(circle) for circle in self.bypassed_circles],
+            "rings_done": self.rings_done,
+            "failed_segments": list(self.failed_segments),
+            "zone_plan_passes": self.zone_plan_passes,
+        }
+
+    def _charging_step(self):
+        if self.robot.charging:
+            if self.charge_reason == "low" and self.robot.battery >= RESUME_BATTERY:
+                self._log(
+                    "event",
+                    "电量已充至 {:.0f}%，返回断点继续任务".format(RESUME_BATTERY),
+                )
+                self._resume_from_charge()
+            elif self.charge_reason == "manual" and self.resume_requested:
+                self._log("event", "按控制台要求继续任务")
+                self._resume_from_charge()
+        return 0.0, 0.0
+
+    def _resume_from_charge(self):
+        self.charge_reason = None
+        self.resume_requested = False
+        if not self.breakpoint:
+            self.phase = "idle"
+            return
+        target = self.breakpoint["pose"][:2]
+        self.phase = "charge_return"
+        self._set_route(target, "breakpoint")
+
+    def _arrive_breakpoint(self):
+        if not self.breakpoint:
+            self.phase = "idle"
+            return
+        saved_phase = self.breakpoint["phase"]
+        if saved_phase == "map_follow":
+            self.phase = "align"
+            self.align_target = self.breakpoint["pose"][2]
+            return
+        self._restore_breakpoint()
+
+    def _align_step(self):
+        _, _, theta = self._pose()
+        err = world.wrap_angle(self.align_target - theta)
+        if abs(err) < 0.12:
+            self._restore_breakpoint()
+            return 0.0, 0.0
+        return 0.0, world.clamp(1.6 * err, -1.6, 1.6)
+
+    def _restore_breakpoint(self):
+        saved = self.breakpoint
+        if not saved:
+            self.phase = "idle"
+            return
+        self.breakpoint = None
+        self.zone_id = saved.get("zone_id")
+        self.zone_index = saved.get("zone_index", 0)
+        self.zone_stage = saved.get("zone_stage")
+        self.mowing_mode = saved.get("mode", self.mowing_mode)
+        self.edge_done = saved.get("edge_done", False)
+        if saved.get("task_start_sim") is not None:
+            self.task_start_sim = saved["task_start_sim"]
+        self.lane_axis = saved.get("lane_axis", "h")
+        self.bypassed_circles = [dict(circle) for circle in saved.get("bypassed", [])]
+        self.rings_done = saved.get("rings_done", False)
+        self.failed_segments = set(saved.get("failed_segments", []))
+        self.zone_plan_passes = saved.get("zone_plan_passes", 0)
+        phase = saved["phase"]
+        self._log("event", "已返回断点，继续之前的任务")
+        if phase == "map_seek":
+            self.phase = "map_seek"
+        elif phase == "map_follow":
+            self.map_path = list(saved.get("map_path", []))
+            self.map_path_dist = saved.get("map_path_dist", 0.0)
+            self.map_islands = list(saved.get("map_islands", []))
+            self.phase = "map_follow"
+        elif phase == "map_escape":
+            self.phase = "map_seek"
+        elif (
+            saved.get("zone_stage") in ("edge", "edge_final")
+            and saved.get("edge_points")
+        ):
+            self.edge_points = saved["edge_points"]
+            self.edge_index = saved.get("edge_index", 0)
+            self.phase = "zone_edge"
+        elif phase in ("zone_stripes", "to_segment", "detour", "zone_plan", "ring"):
+            self.phase = "zone_plan"
+        elif phase == "to_zone":
+            self.phase = "to_zone"
+            self._plan_to_zone_corner()
+        else:
+            self.phase = "idle"
+
+    # ----------------------------------------------------------- 状态输出
+    def get_state(self):
+        with self.lock:
+            state = self.robot.get_state()
+            zone_list = []
+            order = self.zone_order if self.task and self.task["type"] == "mow" else []
+            total_cells = 0
+            mowed_cells = 0
+            all_total = 0
+            all_mowed = 0
+            for zone in self.grid.zones:
+                total = self.grid.zone_totals.get(zone["id"], 0)
+                mowed = self.grid.zone_mowed.get(zone["id"], 0)
+                all_total += total
+                all_mowed += mowed
+                if zone["id"] in order:
+                    total_cells += total
+                    mowed_cells += mowed
+                zone_list.append(
+                    {
+                        "id": zone["id"],
+                        "name": zone["name"],
+                        "x0": zone["x0"],
+                        "y0": zone["y0"],
+                        "x1": zone["x1"],
+                        "y1": zone["y1"],
+                        "total": total,
+                        "mowed": mowed,
+                        "coverage": round(min(1.0, mowed / float(total)) if total else 0.0, 3),
+                        "selected": zone["id"] in order,
+                        "current": zone["id"] == self.zone_id,
+                    }
+                )
+            overall = (mowed_cells / float(total_cells)) if total_cells else 0.0
+            overall_all = (all_mowed / float(all_total)) if all_total else 0.0
+            end_sim = (
+                self.task_end_sim
+                if self.task_end_sim is not None
+                else self.robot.sim_time
+            )
+            duration = (
+                max(0.0, end_sim - self.task_start_sim)
+                if self.task_start_sim is not None
+                else 0.0
+            )
+
+            task = {
+                "type": self.task["type"] if self.task else None,
+                "phase": self.phase,
+                "phase_label": PHASE_LABELS.get(self.phase, self.phase),
+                "zone_order": list(order),
+                "current_zone": self.zone_id,
+                "coverage": round(overall, 4),
+                "overall_coverage": round(overall_all, 4),
+                "mode": self.mowing_mode,
+                "distance": round(state.get("distance", 0.0), 2),
+                "duration": round(duration, 1),
+                "mowed_cells": all_mowed,
+                "total_cells": all_total,
+                "map_progress": round(self.grid.boundary_discovery(), 3),
+                "charge_reason": self.charge_reason,
+                "message": self.message,
+                "serial": self.task_serial,
+                "breakpoint": (
+                    {
+                        "x": round(self.breakpoint["pose"][0], 2),
+                        "y": round(self.breakpoint["pose"][1], 2),
+                        "phase": self.breakpoint["phase"],
+                    }
+                    if self.breakpoint
+                    else None
+                ),
+            }
+
+            return dict(
+                state,
+                mode="manual" if not self.task else self.task["type"],
+                mowing_mode=self.mowing_mode,
+                task=task,
+                zones=zone_list,
+                obstacles=self.grid.obstacle_circles(None),
+                map=self.grid.encode(),
+                world=world.world_dict(),
+                route=[[round(p[0], 2), round(p[1], 2)] for p in self.route],
+                segments=[
+                    [[round(a[0], 2), round(a[1], 2)], [round(b[0], 2), round(b[1], 2)]]
+                    for a, b in self.segments
+                ],
+                edge_route=[[round(p[0], 2), round(p[1], 2)] for p in self.edge_points],
+                ray_scan=[
+                    [round(math.degrees(relative), 1), round(distance, 3)]
+                    for relative, distance in self.robot.vision
+                ],
+                goal=(
+                    [round(self.nav_goal[0], 2), round(self.nav_goal[1], 2)]
+                    if self.nav_goal
+                    else None
+                ),
+            )
+
+
+def _segment_key(segment):
+    a, b = segment
+    return (round(a[0], 1), round(a[1], 1), round(b[0], 1), round(b[1], 1))
+
+
+def _validate_zones(raw, available):
+    values = []
+    if isinstance(raw, str):
+        parts = raw.replace("，", ",").split(",")
+    elif isinstance(raw, (list, tuple)):
+        parts = raw
+    else:
+        parts = []
+    for part in parts:
+        try:
+            value = int(part)
+        except (TypeError, ValueError):
+            continue
+        if value in available and value not in values:
+            values.append(value)
+    return values or list(available)
+
+
+def _front_distance(readings, half_angle_deg):
+    best = None
+    for relative, distance in readings:
+        if abs(math.degrees(relative)) > half_angle_deg:
+            continue
+        if distance >= world.VISION_RANGE - 1e-6:
+            continue
+        if best is None or distance < best[0]:
+            best = (distance, relative)
+    return best
+
+
+def _right_surface_distance(readings):
+    values = []
+    for relative, distance in readings:
+        degrees = math.degrees(relative)
+        if -50.0 <= degrees <= -25.0 and distance < world.VISION_RANGE - 1e-6:
+            values.append(distance * math.sin(math.radians(-degrees)))
+    if not values:
+        return None
+    return min(values)
+
+
+def _polygon_area(points):
+    if len(points) < 3:
+        return 0.0
+    area = 0.0
+    count = len(points)
+    for index in range(count):
+        x1, y1 = points[index]
+        x2, y2 = points[(index + 1) % count]
+        area += x1 * y2 - x2 * y1
+    return area / 2.0
+
+
+def _path_length(points):
+    total = 0.0
+    for index in range(1, len(points)):
+        total += math.hypot(points[index][0] - points[index - 1][0], points[index][1] - points[index - 1][1])
+    return total
