@@ -29,7 +29,7 @@ class Settings(object):
         self.mowing_mode = "A"
         self.edge_inset = 0.22
         self.lane_spacing = 0.30
-        self.ring_margin = 0.38
+        self.ring_margin = 0.34
         self.nav_speed = 0.38
         self.map_speed = 0.50
         self.mow_speed = 0.48

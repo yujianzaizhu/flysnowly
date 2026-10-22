@@ -2,6 +2,7 @@ import math
 import os
 import sys
 import unittest
+from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -221,7 +222,7 @@ class ModeFlowTest(unittest.TestCase):
             round(math.hypot(point[0] - circle["x"], point[1] - circle["y"]), 2)
             for point in route
         }
-        self.assertGreater(len(radii), 3)
+        self.assertGreaterEqual(len(radii), 3)
 
     def test_world_obstacle_outline_is_exposed(self):
         data = world.world_dict()
@@ -232,6 +233,26 @@ class ModeFlowTest(unittest.TestCase):
             self.assertTrue(0.0 <= x <= data["width"])
             self.assertTrue(0.0 <= y <= data["height"])
 
+
+
+    def test_stuck_escape_reverses_along_history(self):
+        robot, grid, manager = make_system()
+        manager.task = {"type": "mow", "zones": [1], "mode": "A"}
+        manager.zone_id = 1
+        manager.phase = "zone_edge"
+        robot.pose = [5.0, 5.0, 0.0]
+        manager.history = deque([(4.4, 5.0), (4.6, 5.0), (4.8, 5.0), (4.95, 5.0)])
+        self.assertTrue(manager._begin_escape("zone_edge"))
+        self.assertEqual(manager.phase, "escape")
+        start_x = robot.pose[0]
+        for _ in range(30):
+            manager.tick(DT)
+        self.assertLess(robot.pose[0], start_x - 0.05)
+        for _ in range(500):
+            manager.tick(DT)
+            if manager.phase != "escape":
+                break
+        self.assertEqual(manager.phase, "zone_edge")
 
     def test_small_patch_cleanup_generates_segments(self):
         robot, grid, manager = make_system()

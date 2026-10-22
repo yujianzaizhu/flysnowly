@@ -40,6 +40,7 @@ PHASE_LABELS = {
     "align": "对齐断点航向",
     "to_dock": "返回充电桩",
     "done": "任务完成",
+    "escape": "后退脱困",
 }
 
 MOW_PHASES = {"zone_edge", "zone_stripes", "detour", "ring"}
@@ -89,9 +90,15 @@ class TaskManager(object):
         self.edge_done = False
         self.edge_resume_target = -1
         self.edge_resume_attempts = 0
+        self.edge_ringed_circles = []
         self.edge_start_sim = None
         self.edge_guard_log_time = 0.0
         self.zone_bump_count = 0
+        self.zone_escape_count = 0
+        self.escape_path = []
+        self.escape_index = 0
+        self.escape_resume = None
+        self.escape_time = 0.0
         self.patch_cleanup_done = False
         self.ring_clipped = False
         self.ring_lost_time = 0.0
@@ -241,7 +248,7 @@ class TaskManager(object):
             if self._prev_pose is not None:
                 step = math.hypot(pose[0] - self._prev_pose[0], pose[1] - self._prev_pose[1])
             self._prev_pose = pose
-            if step > 0.02:
+            if step > 0.02 and self.phase != "escape":
                 self.history.append((pose[0], pose[1]))
 
             self._check_battery()
@@ -321,20 +328,25 @@ class TaskManager(object):
     def _recover_stuck(self):
         phase = self.phase
         self.stats["stuck_recoveries"] += 1
-        self._log("warn", "检测到卡滞（{}），跳过当前动作并恢复".format(phase))
+        self._log("warn", "检测到卡滞（{}），尝试后退沿历史路径脱困".format(phase))
+        if phase == "zone_stripes" and self.segment is not None:
+            self.failed_segments.add(_segment_key(self.segment))
+        if self.zone_escape_count < 3 and self._begin_escape(phase):
+            self.zone_escape_count += 1
+            self.stuck_time = 0.0
+            self.stuck_ref = None
+            self.last_phase = None
+            return
         if phase == "ring":
             self._finish_ring()
         elif phase == "detour":
             self._finish_detour()
         elif phase == "zone_edge":
-            if self.edge_points and self.edge_index < len(self.edge_points):
-                self.edge_index += 1
-                self.edge_resume_target = -1
-                self.edge_resume_attempts = 0
-            if self.edge_index >= len(self.edge_points):
-                self._finish_edge_phase()
-            else:
-                self.phase = "zone_edge"
+            circle = self._edge_circle_from_occupancy()
+            if circle is not None and not self._is_edge_ringed(circle):
+                if self._begin_edge_ring(circle):
+                    return
+            self._advance_edge_after_collision(0.55)
         elif phase == "zone_stripes":
             if self.segment is not None:
                 self.failed_segments.add(_segment_key(self.segment))
@@ -343,6 +355,75 @@ class TaskManager(object):
             self._plan_to_zone_corner()
         self.stuck_time = 0.0
         self.stuck_ref = None
+        self.last_phase = None
+
+    def _begin_escape(self, resume_phase):
+        x, y, _ = self._pose()
+        path = []
+        length = 0.0
+        last = (x, y)
+        for point in reversed(self.history):
+            distance = math.hypot(point[0] - last[0], point[1] - last[1])
+            if distance < 0.04:
+                continue
+            path.append((point[0], point[1]))
+            length += distance
+            last = point
+            if length >= 1.0:
+                break
+        if not path or length < 0.20:
+            return False
+        self.escape_path = path
+        self.escape_index = 0
+        self.escape_resume = resume_phase
+        self.escape_time = 0.0
+        self.phase = "escape"
+        self.route = []
+        self.last_phase = None
+        self._log("warn", "沿历史路径后退脱困（{:.1f} m）".format(length))
+        return True
+
+    def _escape_step(self, dt):
+        self.escape_time += dt
+        x, y, theta = self._pose()
+        while self.escape_index < len(self.escape_path):
+            target = self.escape_path[self.escape_index]
+            if math.hypot(target[0] - x, target[1] - y) >= 0.12:
+                break
+            self.escape_index += 1
+        if self.escape_index >= len(self.escape_path) or self.escape_time > 4.0:
+            self._resume_after_escape()
+            return 0.0, 0.0
+        target = self.escape_path[self.escape_index]
+        bearing = math.atan2(target[1] - y, target[0] - x)
+        # 倒车时车头应朝向目标的反方向，再以负速度沿历史路径退回。
+        desired = world.wrap_angle(bearing + math.pi)
+        err = world.wrap_angle(desired - theta)
+        w = world.clamp(1.8 * err, -1.5, 1.5)
+        return -0.22, w
+
+    def _resume_after_escape(self):
+        resume = self.escape_resume
+        self.escape_path = []
+        self.escape_index = 0
+        self.escape_resume = None
+        self.escape_time = 0.0
+        # 倒车后的位姿与旧历史轨迹不连续，避免下一次脱困误用旧路径。
+        self.history.clear()
+        self.history.append(self._pose()[:2])
+        if resume == "zone_edge":
+            self.phase = "zone_edge"
+        elif resume in ("zone_stripes", "zone_plan", "to_segment"):
+            self.phase = "zone_plan"
+        elif resume == "ring":
+            self._finish_ring()
+        elif resume == "detour":
+            self._finish_detour()
+        elif resume == "to_zone":
+            self.phase = "to_zone"
+            self._plan_to_zone_corner()
+        else:
+            self.phase = "zone_plan"
         self.last_phase = None
 
     def _skip_segment(self):
@@ -391,6 +472,8 @@ class TaskManager(object):
             return self._nav_step(NAV_SPEED)
         if phase == "zone_edge":
             return self._edge_step()
+        if phase == "escape":
+            return self._escape_step(dt)
         if phase == "zone_plan":
             self._plan_stripes()
             return 0.0, 0.0
@@ -549,14 +632,8 @@ class TaskManager(object):
             points = planner.edge_route_grid(self.grid, zone, self._pose()[:2])
         else:
             points = planner.edge_route(zone, self._pose()[:2])
-        if len(points) >= 3:
-            x, y, theta = self._pose()
-            forward = math.atan2(points[1][1] - points[0][1], points[1][0] - points[0][0])
-            reverse = math.atan2(points[0][1] - points[-2][1], points[0][0] - points[-2][0])
-            forward_err = abs(world.wrap_angle(forward - theta))
-            reverse_err = abs(world.wrap_angle(reverse - theta))
-            if reverse_err + 0.25 < forward_err:
-                points = list(reversed(points))
+        if len(points) >= 3 and _polygon_area(points) < 0.0:
+            points = list(reversed(points))
         return points
 
     def _enter_zone(self):
@@ -568,8 +645,14 @@ class TaskManager(object):
         self.edge_index = 0
         self.edge_resume_target = -1
         self.edge_resume_attempts = 0
+        self.edge_ringed_circles = []
         self.zone_plan_passes = 0
         self.zone_bump_count = 0
+        self.zone_escape_count = 0
+        self.escape_path = []
+        self.escape_index = 0
+        self.escape_resume = None
+        self.escape_time = 0.0
         self.patch_cleanup_done = False
         self.failed_segments = set()
         self.lane_axis = "h"
@@ -623,25 +706,19 @@ class TaskManager(object):
         if target is None:
             self._finish_edge_phase()
             return 0.0, 0.0
-        path_state = self._edge_path_obstacle(target)
-        if path_state == "detour":
-            self._begin_detour("edge")
-            return 0.0, 0.0
-        if path_state == "skip":
-            self._skip_blocked_edge_points()
+        circle = self._edge_blocking_circle(target)
+        if circle is not None:
+            if not self._begin_edge_ring(circle):
+                self._advance_edge_past_circle(circle)
             return 0.0, 0.0
         if self._front_hits_zone():
             circle = self._nearest_circle(x, y, 1.20)
             if circle is not None:
-                self._begin_detour("edge")
-            else:
-                # 贴着场地外墙、未被聚类成圆的障碍没有可靠绕行中心，
-                # 继续盲目前进会反复撞墙，直接跳到下一个边缘点。
-                self.edge_index += 1
-                self.stats["edge_skips"] += 1
-                if self.edge_index >= len(self.edge_points):
-                    self._finish_edge_phase()
-            return 0.0, 0.0
+                if not self._begin_edge_ring(circle):
+                    self._advance_edge_past_circle(circle)
+                return 0.0, 0.0
+            # 未聚类的前方命中可能只是贴墙噪声；保持沿边控制，
+            # 由视觉壁障保护处理，不能因此跳过整圈边缘点。
         err = world.wrap_angle(math.atan2(target[1] - y, target[0] - x) - theta)
         v = 0.42 * max(0.25, 1.0 - abs(err) / 1.5) if abs(err) < 1.2 else 0.0
         if v == 0.0 and abs(err) < 2.5 and self.robot.vision:
@@ -685,6 +762,23 @@ class TaskManager(object):
         return points[-1]
 
 
+    def _advance_edge_after_collision(self, distance=0.80):
+        x, y, _ = self._pose()
+        index = self.edge_index + 1
+        while index < len(self.edge_points):
+            point = self.edge_points[index]
+            if math.hypot(point[0] - x, point[1] - y) >= distance:
+                break
+            index += 1
+        if index >= len(self.edge_points):
+            self._finish_edge_phase()
+            return
+        self.edge_index = index
+        self.phase = "zone_edge"
+        self.last_phase = None
+        self.stats["edge_skips"] += 1
+        self._log("info", "沿边遇到未聚类障碍，跳过受阻边缘段继续沿边")
+
     def _advance_edge_past_circle(self, circle):
         circles = self.grid.obstacle_circles(self._zone())
         index = self.edge_index + 1
@@ -692,7 +786,7 @@ class TaskManager(object):
             point = self.edge_points[index]
             outside = (
                 math.hypot(point[0] - circle["x"], point[1] - circle["y"])
-                > circle["r"] + 0.38
+                > circle["r"] + 0.28
             )
             if outside and not self._point_inside_obstacle(point, circles):
                 break
@@ -705,9 +799,83 @@ class TaskManager(object):
         self.last_phase = None
         self.stats["edge_skips"] += 1
 
+    def _is_edge_ringed(self, circle):
+        for known in self.edge_ringed_circles:
+            if math.hypot(circle["x"] - known["x"], circle["y"] - known["y"]) < 0.45:
+                return True
+        return False
+
+    def _edge_circle_from_occupancy(self):
+        x, y, _ = self._pose()
+        near = self.grid.nearest_occupied(x, y, 0.90)
+        if near is None:
+            return None
+        _, ox, oy = near
+        return {"x": ox, "y": oy, "r": 0.24, "kind": "small", "extent": 0.5}
+
+    def _begin_edge_ring(self, circle):
+        if self._is_edge_ringed(circle):
+            return False
+        x, y, _ = self._pose()
+        points = planner.ring_route(circle, (x, y), grid=self.grid, zone=self._zone())
+        self.edge_ringed_circles.append(dict(circle))
+        if not points:
+            return False
+        self.detour_source = "edge"
+        self.ring_circle = circle
+        self.ring_points = points
+        self.ring_index = 0
+        self.ring_after = "detour"
+        self.ring_started = False
+        self.ring_clipped = len(points) < planner.RING_STEPS
+        self.ring_lost_time = 0.0
+        self.ring_scan_time = 0.0
+        self.phase = "ring"
+        self.route = []
+        self.stats["rings"] += 1
+        self._log(
+            "warn",
+            "沿边遇到障碍物，逆时针绕障（半径 {:.2f} m）".format(circle["r"]),
+        )
+        return True
+
+    def _edge_blocking_circle(self, target):
+        x, y, _ = self._pose()
+        circles = self.grid.obstacle_circles(self._zone()) + self.edge_ringed_circles
+        for circle in circles:
+            distance_to_robot = math.hypot(circle["x"] - x, circle["y"] - y)
+            target_distance = math.hypot(target[0] - x, target[1] - y)
+            if distance_to_robot <= circle["r"] + 0.36:
+                if target_distance <= 0.36:
+                    blocked = (
+                        math.hypot(target[0] - circle["x"], target[1] - circle["y"])
+                        < circle["r"] + 0.20
+                    )
+                else:
+                    ux = (target[0] - x) / target_distance
+                    uy = (target[1] - y) / target_distance
+                    sx = x + ux * 0.28
+                    sy = y + uy * 0.28
+                    blocked = (
+                        world._segment_distance(
+                            circle["x"], circle["y"], sx, sy, target[0], target[1]
+                        )
+                        < circle["r"] + 0.20
+                    )
+            else:
+                blocked = (
+                    world._segment_distance(
+                        circle["x"], circle["y"], x, y, target[0], target[1]
+                    )
+                    < circle["r"] + 0.20
+                )
+            if blocked:
+                return circle
+        return None
+
     def _skip_blocked_edge_points(self):
         """一次跳到已被绕行障碍物之后的边缘点，避免逐点空转。"""
-        circles = self.grid.obstacle_circles(self._zone())
+        circles = self.grid.obstacle_circles(self._zone()) + self.edge_ringed_circles
         start = self.edge_index
         index = start
         while index < len(self.edge_points):
@@ -747,7 +915,7 @@ class TaskManager(object):
                 if target_distance <= 0.40:
                     blocked = (
                         math.hypot(target[0] - circle["x"], target[1] - circle["y"])
-                        < circle["r"] + 0.30
+                        < circle["r"] + 0.20
                     )
                 else:
                     ux = (target[0] - x) / target_distance
@@ -758,14 +926,14 @@ class TaskManager(object):
                         world._segment_distance(
                             circle["x"], circle["y"], sx, sy, target[0], target[1]
                         )
-                        < circle["r"] + 0.30
+                        < circle["r"] + 0.20
                     )
             else:
                 blocked = (
                     world._segment_distance(
                         circle["x"], circle["y"], x, y, target[0], target[1]
                     )
-                    < circle["r"] + 0.30
+                    < circle["r"] + 0.20
                 )
             if blocked:
                 return "skip" if self._is_bypassed(circle) else "detour"
@@ -777,7 +945,12 @@ class TaskManager(object):
             return v, w
         relative, distance = min(readings, key=lambda item: item[1])
         # 弓字巡迹速度较高，需要比贴边模式留更大的制动距离。
-        limit = 0.25 if self.phase in ("zone_stripes", "to_segment") else 0.20
+        if self.phase in ("zone_stripes", "to_segment"):
+            limit = 0.25
+        elif self.phase in ("ring", "detour"):
+            limit = 0.24
+        else:
+            limit = 0.20
         if distance < limit:
             steer = -1.4 if relative >= 0.0 else 1.4
             return 0.0, world.clamp(w + steer, -1.6, 1.6)
@@ -842,6 +1015,7 @@ class TaskManager(object):
             return
         self.edge_points = self._zone_edge_points(zone)
         self.edge_index = 0
+        self.edge_ringed_circles = []
         self.zone_stage = "edge_final"
         self.edge_done = False
         self.edge_start_sim = self.robot.sim_time
@@ -1168,7 +1342,7 @@ class TaskManager(object):
             x, y, theta = self._pose()
             hit_x = x + math.cos(theta + relative) * distance
             hit_y = y + math.sin(theta + relative) * distance
-            if math.hypot(hit_x - circle["x"], hit_y - circle["y"]) < circle["r"] + 0.30:
+            if math.hypot(hit_x - circle["x"], hit_y - circle["y"]) < circle["r"] + 0.20:
                 return True
         return False
 
@@ -1233,6 +1407,7 @@ class TaskManager(object):
         self.edge_done = True
         self.edge_resume_target = -1
         self.edge_resume_attempts = 0
+        self.edge_ringed_circles = []
         self.edge_start_sim = None
         self._log("info", "区域 {} 边缘已完成".format(self.zone_id))
         if self.zone_stage == "edge_final":
@@ -1247,7 +1422,7 @@ class TaskManager(object):
             self.phase = "zone_plan"
             return
         x, y, _ = self._pose()
-        circles = self.grid.obstacle_circles(self._zone())
+        circles = self.grid.obstacle_circles(self._zone()) + self.edge_ringed_circles
         candidates = []
         for index in range(self.edge_index, len(self.edge_points)):
             point = self.edge_points[index]
@@ -1278,7 +1453,7 @@ class TaskManager(object):
 
     def _point_inside_obstacle(self, point, circles):
         for circle in circles:
-            if math.hypot(point[0] - circle["x"], point[1] - circle["y"]) < circle["r"] + 0.24:
+            if math.hypot(point[0] - circle["x"], point[1] - circle["y"]) < circle["r"] + 0.18:
                 return True
         return False
 
@@ -1290,6 +1465,21 @@ class TaskManager(object):
                 self.failed_segments.add(_segment_key(self.segment))
             self._log("warn", "同一区域连续碰撞，跳过受阻弓字段并完成本区域")
             self._finish_zone_coverage()
+            return
+        if self.phase == "zone_edge":
+            circle = self._nearest_circle(self._pose()[0], self._pose()[1], 1.20)
+            if circle is not None and not self._is_edge_ringed(circle):
+                if self._begin_edge_ring(circle):
+                    return
+            if circle is None:
+                circle = self._edge_circle_from_occupancy()
+                if circle is not None and not self._is_edge_ringed(circle):
+                    if self._begin_edge_ring(circle):
+                        return
+            if circle is not None:
+                self._advance_edge_past_circle(circle)
+            else:
+                self._advance_edge_after_collision(0.80)
             return
         if self.phase == "ring":
             self._log("warn", "环形绕障受阻，跳过该障碍并重新规划")
@@ -1323,7 +1513,7 @@ class TaskManager(object):
                 self.grid.stamp_obstacle(circle["x"], circle["y"], circle["r"])
                 self.bypassed_circles.append(dict(circle))
             self.phase = "zone_plan"
-        elif self.phase in ("zone_edge", "zone_stripes"):
+        elif self.phase == "zone_stripes":
             self._begin_detour(self.phase)
         elif self.phase in ("to_zone", "to_segment", "charge_go", "charge_return", "to_dock"):
             self._replan_route()
@@ -1507,6 +1697,8 @@ class TaskManager(object):
             "edge_done": self.edge_done,
             "edge_resume_target": self.edge_resume_target,
             "edge_resume_attempts": self.edge_resume_attempts,
+            "edge_ringed": [dict(circle) for circle in self.edge_ringed_circles],
+            "escape_resume": self.escape_resume,
             "edge_elapsed": (
                 max(0.0, self.robot.sim_time - self.edge_start_sim)
                 if self.edge_start_sim is not None
@@ -1578,6 +1770,7 @@ class TaskManager(object):
         self.edge_done = saved.get("edge_done", False)
         self.edge_resume_target = saved.get("edge_resume_target", -1)
         self.edge_resume_attempts = saved.get("edge_resume_attempts", 0)
+        self.edge_ringed_circles = [dict(circle) for circle in saved.get("edge_ringed", [])]
         if saved.get("task_start_sim") is not None:
             self.task_start_sim = saved["task_start_sim"]
         self.lane_axis = saved.get("lane_axis", "h")
@@ -1611,8 +1804,8 @@ class TaskManager(object):
                 self._finish_edge_phase()
             else:
                 self.phase = "zone_edge"
-        elif phase in ("zone_stripes", "to_segment", "detour", "zone_plan", "ring"):
-            self.phase = "zone_plan"
+        elif phase in ("zone_stripes", "to_segment", "detour", "zone_plan", "ring", "escape"):
+            self.phase = saved.get("escape_resume") or "zone_plan"
         elif phase == "to_zone":
             self.phase = "to_zone"
             self._plan_to_zone_corner()

@@ -2,7 +2,8 @@
   "use strict";
 
   const POLL_MS = 100;
-  const INTERP_MS = 100;
+  const POLL_MS_FAST = 50;
+  let interpMs = POLL_MS;
   const TRAIL_LIMIT = 700;
   const ROBOT_RADIUS = 0.18;
 
@@ -182,7 +183,10 @@
     } catch (error) {
       setConnected(false);
     }
-    window.setTimeout(poll, POLL_MS);
+    const speed = current && current.speed ? current.speed : 1;
+    const fast = speed >= 4;
+    interpMs = fast ? POLL_MS_FAST : POLL_MS;
+    window.setTimeout(poll, fast ? POLL_MS_FAST : POLL_MS);
   }
 
   async function send(path, body) {
@@ -452,7 +456,7 @@
   function poseAt(now) {
     if (!current) return { x: 5.6, y: 3.5, theta: 0 };
     if (!previous) return current.pose;
-    const t = Math.max(0, Math.min(1, (now - currentAt) / INTERP_MS));
+    const t = Math.max(0, Math.min(1, (now - currentAt) / interpMs));
     const a = previous.pose;
     const b = current.pose;
     if (Math.hypot(b.x - a.x, b.y - a.y) > 1.5) return b;

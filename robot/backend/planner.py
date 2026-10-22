@@ -6,7 +6,7 @@ import world
 
 LANE_SPACING = 0.30
 EDGE_INSET = 0.22
-RING_MARGIN = 0.38
+RING_MARGIN = 0.34
 
 
 def edge_corners(zone, inset=None):

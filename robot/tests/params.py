@@ -38,7 +38,7 @@ MOWING_PARAMS = {
     "mowing_mode": "A",
     "edge_inset": 0.22,
     "lane_spacing": 0.30,
-    "ring_margin": 0.45,
+    "ring_margin": 0.34,
     "nav_speed": 0.38,
     "map_speed": 0.50,
     "mow_speed": 0.48,
