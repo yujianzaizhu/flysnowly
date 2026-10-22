@@ -31,18 +31,20 @@ class MappingTest(unittest.TestCase):
 
     def test_scan_marks_boundary(self):
         grid = GridMap()
-        readings = world.vision_scan(7.6, 2.0, 0.0)
-        grid.update_from_scan((7.6, 2.0, 0.0), readings, world.VISION_RANGE)
+        x = 8.5 * world.MAP_SCALE - 0.70
+        y = 2.0 * world.MAP_SCALE
+        readings = world.vision_scan(x, y, 0.0)
+        grid.update_from_scan((x, y, 0.0), readings, world.VISION_RANGE)
         self.assertGreater(grid.boundary_discovery(), 0.0)
-        wall_col, wall_row = grid.cell_of(8.45, 2.0)
+        wall_col, wall_row = grid.cell_of(8.5 * world.MAP_SCALE - 0.06, y)
         self.assertEqual(grid.data[grid.index(wall_col, wall_row)], OCCUPIED)
 
     def test_auto_partition_covers_irregular_field(self):
         grid = GridMap()
-        self.assertTrue(grid.build_free_area((4.9, 6.2)))
+        self.assertTrue(grid.build_free_area((world.START["x"], world.START["y"])))
         zones = grid.partition_zones()
         self.assertGreaterEqual(len(zones), 2)
-        self.assertLessEqual(len(zones), 9)
+        self.assertLessEqual(len(zones), 18)
         free_total = sum(1 for value in grid.free_mask if value)
         covered = sum(zone["free"] for zone in zones)
         self.assertGreater(covered, free_total * 0.80)
@@ -61,6 +63,25 @@ class MappingTest(unittest.TestCase):
         grid.mark_mowed(point[0], point[1])
         self.assertGreater(grid.zone_coverage(zone["id"]), before)
 
+
+
+    def test_unmowed_components_find_small_patch(self):
+        grid = GridMap()
+        grid.mask_ready = True
+        zone_id = 7
+        for col in range(20, 45):
+            for row in range(20, 45):
+                index = grid.index(col, row)
+                grid.data[index] = 1
+                grid.free_mask[index] = 1
+                grid.zone_id_map[index] = zone_id
+                grid.mowed[index] = 1
+        for col in range(30, 35):
+            for row in range(30, 35):
+                grid.mowed[grid.index(col, row)] = 0
+        components = grid.unmowed_components(zone_id, min_cells=20)
+        self.assertEqual(len(components), 1)
+        self.assertEqual(len(components[0]), 25)
 
     def test_world_defines_large_and_small_irregular_obstacles(self):
         for map_id in range(1, 6):
@@ -85,6 +106,18 @@ class MappingTest(unittest.TestCase):
         kinds = {circle["kind"] for circle in circles}
         self.assertIn("large", kinds)
         self.assertIn("small", kinds)
+
+    def test_zones_cover_all_free_cells_and_are_large(self):
+        for map_id in range(1, 6):
+            world.select_map(map_id)
+            grid = GridMap()
+            self.assertTrue(grid.build_free_area((world.START["x"], world.START["y"])))
+            zones = grid.partition_zones()
+            self.assertTrue(zones)
+            self.assertEqual(grid.covered_free, grid.free_total)
+            for zone in zones:
+                self.assertGreaterEqual(zone["free"] * grid.cell * grid.cell, 9.9)
+        world.select_map(1)
 
     def test_stamp_obstacle_blocks_navigation(self):
         grid = GridMap()
@@ -144,6 +177,26 @@ class PlannerTest(unittest.TestCase):
             self.assertLessEqual(max(ax, bx), zone["x1"] + 1e-6)
             self.assertGreaterEqual(min(ay, by), zone["y0"] - 1e-6)
             self.assertLessEqual(max(ay, by), zone["y1"] + 1e-6)
+
+    def test_contour_edge_has_no_ray_chords(self):
+        grid = GridMap()
+        self.assertTrue(grid.build_free_area((world.START["x"], world.START["y"])))
+        zones = grid.partition_zones()
+        irregular = []
+        for zone in zones:
+            area = max(1e-6, (zone["x1"] - zone["x0"]) * (zone["y1"] - zone["y0"]))
+            fill = zone["free"] * grid.cell * grid.cell / area
+            if fill < 0.92:
+                irregular.append(zone)
+        self.assertTrue(irregular)
+        route = planner.edge_route_grid(grid, irregular[0], (irregular[0]["cx"], irregular[0]["cy"]))
+        self.assertGreater(len(route), 8)
+        self.assertEqual(route[0], route[-1])
+        jumps = [
+            math.hypot(route[index + 1][0] - route[index][0], route[index + 1][1] - route[index][1])
+            for index in range(len(route) - 1)
+        ]
+        self.assertLess(max(jumps), 0.25)
 
     def test_edge_route_is_closed(self):
         grid = GridMap()

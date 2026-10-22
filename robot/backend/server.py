@@ -86,6 +86,8 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
             self._send_json(self._state())
         elif path == "/api/world":
             self._send_json(world.world_dict())
+        elif path == "/api/config":
+            self._send_json(self._state())
         elif path == "/api/health":
             self._send_json(
                 {"status": "ok", "time": round(time.time(), 3), "speed": self.server.simulator.speed}
@@ -110,7 +112,7 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
         try:
             if path == "/api/command":
                 if manager.task is not None:
-                    manager.stop_task("手动接管，当前任务已取消")
+                    manager.stop_task("手动接管，当前任务已取消", resumable=False)
                 self.server.robot.handle_command(payload.get("command"))
             elif path == "/api/task":
                 task_type = payload.get("task")
@@ -143,6 +145,19 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                     self.server.grid = grid
                     self.server.manager = manager
                     self.server.simulator.manager = manager
+            elif path == "/api/config":
+                if manager.task is not None and manager.phase not in ("idle", "done", "stopped"):
+                    raise ValueError("请先暂停或结束任务，再修改参数")
+                payload.pop("reset", None)
+                if not payload:
+                    raise ValueError("没有可应用的参数")
+                config.configure(**payload)
+                manager.mowing_mode = config.settings.mowing_mode
+            elif path == "/api/config/reset":
+                if manager.task is not None and manager.phase not in ("idle", "done", "stopped"):
+                    raise ValueError("请先暂停或结束任务，再重置参数")
+                config.reset()
+                manager.mowing_mode = config.settings.mowing_mode
             elif path == "/api/speed":
                 speed = int(payload.get("speed", 1))
                 if speed not in (1, 2, 4, 8):
@@ -163,6 +178,7 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
         state["speed"] = self.server.simulator.speed
         state["map_id"] = world.MAP_ID
         state["map_name"] = world.MAP_NAME
+        state["config"] = dict(config.settings.__dict__)
         return state
 
     def _read_json(self):

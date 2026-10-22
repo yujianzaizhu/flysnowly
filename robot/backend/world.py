@@ -3,6 +3,9 @@
 import math
 
 CELL = 0.1
+# 场地面积扩大为原来的 2 倍（宽、高各约 ×1.414），机器人/视觉尺寸不变。
+MAP_AREA_FACTOR = 2.0
+MAP_SCALE = math.sqrt(MAP_AREA_FACTOR)
 ROBOT_RADIUS = 0.18
 TRACK_WIDTH = 0.26
 WHEEL_BASE = 0.30
@@ -25,7 +28,7 @@ MAPS = {
         "obstacles": [
             {"kind": "large", "parts": [(1.82, 1.95, 0.40), (2.18, 2.05, 0.32), (2.00, 2.30, 0.25)]},
             {"kind": "small", "parts": [(6.70, 1.60, 0.30), (6.95, 1.68, 0.22)]},
-            {"kind": "large", "parts": [(9.82, 6.20, 0.40), (10.18, 6.30, 0.30), (10.00, 6.55, 0.25)]},
+            {"kind": "large", "parts": [(7.80, 6.80, 0.40), (8.15, 6.90, 0.30), (8.00, 7.15, 0.25)]},
             {"kind": "small", "parts": [(6.40, 2.30, 0.25), (6.65, 2.35, 0.20)]},
             {"kind": "small", "parts": [(2.00, 6.70, 0.35), (2.16, 6.55, 0.20)]},
         ],
@@ -144,20 +147,40 @@ def select_map(map_id):
     definition = MAPS[int(map_id)]
     MAP_ID = definition["id"]
     MAP_NAME = definition["name"]
-    WIDTH = definition["width"]
-    HEIGHT = definition["height"]
+    scale = MAP_SCALE
+    WIDTH = definition["width"] * scale
+    HEIGHT = definition["height"] * scale
     COLS = int(round(WIDTH / CELL))
     ROWS = int(round(HEIGHT / CELL))
-    POLYGON = list(definition["polygon"])
-    OBSTACLE_SHAPES = [dict(shape) for shape in definition["obstacles"]]
+    POLYGON = [(x * scale, y * scale) for x, y in definition["polygon"]]
+    OBSTACLE_SHAPES = [
+        {
+            "kind": shape["kind"],
+            "parts": [(x * scale, y * scale, radius) for x, y, radius in shape["parts"]],
+        }
+        for shape in definition["obstacles"]
+    ]
     OBSTACLES = [part for shape in OBSTACLE_SHAPES for part in shape["parts"]]
-    DOCK = dict(definition["dock"])
-    START = dict(definition["start"])
+    DOCK = {
+        "x": definition["dock"]["x"] * scale,
+        "y": definition["dock"]["y"] * scale,
+        "r": definition["dock"]["r"],
+    }
+    START = {
+        "x": definition["start"]["x"] * scale,
+        "y": definition["start"]["y"] * scale,
+        "theta": definition["start"]["theta"],
+    }
 
 
 def map_list():
     return [
-        {"id": definition["id"], "name": definition["name"]}
+        {
+            "id": definition["id"],
+            "name": definition["name"],
+            "width": round(definition["width"] * MAP_SCALE, 1),
+            "height": round(definition["height"] * MAP_SCALE, 1),
+        }
         for definition in sorted(MAPS.values(), key=lambda item: item["id"])
     ]
 
@@ -291,18 +314,54 @@ def boundary_cells():
     return cells
 
 
+def obstacle_outline(shape, steps=48):
+    """场地真实障碍物轮廓（仅用于界面展示，不参与机器人感知）。"""
+    parts = shape.get("parts", [])
+    if not parts:
+        return []
+    total = sum(radius * radius for _, _, radius in parts)
+    cx = sum(x * radius * radius for x, _, radius in parts) / total
+    cy = sum(y * radius * radius for _, y, radius in parts) / total
+    outline = []
+    for index in range(steps):
+        angle = 2.0 * math.pi * index / steps
+        dx, dy = math.cos(angle), math.sin(angle)
+        best = 0.0
+        for ox, oy, radius in parts:
+            vx, vy = ox - cx, oy - cy
+            b = vx * dx + vy * dy
+            c = vx * vx + vy * vy - radius * radius
+            discriminant = b * b - c
+            if discriminant < 0.0:
+                continue
+            hit = b + math.sqrt(discriminant)
+            if hit > best:
+                best = hit
+        if best <= 0.0:
+            ox, oy, radius = min(
+                parts, key=lambda part: math.hypot(part[0] - cx, part[1] - cy)
+            )
+            distance = math.hypot(ox - cx, oy - cy)
+            best = distance + radius
+        outline.append((round(cx + dx * best, 3), round(cy + dy * best, 3)))
+    return outline
+
+
 def world_dict():
+    shapes = [dict(shape, outline=obstacle_outline(shape)) for shape in OBSTACLE_SHAPES]
     return {
         "id": MAP_ID,
         "name": MAP_NAME,
         "width": WIDTH,
         "height": HEIGHT,
         "cell": CELL,
+        "map_scale": MAP_SCALE,
+        "map_area_factor": MAP_AREA_FACTOR,
         "cols": COLS,
         "rows": ROWS,
         "polygon": POLYGON,
         "obstacles": OBSTACLES,
-        "obstacle_shapes": OBSTACLE_SHAPES,
+        "obstacle_shapes": shapes,
         "dock": DOCK,
         "start": START,
         "maps": map_list(),

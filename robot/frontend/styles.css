@@ -689,6 +689,12 @@ body {
 .dot--vision { background: rgba(79, 195, 255, 0.55); }
 .dot--mowed { background: rgba(55, 224, 160, 0.75); }
 .dot--obstacle { background: #ff8a5c; }
+.dot--obstacle-real {
+  background: rgba(255, 143, 90, 0.18);
+  border: 1.5px solid rgba(255, 143, 90, 0.85);
+  width: 10px;
+  height: 10px;
+}
 .dot--path { background: #ffd166; }
 
 .tips {
@@ -935,3 +941,80 @@ body {
 
 .dot--obstacle-large { background: #ff8f5a; }
 .dot--obstacle-small { background: #ffd166; }
+
+/* ------------------------------------------------------------- 参数面板 / 折叠 */
+.panel > h2 {
+  position: relative;
+  padding-right: 18px;
+  cursor: pointer;
+}
+
+.panel > h2::after {
+  content: "▾";
+  position: absolute;
+  right: 0;
+  top: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.panel.is-collapsed > h2::after {
+  content: "▸";
+}
+
+.panel.is-collapsed > *:not(h2) {
+  display: none !important;
+}
+
+.panel.is-collapsed {
+  padding-bottom: 8px;
+}
+
+.param-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px 8px;
+}
+
+.param-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 9.5px;
+  letter-spacing: 0.2px;
+}
+
+.param-grid input {
+  width: 100%;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(5, 9, 20, 0.8);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.param-grid input:focus {
+  outline: none;
+  border-color: rgba(55, 224, 160, 0.55);
+}
+
+.param-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 9px;
+}
+
+.param-actions .task-btn {
+  flex: 1;
+  padding: 5px 6px;
+  font-size: 10.5px;
+}
+
+.param-message {
+  margin-top: 7px;
+  text-align: left;
+}

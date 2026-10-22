@@ -24,11 +24,12 @@ class Settings(object):
         self.battery_low = 30.0
         self.battery_resume = 80.0
         self.charge_rate = 8.0
+        self.battery_drain_factor = 0.6
         # 割草
         self.mowing_mode = "A"
         self.edge_inset = 0.22
         self.lane_spacing = 0.30
-        self.ring_margin = 0.45
+        self.ring_margin = 0.38
         self.nav_speed = 0.38
         self.map_speed = 0.50
         self.mow_speed = 0.48
@@ -42,6 +43,30 @@ class Settings(object):
 settings = Settings()
 
 _ALLOWED_MODES = ("A", "B")
+_RANGES = {
+    "robot_radius": (0.08, 0.50),
+    "mower_width": (0.10, 1.00),
+    "track_width": (0.10, 0.80),
+    "wheelbase": (0.10, 0.80),
+    "max_linear": (0.10, 2.00),
+    "max_angular": (0.20, 4.00),
+    "vision_fov_deg": (30.0, 180.0),
+    "vision_range": (0.30, 4.00),
+    "vision_rays": (9, 181),
+    "battery_low": (5.0, 60.0),
+    "battery_resume": (40.0, 100.0),
+    "charge_rate": (0.5, 30.0),
+    "battery_drain_factor": (0.10, 2.00),
+    "edge_inset": (0.12, 0.60),
+    "lane_spacing": (0.15, 0.80),
+    "ring_margin": (0.20, 1.50),
+    "nav_speed": (0.10, 2.00),
+    "map_speed": (0.10, 2.00),
+    "mow_speed": (0.10, 2.00),
+    "large_obstacle_extent": (0.40, 2.00),
+    "small_obstacle_radius": (0.10, 1.00),
+    "max_zone_plan_passes": (1, 30),
+}
 
 
 def configure(**kwargs):
@@ -53,6 +78,16 @@ def configure(**kwargs):
             value = str(value).upper()
             if value not in _ALLOWED_MODES:
                 raise ValueError("割草模式仅支持 A/B")
+        elif key in _RANGES:
+            low, high = _RANGES[key]
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                raise ValueError("参数 {} 必须是数字".format(key))
+            if not (low <= value <= high):
+                raise ValueError("参数 {} 超出范围 {}-{}".format(key, low, high))
+            if key in ("vision_rays", "max_zone_plan_passes"):
+                value = int(round(value))
         setattr(settings, key, value)
     apply()
 
@@ -76,6 +111,7 @@ def apply():
     robot_car.MAX_LINEAR = float(settings.max_linear)
     robot_car.MAX_ANGULAR = float(settings.max_angular)
     robot_car.CHARGE_RATE = float(settings.charge_rate)
+    robot_car.DRAIN_FACTOR = float(settings.battery_drain_factor)
 
     planner.EDGE_INSET = float(settings.edge_inset)
     planner.LANE_SPACING = float(settings.lane_spacing)

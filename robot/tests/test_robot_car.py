@@ -48,7 +48,7 @@ class KinematicsTest(unittest.TestCase):
 
     def test_wall_stops_robot(self):
         car = RobotCar()
-        car.pose = [11.80, 7.0, 0.0]
+        car.pose = [world.WIDTH - 0.70, world.HEIGHT - 1.50, 0.0]
         car.handle_command("forward")
         run(car, 2.0)
         self.assertLessEqual(car.pose[0], world.WIDTH - world.ROBOT_RADIUS + 1e-6)
@@ -70,13 +70,18 @@ class VisionTest(unittest.TestCase):
 
     def test_front_distance_to_wall(self):
         car = RobotCar()
-        car.pose = [11.8, 7.0, 0.0]
+        car.pose = [world.WIDTH - 0.70, world.HEIGHT - 1.50, 0.0]
         car.scan()
         self.assertAlmostEqual(car.get_state()["vision"]["front"], 0.7, places=2)
 
     def test_front_distance_to_obstacle(self):
         car = RobotCar()
-        car.pose = [1.2, 6.7, 0.0]
+        target = min(
+            world.OBSTACLES,
+            key=lambda item: abs(item[0] - 2.0 * world.MAP_SCALE)
+            + abs(item[1] - 6.7 * world.MAP_SCALE),
+        )
+        car.pose = [target[0] - target[2] - 0.45, target[1], 0.0]
         car.scan()
         self.assertAlmostEqual(car.get_state()["vision"]["front"], 0.45, places=2)
 
@@ -97,6 +102,12 @@ class BatteryTest(unittest.TestCase):
         car.handle_command("forward")
         run(car, 5.0)
         self.assertLess(car.battery, 100.0)
+
+    def test_battery_drain_is_scaled_to_sixty_percent(self):
+        car = RobotCar()
+        car.battery = 100.0
+        run(car, 10.0)
+        self.assertAlmostEqual(car.battery, 100.0 - 0.012 * 10.0, places=2)
 
     def test_dock_charges_battery(self):
         car = RobotCar()

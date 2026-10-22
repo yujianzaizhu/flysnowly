@@ -6,7 +6,7 @@ import world
 
 LANE_SPACING = 0.30
 EDGE_INSET = 0.22
-RING_MARGIN = 0.45
+RING_MARGIN = 0.38
 
 
 def edge_corners(zone, inset=None):
@@ -98,18 +98,49 @@ def edge_route_grid(grid, zone, start_xy, clearance=None):
                         stack.append(neighbour)
                         component.append(neighbour)
         components.append(component)
-    loop_cells = max(components, key=len)
-    points = [grid.center_of(col, row) for col, row in loop_cells]
-    cx = sum(point[0] for point in points) / len(points)
-    cy = sum(point[1] for point in points) / len(points)
-    points.sort(key=lambda point: math.atan2(point[1] - cy, point[0] - cx))
-    start = min(
-        range(len(points)),
-        key=lambda i: math.hypot(points[i][0] - start_xy[0], points[i][1] - start_xy[1]),
+    loop_cells = set(max(components, key=len))
+    start_cell = min(
+        loop_cells,
+        key=lambda cell: math.hypot(
+            grid.center_of(*cell)[0] - start_xy[0],
+            grid.center_of(*cell)[1] - start_xy[1],
+        ),
     )
-    ordered = points[start:] + points[:start]
-    ordered.append(ordered[0])
-    return ordered
+    walk = [start_cell]
+    visited = {start_cell}
+    current = start_cell
+    previous = None
+    while True:
+        candidates = []
+        for dc in (-1, 0, 1):
+            for dr in (-1, 0, 1):
+                if dc == 0 and dr == 0:
+                    continue
+                neighbour = (current[0] + dc, current[1] + dr)
+                if neighbour in loop_cells and neighbour not in visited:
+                    candidates.append(neighbour)
+        if not candidates:
+            break
+        if previous is None:
+            chosen = min(candidates, key=lambda cell: abs(cell[0] - current[0]) + abs(cell[1] - current[1]))
+        else:
+            previous_heading = math.atan2(current[1] - previous[1], current[0] - previous[0])
+
+            def score(cell):
+                heading = math.atan2(cell[1] - current[1], cell[0] - current[0])
+                turn = abs(world.wrap_angle(heading - previous_heading))
+                diagonal = abs(cell[0] - current[0]) + abs(cell[1] - current[1]) > 1
+                return turn + (0.45 if diagonal else 0.0)
+
+            chosen = min(candidates, key=score)
+        walk.append(chosen)
+        visited.add(chosen)
+        previous, current = current, chosen
+    points = [grid.center_of(col, row) for col, row in walk]
+    if len(points) < 2:
+        return edge_route(zone, start_xy)
+    points.append(points[0])
+    return points
 
 
 def lane_segments(grid, zone, spacing=None, axis="h"):
@@ -135,9 +166,9 @@ def lane_segments(grid, zone, spacing=None, axis="h"):
     fixed_end = x_end if axis == "v" else y_hi
     while fixed <= fixed_end + 1e-6:
         if axis == "v":
-            runs = _lane_runs(grid, y_lo, y_hi, fixed, vertical=True)
+            runs = _lane_runs(grid, y_lo, y_hi, fixed, vertical=True, zone_id=zone["id"])
         else:
-            runs = _lane_runs(grid, x_start, x_end, fixed)
+            runs = _lane_runs(grid, x_start, x_end, fixed, zone_id=zone["id"])
         runs = [run for run in runs if run[1] - run[0] >= 0.25]
         if runs:
             lanes.append((lane_index, fixed, runs))
@@ -194,7 +225,7 @@ def order_segments(segments, start_xy, heading=0.0):
     return ordered
 
 
-def _lane_runs(grid, start, end, fixed, vertical=False):
+def _lane_runs(grid, start, end, fixed, vertical=False, zone_id=None):
     runs = []
     current = None
     gap = 0
@@ -207,6 +238,7 @@ def _lane_runs(grid, start, end, fixed, vertical=False):
             not grid.cell_blocked_mow(col, row)
             and grid.cell_mowable(col, row)
             and not grid.cell_mowed(col, row)
+            and (zone_id is None or grid.cell_in_zone(col, row, zone_id))
         )
         if usable:
             if current is None:
@@ -232,15 +264,37 @@ def zone_free_ratio(grid, zone):
 RING_STEPS = 36
 
 
+def _observed_radius(grid, cx, cy, angle, fallback, clearance):
+    """沿视线方向找已探明障碍物的最外边界，返回贴边绕行半径。"""
+    if grid is None:
+        return fallback
+    dx = math.cos(angle)
+    dy = math.sin(angle)
+    step = max(0.02, grid.cell * 0.45)
+    limit = fallback + grid.cell
+    distance = step
+    last_hit = None
+    while distance <= limit:
+        x = cx + dx * distance
+        y = cy + dy * distance
+        if grid.is_occupied_world(x, y):
+            last_hit = distance
+        distance += step
+    if last_hit is None:
+        return fallback
+    return max(0.30 + clearance, min(fallback, last_hit + clearance))
+
+
 def ring_route(circle, start_xy, margin=None, steps=RING_STEPS, grid=None, zone=None):
     margin = RING_MARGIN if margin is None else margin
-    """绕障碍物一周的圆环路径；若被墙体/区域边界遮挡，只返回连续可行驶弧段。"""
-    radius = max(circle["r"], 0.30) + margin
+    """沿已探明障碍物外轮廓绕行；被区域边界遮挡时只返回连续弧段。"""
+    fallback = max(circle["r"], 0.30) + margin
     cx, cy = circle["x"], circle["y"]
     start_angle = math.atan2(start_xy[1] - cy, start_xy[0] - cx)
     raw = []
     for index in range(1, steps + 1):
         angle = start_angle + 2.0 * math.pi * index / steps
+        radius = _observed_radius(grid, cx, cy, angle, fallback, margin)
         raw.append((cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
     if grid is None:
         return raw

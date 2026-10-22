@@ -17,6 +17,7 @@ ANGULAR_ACCEL = 4.5
 
 CHARGE_RATE = 8.0
 IDLE_DRAIN = 0.02
+DRAIN_FACTOR = 0.6
 
 COMMANDS = {
     "forward": (0.55, 0.0),
@@ -141,7 +142,7 @@ class RobotCar(object):
             if not was_charging:
                 self.log("event", "已停靠充电桩，开始充电")
         else:
-            drain = (
+            drain = DRAIN_FACTOR * (
                 IDLE_DRAIN
                 + 0.50 * abs(self.v) / MAX_LINEAR
                 + 0.08 * abs(self.w) / MAX_ANGULAR

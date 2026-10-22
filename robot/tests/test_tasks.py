@@ -82,7 +82,7 @@ class MowingTaskTest(unittest.TestCase):
         robot, grid, manager = make_system()
         map_field(robot, grid, manager)
         manager.start_mowing([1])
-        advance(manager, 400.0)
+        advance(manager, 650.0)
         self.assertEqual(manager.phase, "done")
         self.assertGreaterEqual(grid.zone_coverage(1), 0.85)
         self.assertEqual(robot.collisions, 0)
@@ -118,7 +118,7 @@ class MowingTaskTest(unittest.TestCase):
         self.assertGreaterEqual(coverage_before, 0.0)
 
         manager.request_resume()
-        advance(manager, 420.0)
+        advance(manager, 650.0)
         self.assertEqual(manager.phase, "done")
         self.assertGreaterEqual(grid.zone_coverage(1), 0.85)
 
@@ -149,9 +149,27 @@ class MowingTaskTest(unittest.TestCase):
         robot, grid, manager = make_system()
         manager.start_mapping()
         advance(manager, 3.0, stop=())
-        manager.stop_task("测试停止")
+        manager.stop_task("测试停止", resumable=False)
         self.assertIsNone(manager.task)
         self.assertEqual(manager.phase, "idle")
+
+    def test_stopped_task_can_continue(self):
+        robot, grid, manager = make_system()
+        map_field(robot, grid, manager)
+        robot.battery = 100.0
+        manager.start_mowing([1])
+        advance(manager, 25.0, stop=())
+        manager.stop_task("控制台暂停")
+        self.assertEqual(manager.phase, "stopped")
+        self.assertIsNotNone(manager.breakpoint)
+        coverage = grid.zone_coverage(1)
+        advance(manager, 8.0, stop=())
+        self.assertAlmostEqual(grid.zone_coverage(1), coverage, places=4)
+        manager.request_resume()
+        self.assertIn(manager.phase, ("zone_edge", "zone_plan", "to_zone"))
+        advance(manager, 450.0)
+        self.assertEqual(manager.phase, "done")
+        self.assertGreaterEqual(grid.zone_coverage(1), 0.80)
 
 
 if __name__ == "__main__":

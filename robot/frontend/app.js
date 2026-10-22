@@ -53,6 +53,12 @@
     estopBtn: document.getElementById("estopBtn"),
     speedButtons: Array.from(document.querySelectorAll(".speed-btn")),
     mapSelect: document.getElementById("mapSelect"),
+    applyParamsBtn: document.getElementById("applyParamsBtn"),
+    resetParamsBtn: document.getElementById("resetParamsBtn"),
+    paramMessage: document.getElementById("paramMessage"),
+    collapseAllBtn: document.getElementById("collapseAllBtn"),
+    expandAllBtn: document.getElementById("expandAllBtn"),
+    visionSpec: document.getElementById("visionSpec"),
   };
 
   const visionEls = {};
@@ -77,6 +83,8 @@
   let zoneAutoValue = "";
   let zoneInputDirty = false;
   let modeTouched = false;
+  let paramsDirty = false;
+  const configInputs = Array.from(document.querySelectorAll("[data-config]"));
 
   const wrap = (angle) => {
     const twoPi = Math.PI * 2;
@@ -127,6 +135,13 @@
     }
     if (!modeTouched && state.mowing_mode) {
       els.mowMode.value = state.mowing_mode;
+    }
+    if (state.config && !paramsDirty) {
+      loadConfig(state.config);
+    }
+    if (state.world && state.world.vision) {
+      els.visionSpec.textContent =
+        state.world.vision.fov_deg.toFixed(0) + "° FOV · " + state.world.vision.range.toFixed(2) + " m";
     }
     if (state.world && state.world.maps) {
       updateMapOptions(state.world.maps);
@@ -475,6 +490,10 @@
     if (state) {
       drawMap(geom, state.map);
       drawZones(geom, state.zones || []);
+      drawGroundObstacles(
+        geom,
+        (state.world && state.world.obstacle_shapes) || []
+      );
       drawObstacles(geom, state.obstacles || []);
       drawPaths(geom, state);
       drawTrail(geom);
@@ -585,6 +604,30 @@
       ctx.font = Math.max(8, geom.scale * 0.10).toFixed(0) + "px 'Segoe UI', sans-serif";
       ctx.fillStyle = zone.selected ? "rgba(55, 224, 160, 0.8)" : "rgba(139, 163, 199, 0.35)";
       ctx.fillText(Math.round(zone.coverage * 100) + "%", labelX, labelY + geom.scale * 0.14);
+    });
+    ctx.restore();
+  }
+
+  function drawGroundObstacles(geom, shapes) {
+    ctx.save();
+    shapes.forEach((shape) => {
+      const outline = shape.outline || [];
+      if (outline.length < 3) return;
+      const large = shape.kind === "large";
+      const color = large ? "255, 143, 90" : "255, 209, 102";
+      ctx.beginPath();
+      outline.forEach((point, index) => {
+        const x = geom.x(point[0]);
+        const y = geom.y(point[1]);
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.closePath();
+      ctx.fillStyle = "rgba(" + color + ", 0.13)";
+      ctx.fill();
+      ctx.lineWidth = 1.4;
+      ctx.strokeStyle = "rgba(" + color + ", 0.75)";
+      ctx.stroke();
     });
     ctx.restore();
   }
@@ -1021,7 +1064,7 @@
   document.querySelectorAll("[data-module]").forEach((panel) => {
     modulePanels[panel.dataset.module] = panel;
   });
-  const moduleDefaults = { telemetry: true, manual: true, zones: true, events: true };
+  const moduleDefaults = { telemetry: true, manual: true, zones: true, events: true, params: true };
   let moduleState = Object.assign({}, moduleDefaults);
   try {
     const saved = JSON.parse(localStorage.getItem(MODULE_KEY) || "null");
@@ -1117,8 +1160,99 @@
     localStorage.removeItem(OFFSET_KEY);
     applyOffsets();
   });
-  applyModuleState();
-  applyOffsets();
+  // ------------------------------------------------------------- 参数设置
+  function loadConfig(config) {
+    configInputs.forEach((input) => {
+      const value = config[input.dataset.config];
+      if (value === undefined) return;
+      input.value =
+        input.dataset.type === "int" ? String(parseInt(value, 10)) : String(Number(value));
+    });
+  }
+
+  configInputs.forEach((input) => {
+    input.addEventListener("input", () => {
+      paramsDirty = true;
+    });
+  });
+
+  async function applyParams() {
+    const payload = { mowing_mode: els.mowMode.value };
+    configInputs.forEach((input) => {
+      const raw = input.value.trim();
+      if (raw === "") return;
+      payload[input.dataset.config] =
+        input.dataset.type === "int" ? parseInt(raw, 10) : Number(raw);
+    });
+    try {
+      const state = await request("/api/config", payload);
+      paramsDirty = false;
+      ingest(state);
+      els.paramMessage.textContent = "参数已应用，下一次规划生效";
+    } catch (error) {
+      els.paramMessage.textContent = error.message;
+    }
+  }
+
+  async function resetParams() {
+    try {
+      const state = await request("/api/config/reset", {});
+      paramsDirty = false;
+      ingest(state);
+      els.paramMessage.textContent = "已恢复默认参数";
+    } catch (error) {
+      els.paramMessage.textContent = error.message;
+    }
+  }
+
+  els.applyParamsBtn.addEventListener("click", applyParams);
+  els.resetParamsBtn.addEventListener("click", resetParams);
+
+  // ------------------------------------------------------------- 面板折叠
+  const COLLAPSE_KEY = "mowerCollapsedV1";
+  let collapsed = {};
+  try {
+    collapsed = JSON.parse(localStorage.getItem(COLLAPSE_KEY) || "null") || {};
+  } catch (error) {
+    collapsed = {};
+  }
+
+  function applyCollapsed() {
+    Object.keys(modulePanels).forEach((key) => {
+      modulePanels[key].classList.toggle("is-collapsed", collapsed[key] === true);
+    });
+  }
+
+  function toggleCollapsed(panel) {
+    const key = panel.dataset.dragPanel;
+    collapsed[key] = !collapsed[key];
+    localStorage.setItem(COLLAPSE_KEY, JSON.stringify(collapsed));
+    applyCollapsed();
+  }
+
+  Object.keys(modulePanels).forEach((key) => {
+    const panel = modulePanels[key];
+    const heading = panel.querySelector("h2");
+    if (!heading) return;
+    heading.addEventListener("click", (event) => {
+      if (event.target.closest("[data-drag-handle]")) return;
+      if (panel.classList.contains("dragging")) return;
+      toggleCollapsed(panel);
+    });
+  });
+  els.collapseAllBtn.addEventListener("click", () => {
+    Object.keys(modulePanels).forEach((key) => {
+      collapsed[key] = true;
+    });
+    localStorage.setItem(COLLAPSE_KEY, JSON.stringify(collapsed));
+    applyCollapsed();
+  });
+  els.expandAllBtn.addEventListener("click", () => {
+    collapsed = {};
+    localStorage.setItem(COLLAPSE_KEY, JSON.stringify(collapsed));
+    applyCollapsed();
+  });
+  applyCollapsed();
 
   // ------------------------------------------------------------- 启动
   function frame(now) {

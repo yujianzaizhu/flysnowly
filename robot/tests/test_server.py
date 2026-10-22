@@ -68,6 +68,9 @@ class ServerTest(unittest.TestCase):
         self.assertGreater(state["map"]["cols"] * state["map"]["rows"], 5000)
         self.assertEqual(len(state["ray_scan"]), 41)
         self.assertIn("speed", state)
+        self.assertIn("config", state)
+        for key in ("robot_radius", "vision_range", "lane_spacing", "ring_margin"):
+            self.assertIn(key, state["config"])
         self.assertEqual(state["mowing_mode"], "A")
         for key in ("overall_coverage", "distance", "duration"):
             self.assertIn(key, state["task"])
@@ -122,8 +125,8 @@ class ServerTest(unittest.TestCase):
     def test_map_switch(self):
         _, state = self.post("/api/map", {"map": 3})
         self.assertEqual(state["map_id"], 3)
-        self.assertAlmostEqual(state["pose"]["x"], 6.5, places=2)
-        self.assertAlmostEqual(state["pose"]["y"], 1.5, places=2)
+        self.assertAlmostEqual(state["pose"]["x"], world.START["x"], places=2)
+        self.assertAlmostEqual(state["pose"]["y"], world.START["y"], places=2)
         self.assertEqual(
             len(state["map"]["occupancy"]),
             state["map"]["cols"] * state["map"]["rows"],
@@ -136,6 +139,7 @@ class ServerTest(unittest.TestCase):
             ("/api/speed", {"speed": 3}),
             ("/api/map", {"map": 99}),
             ("/api/task", {"task": "mow", "zones": [1], "mode": "C"}),
+            ("/api/config", {"robot_radius": 5.0}),
         ):
             request = urllib.request.Request(
                 self.base + path,
@@ -146,6 +150,33 @@ class ServerTest(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as context:
                 urllib.request.urlopen(request, timeout=3)
             self.assertEqual(context.exception.code, 400)
+
+    def test_config_endpoint(self):
+        _, state = self.post(
+            "/api/config",
+            {
+                "robot_radius": 0.20,
+                "vision_range": 1.2,
+                "lane_spacing": 0.28,
+                "mowing_mode": "B",
+            },
+        )
+        self.assertAlmostEqual(state["config"]["robot_radius"], 0.20)
+        self.assertAlmostEqual(state["config"]["vision_range"], 1.2)
+        self.assertEqual(state["config"]["mowing_mode"], "B")
+        self.assertAlmostEqual(world.ROBOT_RADIUS, 0.20)
+        _, state = self.post("/api/config/reset", {})
+        self.assertAlmostEqual(state["config"]["robot_radius"], 0.18)
+        self.assertAlmostEqual(world.ROBOT_RADIUS, 0.18)
+
+    def test_stop_and_resume_endpoints(self):
+        self.post("/api/task", {"task": "mow", "zones": [1], "mode": "A"})
+        time.sleep(0.3)
+        _, state = self.post("/api/stop", {})
+        self.assertEqual(state["task"]["phase"], "stopped")
+        self.assertIsNotNone(state["task"]["type"])
+        _, state = self.post("/api/resume", {})
+        self.assertNotEqual(state["task"]["phase"], "stopped")
 
     def test_reset(self):
         self.post("/api/task", {"task": "map"})

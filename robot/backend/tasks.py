@@ -11,6 +11,8 @@ LOW_BATTERY = 30.0
 RESUME_BATTERY = 80.0
 DEFAULT_MOWING_MODE = "A"
 MAX_ZONE_PLAN_PASSES = 8
+PATCH_MIN_CELLS = 20
+PATCH_MAX_CELLS = 120
 
 NAV_SPEED = 0.38
 MAP_SPEED = 0.50
@@ -24,6 +26,7 @@ PHASE_LABELS = {
     "map_seek": "寻找场地边界",
     "map_follow": "逆时针巡边建图",
     "map_escape": "脱离孤岛",
+    "stopped": "任务已暂停",
     "to_zone": "前往割草区域",
     "zone_edge": "沿区域边缘割草",
     "zone_plan": "规划弓字轨迹",
@@ -42,6 +45,7 @@ PHASE_LABELS = {
 MOW_PHASES = {"zone_edge", "zone_stripes", "detour", "ring"}
 CHARGE_EXEMPT = {
     "charging", "charge_go", "charge_return", "align", "done", "idle", "to_dock",
+    "stopped",
 }
 
 
@@ -87,12 +91,22 @@ class TaskManager(object):
         self.edge_resume_attempts = 0
         self.edge_start_sim = None
         self.edge_guard_log_time = 0.0
+        self.zone_bump_count = 0
+        self.patch_cleanup_done = False
         self.ring_clipped = False
         self.ring_lost_time = 0.0
         self.ring_scan_time = 0.0
         self.ring_scan_heading = 0.0
         self.task_start_sim = None
         self.task_end_sim = None
+        self.stats = {
+            "segments_planned": 0,
+            "rings": 0,
+            "large_replans": 0,
+            "edge_skips": 0,
+            "stuck_recoveries": 0,
+            "charge_count": 0,
+        }
         self.ring_points = []
         self.ring_index = 0
         self.ring_after = None
@@ -173,12 +187,22 @@ class TaskManager(object):
             )
             self._plan_to_zone_corner()
 
-    def stop_task(self, reason="任务已停止"):
+    def stop_task(self, reason="任务已停止", resumable=True):
         with self.lock:
-            if self.task is not None or self.charge_reason is not None:
+            if not self.task and self.charge_reason is None:
+                self.robot.stop()
+                return
+            if resumable:
+                self._save_breakpoint()
+                self.robot.stop()
+                self.phase = "stopped"
+                self.last_phase = None
+                self.message = reason
+                self._log("warn", "{}（点击继续任务可恢复）".format(reason))
+            else:
                 self._log("warn", reason)
-            self._reset_state()
-            self.robot.stop()
+                self._reset_state()
+                self.robot.stop()
 
     def request_charge(self):
         with self.lock:
@@ -193,6 +217,10 @@ class TaskManager(object):
 
     def request_resume(self):
         with self.lock:
+            if self.phase in ("stopped", "paused") and self.breakpoint:
+                self._log("event", "收到继续任务指令，从暂停断点恢复")
+                self._restore_breakpoint()
+                return
             if self.phase not in ("charging", "charge_go"):
                 return
             self.resume_requested = True
@@ -253,6 +281,14 @@ class TaskManager(object):
         else:
             self.stuck_time += dt
 
+        if self.stuck_time > 4.0 and self.phase in (
+            "zone_edge",
+            "zone_stripes",
+            "ring",
+            "detour",
+            "to_zone",
+        ):
+            self._recover_stuck()
         if self.phase == "to_segment" and (self.phase_time > 25.0 or self.stuck_time > 5.0):
             self._skip_segment()
         if self.phase == "ring" and self.phase_time > 35.0:
@@ -282,6 +318,33 @@ class TaskManager(object):
             self.last_phase = None
             self._log("warn", "巡边受阻，脱离障碍物后重新寻找外墙")
 
+    def _recover_stuck(self):
+        phase = self.phase
+        self.stats["stuck_recoveries"] += 1
+        self._log("warn", "检测到卡滞（{}），跳过当前动作并恢复".format(phase))
+        if phase == "ring":
+            self._finish_ring()
+        elif phase == "detour":
+            self._finish_detour()
+        elif phase == "zone_edge":
+            if self.edge_points and self.edge_index < len(self.edge_points):
+                self.edge_index += 1
+                self.edge_resume_target = -1
+                self.edge_resume_attempts = 0
+            if self.edge_index >= len(self.edge_points):
+                self._finish_edge_phase()
+            else:
+                self.phase = "zone_edge"
+        elif phase == "zone_stripes":
+            if self.segment is not None:
+                self.failed_segments.add(_segment_key(self.segment))
+            self.phase = "zone_plan"
+        elif phase == "to_zone":
+            self._plan_to_zone_corner()
+        self.stuck_time = 0.0
+        self.stuck_ref = None
+        self.last_phase = None
+
     def _skip_segment(self):
         self._log("warn", "弓字线段起点不可达，跳过并重新规划剩余区域")
         if self.segment is not None:
@@ -305,6 +368,7 @@ class TaskManager(object):
         if self.robot.battery <= LOW_BATTERY:
             self._save_breakpoint()
             self.charge_reason = "low"
+            self.stats["charge_count"] += 1
             self.phase = "charge_go"
             self._log(
                 "warn",
@@ -482,8 +546,18 @@ class TaskManager(object):
         width = max(1e-6, (zone["x1"] - zone["x0"]) * (zone["y1"] - zone["y0"]))
         fill = zone["free"] * self.grid.cell * self.grid.cell / width
         if fill < 0.92:
-            return planner.edge_route_grid(self.grid, zone, self._pose()[:2])
-        return planner.edge_route(zone, self._pose()[:2])
+            points = planner.edge_route_grid(self.grid, zone, self._pose()[:2])
+        else:
+            points = planner.edge_route(zone, self._pose()[:2])
+        if len(points) >= 3:
+            x, y, theta = self._pose()
+            forward = math.atan2(points[1][1] - points[0][1], points[1][0] - points[0][0])
+            reverse = math.atan2(points[0][1] - points[-2][1], points[0][0] - points[-2][0])
+            forward_err = abs(world.wrap_angle(forward - theta))
+            reverse_err = abs(world.wrap_angle(reverse - theta))
+            if reverse_err + 0.25 < forward_err:
+                points = list(reversed(points))
+        return points
 
     def _enter_zone(self):
         zone = self._zone()
@@ -495,6 +569,8 @@ class TaskManager(object):
         self.edge_resume_target = -1
         self.edge_resume_attempts = 0
         self.zone_plan_passes = 0
+        self.zone_bump_count = 0
+        self.patch_cleanup_done = False
         self.failed_segments = set()
         self.lane_axis = "h"
         self.rings_done = False
@@ -515,35 +591,203 @@ class TaskManager(object):
             self.phase = "zone_plan"
             return 0.0, 0.0
         x, y, theta = self._pose()
-        target = self.edge_points[self.edge_index]
-        distance = math.hypot(target[0] - x, target[1] - y)
-        if distance < 0.22:
+        while self.edge_index < len(self.edge_points):
+            point = self.edge_points[self.edge_index]
+            reached = math.hypot(point[0] - x, point[1] - y) < 0.18
+            passed = False
+            if not reached and self.edge_index > 0:
+                ax, ay = self.edge_points[self.edge_index - 1]
+                vx, vy = point[0] - ax, point[1] - ay
+                length_sq = vx * vx + vy * vy
+                if length_sq > 1e-9:
+                    length = math.sqrt(length_sq)
+                    along = ((x - point[0]) * vx + (y - point[1]) * vy) / length
+                    cross = abs((x - point[0]) * vy - (y - point[1]) * vx) / length
+                    passed = (
+                        along > 0.02
+                        and cross < 0.12
+                        and math.hypot(point[0] - x, point[1] - y) < 0.65
+                    )
+            if not reached and not passed:
+                break
             self.edge_index += 1
             self.edge_resume_target = -1
             self.edge_resume_attempts = 0
-            if self.edge_index >= len(self.edge_points):
-                self._finish_edge_phase()
+        if self.edge_index >= len(self.edge_points):
+            self._finish_edge_phase()
             return 0.0, 0.0
-        if self._front_hits_zone():
+
+        # 纯跟踪预瞄：在路径投影点前方约 0.30 m 取连续点。
+        # 规则区域边缘只有少数长边，不能直接跳到下一个角点。
+        target = self._edge_lookahead_target(x, y)
+        if target is None:
+            self._finish_edge_phase()
+            return 0.0, 0.0
+        path_state = self._edge_path_obstacle(target)
+        if path_state == "detour":
             self._begin_detour("edge")
             return 0.0, 0.0
+        if path_state == "skip":
+            self._skip_blocked_edge_points()
+            return 0.0, 0.0
+        if self._front_hits_zone():
+            circle = self._nearest_circle(x, y, 1.20)
+            if circle is not None:
+                self._begin_detour("edge")
+            else:
+                # 贴着场地外墙、未被聚类成圆的障碍没有可靠绕行中心，
+                # 继续盲目前进会反复撞墙，直接跳到下一个边缘点。
+                self.edge_index += 1
+                self.stats["edge_skips"] += 1
+                if self.edge_index >= len(self.edge_points):
+                    self._finish_edge_phase()
+            return 0.0, 0.0
         err = world.wrap_angle(math.atan2(target[1] - y, target[0] - x) - theta)
-        v = 0.42 * max(0.2, 1.0 - abs(err) / 1.5) if abs(err) < 1.2 else 0.0
+        v = 0.42 * max(0.25, 1.0 - abs(err) / 1.5) if abs(err) < 1.2 else 0.0
+        if v == 0.0 and abs(err) < 2.5 and self.robot.vision:
+            # 大角度转向时保留极低爬行速度，形成连续弧线而不是原地停顿。
+            if min(distance for _, distance in self.robot.vision) > 0.45:
+                v = 0.06
         w = world.clamp(2.2 * err, -1.4, 1.4)
         return self._wall_guard(v, w)
+
+
+    def _edge_lookahead_target(self, x, y, distance=0.30):
+        points = self.edge_points
+        if not points:
+            return None
+        if len(points) == 1:
+            return points[0]
+        if self.edge_index <= 0:
+            self.edge_index = 1
+        cursor = min(self.edge_index, len(points) - 1)
+        ax, ay = points[cursor - 1]
+        bx, by = points[cursor]
+        vx, vy = bx - ax, by - ay
+        length = math.hypot(vx, vy)
+        if length <= 1e-9:
+            return points[cursor]
+        t = world.clamp(((x - ax) * vx + (y - ay) * vy) / (length * length), 0.0, 1.0)
+        remaining = (1.0 - t) * length
+        if remaining >= distance:
+            ratio = t + distance / length
+            return (ax + vx * ratio, ay + vy * ratio)
+        need = distance - remaining
+        while cursor + 1 < len(points):
+            ax, ay = points[cursor]
+            bx, by = points[cursor + 1]
+            segment = math.hypot(bx - ax, by - ay)
+            if segment >= need:
+                ratio = need / segment if segment > 0 else 0.0
+                return (ax + (bx - ax) * ratio, ay + (by - ay) * ratio)
+            need -= segment
+            cursor += 1
+        return points[-1]
+
+
+    def _advance_edge_past_circle(self, circle):
+        circles = self.grid.obstacle_circles(self._zone())
+        index = self.edge_index + 1
+        while index < len(self.edge_points):
+            point = self.edge_points[index]
+            outside = (
+                math.hypot(point[0] - circle["x"], point[1] - circle["y"])
+                > circle["r"] + 0.38
+            )
+            if outside and not self._point_inside_obstacle(point, circles):
+                break
+            index += 1
+        if index >= len(self.edge_points):
+            self._finish_edge_phase()
+            return
+        self.edge_index = index
+        self.phase = "zone_edge"
+        self.last_phase = None
+        self.stats["edge_skips"] += 1
+
+    def _skip_blocked_edge_points(self):
+        """一次跳到已被绕行障碍物之后的边缘点，避免逐点空转。"""
+        circles = self.grid.obstacle_circles(self._zone())
+        start = self.edge_index
+        index = start
+        while index < len(self.edge_points):
+            state = self._edge_path_obstacle(self.edge_points[index], circles)
+            if state == "detour":
+                self._begin_detour("edge")
+                return
+            if state is None and index > start:
+                break
+            # 当前点本身可用、但预瞄点被绕过的障碍挡住时，至少前进一点，
+            # 否则下一帧仍会选中同一个预瞄点并原地空转。
+            index += 1
+        if index >= len(self.edge_points):
+            self._finish_edge_phase()
+            return
+        self.edge_index = index
+        self.stats["edge_skips"] += 1
+        if self.robot.sim_time - self.edge_guard_log_time > 2.0:
+            self.edge_guard_log_time = self.robot.sim_time
+            self._log("info", "边缘路径遇到已绕行障碍物，跳至障碍物后的边缘点")
+
+    def _edge_path_obstacle(self, target, circles=None):
+        """沿边时主动检查已探明障碍物是否压在当前边缘路径上。
+
+        返回 detour（未绕过，主动绕障）/ skip（已绕过，跳过阻挡点）/ None。
+        """
+        x, y, _ = self._pose()
+        if circles is None:
+            circles = self.grid.obstacle_circles(self._zone())
+        for circle in circles:
+            distance_to_robot = math.hypot(circle["x"] - x, circle["y"] - y)
+            target_distance = math.hypot(target[0] - x, target[1] - y)
+            if distance_to_robot <= circle["r"] + 0.40:
+                # 起点就在障碍物旁时，忽略从机器人当前点出发的前 0.30 m，
+                # 检查剩余线段是否穿过障碍；仅看目标点会误判“目标在外侧就
+                # 可直达”，导致机器人原地转向却始终撞向障碍。
+                if target_distance <= 0.40:
+                    blocked = (
+                        math.hypot(target[0] - circle["x"], target[1] - circle["y"])
+                        < circle["r"] + 0.30
+                    )
+                else:
+                    ux = (target[0] - x) / target_distance
+                    uy = (target[1] - y) / target_distance
+                    sx = x + ux * 0.30
+                    sy = y + uy * 0.30
+                    blocked = (
+                        world._segment_distance(
+                            circle["x"], circle["y"], sx, sy, target[0], target[1]
+                        )
+                        < circle["r"] + 0.30
+                    )
+            else:
+                blocked = (
+                    world._segment_distance(
+                        circle["x"], circle["y"], x, y, target[0], target[1]
+                    )
+                    < circle["r"] + 0.30
+                )
+            if blocked:
+                return "skip" if self._is_bypassed(circle) else "detour"
+        return None
 
     def _wall_guard(self, v, w):
         readings = self.robot.vision
         if not readings:
             return v, w
         relative, distance = min(readings, key=lambda item: item[1])
-        if distance < 0.20:
+        # 弓字巡迹速度较高，需要比贴边模式留更大的制动距离。
+        limit = 0.25 if self.phase in ("zone_stripes", "to_segment") else 0.20
+        if distance < limit:
             steer = -1.4 if relative >= 0.0 else 1.4
             return 0.0, world.clamp(w + steer, -1.6, 1.6)
         return v, w
 
     # ----------------------------------------------------------- 弓字覆盖
     def _plan_stripes(self):
+        if self.zone_stage == "patch" and self.patch_cleanup_done:
+            self._complete_zone()
+            return
         zone = self._zone()
         if not self.task or zone is None:
             if self.task and self.task["type"] == "mow":
@@ -552,7 +796,10 @@ class TaskManager(object):
                 self.phase = "idle"
             return
         for circle in self.grid.obstacle_circles(zone):
-            self.grid.stamp_obstacle(circle["x"], circle["y"], circle["r"])
+            # 大型障碍常用包围圆近似多瓣形状，直接盖章会堵死狭窄回廊；
+            # 其真实占据栅格+膨胀已足够保证割草避让。
+            if circle.get("kind") != "large":
+                self.grid.stamp_obstacle(circle["x"], circle["y"], circle["r"])
         raw_segments = planner.lane_segments(self.grid, zone, axis=self.lane_axis)
         filtered = [
             segment for segment in raw_segments if _segment_key(segment) not in self.failed_segments
@@ -581,6 +828,7 @@ class TaskManager(object):
         if not self.segments:
             self._finish_zone_coverage()
             return
+        self.stats["segments_planned"] += len(self.segments)
         self._log(
             "info",
             "区域 {} 规划弓字线段 {} 条".format(self.zone_id, len(self.segments)),
@@ -639,6 +887,8 @@ class TaskManager(object):
             self.segment_index += 1
             if self.segment_index < len(self.segments):
                 self._goto_segment(self.segment_index)
+            elif self.zone_stage == "patch":
+                self._complete_zone()
             else:
                 self.phase = "zone_plan"
             return 0.0, 0.0
@@ -652,7 +902,76 @@ class TaskManager(object):
         w = world.clamp(2.4 * err, -1.5, 1.5)
         return self._wall_guard(v, w)
 
+    def _plan_patch_cleanup(self):
+        if self.patch_cleanup_done:
+            return False
+        self.patch_cleanup_done = True
+        zone = self._zone()
+        if zone is None:
+            return False
+        components = self.grid.unmowed_components(
+            self.zone_id, min_cells=PATCH_MIN_CELLS
+        )
+        patches = [
+            cells
+            for cells in components
+            if PATCH_MIN_CELLS <= len(cells) <= PATCH_MAX_CELLS
+        ]
+        if not patches:
+            return False
+        patch_cells = set()
+        for cells in patches:
+            patch_cells.update(cells)
+        raw_segments = planner.lane_segments(self.grid, zone, axis=self.lane_axis)
+        segments = []
+        for segment in raw_segments:
+            if _segment_length(segment) < 0.18:
+                continue
+            a, b = segment
+            touches = False
+            for ratio in (0.0, 0.25, 0.5, 0.75, 1.0):
+                x = a[0] + (b[0] - a[0]) * ratio
+                y = a[1] + (b[1] - a[1]) * ratio
+                cell = self.grid.cell_of(x, y)
+                if cell in patch_cells:
+                    touches = True
+                    break
+            if touches:
+                segments.append(segment)
+        if not segments:
+            # 窄小补丁可能无法生成正常行距的弓字，直接沿补丁长轴扫一遍。
+            for cells in patches:
+                xs = [self.grid.center_of(c, r)[0] for c, r in cells]
+                ys = [self.grid.center_of(c, r)[1] for c, r in cells]
+                if max(xs) - min(xs) >= max(ys) - min(ys):
+                    y = (min(ys) + max(ys)) / 2.0
+                    segment = ((min(xs), y), (max(xs), y))
+                else:
+                    x = (min(xs) + max(xs)) / 2.0
+                    segment = ((x, min(ys)), (x, max(ys)))
+                segments.append(segment)
+        if not segments:
+            return False
+        pose = self._pose()
+        self.segments = planner.order_segments(segments, pose[:2], pose[2])
+        self.segment_index = 0
+        self.segment = None
+        self.zone_stage = "patch"
+        self.zone_plan_passes = 0
+        self.failed_segments = set()
+        area = len(patch_cells) * self.grid.cell * self.grid.cell
+        self._log(
+            "event",
+            "区域 {} 发现 {} 块小块漏扫（{:.2f} m²），开始补扫".format(
+                self.zone_id, len(patches), area
+            ),
+        )
+        self._goto_segment(0)
+        return True
+
     def _complete_zone(self):
+        if self._plan_patch_cleanup():
+            return
         coverage = self.grid.zone_coverage(self.zone_id)
         self._log(
             "event",
@@ -693,10 +1012,13 @@ class TaskManager(object):
         if zone is None:
             return False
         margin = 0.10
-        return (
+        inside = (
             zone["x0"] + margin <= hit_x <= zone["x1"] - margin
             and zone["y0"] + margin <= hit_y <= zone["y1"] - margin
         )
+        # 只有视觉确认的占据栅格才视为障碍物。区域边界和场地外墙不应
+        # 触发绕障，否则沿边会在墙边反复启停。
+        return inside and self.grid.occupied_near(hit_x, hit_y, 0.12)
 
     def _begin_detour(self, source):
         if self.phase in ("detour", "ring"):
@@ -706,8 +1028,10 @@ class TaskManager(object):
 
         if circle is not None and self._is_bypassed(circle):
             self._log("info", "该障碍物已绕行过，跳过二次绕障并重新规划")
-            if source == "edge":
-                self._resume_edge_route()
+            if source in ("edge", "zone_edge"):
+                # 已绕过的障碍仍挡在预瞄方向时，一次推进到该障碍后的
+                # 边缘点；不要递归调用 skip，否则会反复回到同一点。
+                self._advance_edge_past_circle(circle)
             else:
                 if self.segment is not None:
                     self.failed_segments.add(_segment_key(self.segment))
@@ -727,6 +1051,7 @@ class TaskManager(object):
                 self.failed_segments.add(_segment_key(self.segment))
             self.phase = "zone_plan"
             self.last_phase = None
+            self.stats["large_replans"] += 1
             self._log("info", "遇到大型障碍物：掉头并重新规划弓字")
             return
 
@@ -755,6 +1080,7 @@ class TaskManager(object):
             self.ring_scan_time = 0.0
             self.phase = "ring"
             self.route = []
+            self.stats["rings"] += 1
             self._log(
                 "warn",
                 "巡迹遇到障碍物，绕障碍物一周（半径 {:.2f} m）".format(circle["r"]),
@@ -763,12 +1089,14 @@ class TaskManager(object):
                 self._log("info", "绕障路径触及区域边界，只沿本区域内的弧段绕行")
             return
 
+        # 障碍物靠近场地边界时可能无法聚类成圆，先沿可见表面绕行；
+        # 若再次碰撞，_on_bump 会跳过当前弓字段并限制同区碰撞次数。
         self.detour_start = (x, y)
         self.detour_distance = 0.0
         self.detour_source = source
         self.phase = "detour"
         self.route = []
-        self._log("warn", "巡迹遇到障碍物，开始绕障一周")
+        self._log("warn", "巡迹遇到障碍物，沿表面绕障")
 
     def _nearest_circle(self, x, y, limit):
         zone = self._zone()
@@ -830,7 +1158,7 @@ class TaskManager(object):
         err = world.wrap_angle(math.atan2(target[1] - y, target[0] - x) - theta)
         v = 0.34 * max(0.2, 1.0 - abs(err) / 1.5) if abs(err) < 1.3 else 0.0
         w = world.clamp(2.2 * err, -1.4, 1.4)
-        return v, w
+        return self._wall_guard(v, w)
 
     def _obstacle_visible(self, circle):
         range_limit = world.VISION_RANGE - 0.02
@@ -892,12 +1220,14 @@ class TaskManager(object):
 
     def _finish_detour(self):
         self._log("event", "绕障完成并回到历史路径")
-        if self.detour_source == "edge" and self.edge_points:
+        source = self.detour_source
+        self.detour_source = None
+        self.detour_start = None
+        self.detour_distance = 0.0
+        if source == "edge" and self.edge_points:
             self._resume_edge_route()
         else:
             self.phase = "zone_plan"
-        self.detour_start = None
-        self.detour_distance = 0.0
 
     def _finish_edge_phase(self):
         self.edge_done = True
@@ -916,33 +1246,51 @@ class TaskManager(object):
             self.zone_stage = "stripes"
             self.phase = "zone_plan"
             return
-        if self.edge_index >= len(self.edge_points):
+        x, y, _ = self._pose()
+        circles = self.grid.obstacle_circles(self._zone())
+        candidates = []
+        for index in range(self.edge_index, len(self.edge_points)):
+            point = self.edge_points[index]
+            if self._point_inside_obstacle(point, circles):
+                continue
+            direct = self.grid.line_clear((x, y), point)
+            score = math.hypot(point[0] - x, point[1] - y) + (0.0 if direct else 1.5)
+            candidates.append((score, index, direct))
+        if not candidates:
             self._finish_edge_phase()
             return
-        if self.edge_resume_target == self.edge_index:
-            self.edge_resume_attempts += 1
-        else:
-            self.edge_resume_target = self.edge_index
-            self.edge_resume_attempts = 1
-        if self.edge_resume_attempts > 3:
-            self.edge_index += 1
-            self.edge_resume_target = -1
+        candidates.sort(key=lambda item: item[0])
+        for _, index, direct in candidates[:12]:
+            self.edge_index = index
+            target = self.edge_points[index]
+            self.edge_resume_target = index
             self.edge_resume_attempts = 0
-            self._log("warn", "区域边缘存在不可达点，跳过并继续沿边")
-            if self.edge_index >= len(self.edge_points):
-                self._finish_edge_phase()
-            else:
-                self._resume_edge_route()
-            return
-        target = self.edge_points[self.edge_index]
-        x, y, _ = self._pose()
-        # 沿区域边缘继续，不走跨区域的全局 A*，避免绕障后离开当前区域。
-        if math.hypot(target[0] - x, target[1] - y) < 0.25:
-            self.phase = "zone_edge"
-            return
-        self.phase = "zone_edge"
+            if direct:
+                self.phase = "zone_edge"
+                return
+            # 障碍物仍挡在机器人与其后的边缘点之间时，先用 A* 贴边
+            # 绕回边缘；失败则尝试下一个更远的边缘点，不能原地等待。
+            if self._set_route(target, "edge_resume"):
+                self.phase = "to_segment"
+                return
+        self._log("warn", "绕障后找不到可达边缘点，结束本区域沿边并继续割草")
+        self._finish_edge_phase()
+
+    def _point_inside_obstacle(self, point, circles):
+        for circle in circles:
+            if math.hypot(point[0] - circle["x"], point[1] - circle["y"]) < circle["r"] + 0.24:
+                return True
+        return False
 
     def _on_bump(self):
+        if self.phase in ("zone_stripes", "zone_edge"):
+            self.zone_bump_count += 1
+        if self.phase == "zone_stripes" and self.zone_bump_count >= 2:
+            if self.segment is not None:
+                self.failed_segments.add(_segment_key(self.segment))
+            self._log("warn", "同一区域连续碰撞，跳过受阻弓字段并完成本区域")
+            self._finish_zone_coverage()
+            return
         if self.phase == "ring":
             self._log("warn", "环形绕障受阻，跳过该障碍并重新规划")
             if self.ring_circle is not None:
@@ -958,12 +1306,13 @@ class TaskManager(object):
                 self.phase = "zone_plan"
             return
         if self.phase == "detour":
-            self._log("warn", "沿边绕障受阻，跳过该段并重新规划")
-            self.detour_start = None
-            self.detour_distance = 0.0
+            self._log("warn", "绕障受阻，重新贴回历史路径")
             if self.detour_source == "edge":
-                self._finish_edge_phase()
+                self._finish_detour()
             else:
+                self.detour_start = None
+                self.detour_distance = 0.0
+                self.detour_source = None
                 if self.segment is not None:
                     self.failed_segments.add(_segment_key(self.segment))
                 self.phase = "zone_plan"
@@ -1006,10 +1355,27 @@ class TaskManager(object):
         self.route_kind = kind
         x, y, _ = self._pose()
         path = self.grid.plan((x, y), goal)
+        if not path and self.grid.relax_around(x, y, 0.30):
+            # 机器人当前点可能被相邻障碍的保守膨胀包围；该点本身已证明
+            # 可通行，先释放脚下膨胀再尝试一次，避免区域间导航死锁。
+            path = self.grid.plan((x, y), goal)
         if not path:
-            path = [goal]
+            self.route = []
+            self.route_index = 0
+            self.nav_goal = None
+            self._log("warn", "目标点不可达，取消本次直线兜底并重新规划")
+            if kind == "to_segment":
+                if self.segment is not None:
+                    self.failed_segments.add(_segment_key(self.segment))
+                self.phase = "zone_plan"
+            elif kind == "to_zone":
+                self.phase = "zone_plan"
+            elif kind == "edge_resume":
+                self.phase = "zone_edge"
+            return False
         self.route = path
         self.route_index = 1 if len(path) > 1 else 0
+        return True
 
     def _replan_route(self):
         if self.nav_goal is None or self.replan_cooldown > 0.0:
@@ -1042,14 +1408,15 @@ class TaskManager(object):
         w = world.clamp(2.4 * err, -1.5, 1.5)
 
         front = _front_distance(self.robot.vision, 16.0)
-        if front is not None and front[0] < 0.42:
+        # 目标在侧后方时先原地转向目标；此时前向障碍不会造成平移碰撞，
+        # 若仍按前向避障左右切换，会在狭窄回廊中来回摆动而卡死。
+        if front is not None and front[0] < 0.42 and abs(err) < 1.0:
             v = 0.0
-            w = 1.3
-            self._replan_route()
+            w = -1.3 if front[1] >= 0.0 else 1.3
             return v, w
 
         readings = self.robot.vision
-        if readings:
+        if readings and v > 0.05:
             relative, distance = min(readings, key=lambda item: item[1])
             if distance < 0.34:
                 v = min(v, 0.22)
@@ -1137,6 +1504,14 @@ class TaskManager(object):
             "zone_stage": self.zone_stage,
             "edge_points": list(self.edge_points),
             "edge_index": self.edge_index,
+            "edge_done": self.edge_done,
+            "edge_resume_target": self.edge_resume_target,
+            "edge_resume_attempts": self.edge_resume_attempts,
+            "edge_elapsed": (
+                max(0.0, self.robot.sim_time - self.edge_start_sim)
+                if self.edge_start_sim is not None
+                else 0.0
+            ),
             "map_path": list(self.map_path),
             "map_path_dist": self.map_path_dist,
             "map_islands": list(self.map_islands),
@@ -1145,6 +1520,7 @@ class TaskManager(object):
             "rings_done": self.rings_done,
             "failed_segments": list(self.failed_segments),
             "zone_plan_passes": self.zone_plan_passes,
+            "patch_cleanup_done": self.patch_cleanup_done,
         }
 
     def _charging_step(self):
@@ -1200,6 +1576,8 @@ class TaskManager(object):
         self.zone_stage = saved.get("zone_stage")
         self.mowing_mode = saved.get("mode", self.mowing_mode)
         self.edge_done = saved.get("edge_done", False)
+        self.edge_resume_target = saved.get("edge_resume_target", -1)
+        self.edge_resume_attempts = saved.get("edge_resume_attempts", 0)
         if saved.get("task_start_sim") is not None:
             self.task_start_sim = saved["task_start_sim"]
         self.lane_axis = saved.get("lane_axis", "h")
@@ -1207,6 +1585,9 @@ class TaskManager(object):
         self.rings_done = saved.get("rings_done", False)
         self.failed_segments = set(saved.get("failed_segments", []))
         self.zone_plan_passes = saved.get("zone_plan_passes", 0)
+        self.patch_cleanup_done = saved.get("patch_cleanup_done", False)
+        if saved.get("zone_stage") == "patch":
+            self.patch_cleanup_done = False
         phase = saved["phase"]
         self._log("event", "已返回断点，继续之前的任务")
         if phase == "map_seek":
@@ -1224,7 +1605,12 @@ class TaskManager(object):
         ):
             self.edge_points = saved["edge_points"]
             self.edge_index = saved.get("edge_index", 0)
-            self.phase = "zone_edge"
+            # 暂停/回充期间 sim_time 仍会增长，不能把这段时间算进沿边超时。
+            self.edge_start_sim = self.robot.sim_time - saved.get("edge_elapsed", 0.0)
+            if self.edge_index >= len(self.edge_points):
+                self._finish_edge_phase()
+            else:
+                self.phase = "zone_edge"
         elif phase in ("zone_stripes", "to_segment", "detour", "zone_plan", "ring"):
             self.phase = "zone_plan"
         elif phase == "to_zone":
@@ -1292,6 +1678,7 @@ class TaskManager(object):
                 "duration": round(duration, 1),
                 "mowed_cells": all_mowed,
                 "total_cells": all_total,
+                "stats": dict(self.stats),
                 "map_progress": round(self.grid.boundary_discovery(), 3),
                 "charge_reason": self.charge_reason,
                 "message": self.message,
@@ -1332,6 +1719,11 @@ class TaskManager(object):
                     else None
                 ),
             )
+
+
+def _segment_length(segment):
+    a, b = segment
+    return math.hypot(b[0] - a[0], b[1] - a[1])
 
 
 def _segment_key(segment):
