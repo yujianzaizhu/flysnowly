@@ -11,6 +11,7 @@ if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
 import config  # noqa: E402
+import tasks  # noqa: E402
 import world  # noqa: E402
 from grid_map import GridMap  # noqa: E402
 from robot_car import RobotCar  # noqa: E402
@@ -30,6 +31,9 @@ class RobotParameterTest(unittest.TestCase):
             mowing_mode="B",
             battery_low=25.0,
             battery_resume=75.0,
+            edge_speed=0.56,
+            inner_corner_advance=0.20,
+            dock_radius=0.82,
         )
         self.assertAlmostEqual(world.ROBOT_RADIUS, 0.22)
         self.assertAlmostEqual(world.MOWER_WIDTH, 0.50)
@@ -37,6 +41,9 @@ class RobotParameterTest(unittest.TestCase):
         self.assertEqual(world.VISION_RAYS, 61)
         self.assertAlmostEqual(settings.battery_low, 25.0)
         self.assertAlmostEqual(settings.battery_resume, 75.0)
+        self.assertAlmostEqual(tasks.EDGE_SPEED, 0.56)
+        self.assertAlmostEqual(tasks.INNER_CORNER_ADVANCE, 0.20)
+        self.assertAlmostEqual(world.DOCK["r"], 0.82)
         world.select_map(1)
         car = RobotCar()
         self.assertEqual(len(car.scan()), 61)

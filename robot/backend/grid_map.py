@@ -13,6 +13,8 @@ INFLATE_CELLS = 2
 MOW_INFLATE_CELLS = 2
 LARGE_OBSTACLE_EXTENT = 0.85
 SMALL_OBSTACLE_RADIUS = 0.45
+MIN_ZONE_AREA = 20.0
+REGULAR_SOLIDITY = 0.90
 
 
 class GridMap(object):
@@ -21,6 +23,11 @@ class GridMap(object):
         self.cols = world.COLS
         self.rows = world.ROWS
         self.version = 0
+        self.data_version = 1
+        self._circle_cache_version = -1
+        self._circle_cache = []
+        self._boundary_cache_version = -1
+        self._boundary_cache = 0.0
         self.wall_cells = world.boundary_cells()
         self.zones = []
         self.zone_totals = {}
@@ -32,6 +39,7 @@ class GridMap(object):
         self._reset_arrays()
 
     def _reset_arrays(self):
+        self.data_version = getattr(self, "data_version", 0) + 1
         self.data = bytearray(self.cols * self.rows)
         self.mowed = bytearray(self.cols * self.rows)
         self.blocked = bytearray(self.cols * self.rows)
@@ -77,20 +85,26 @@ class GridMap(object):
         index = self.index(col, row)
         if self.data[index] == UNKNOWN:
             self.data[index] = FREE
+            self.data_version += 1
 
     def mark_occupied(self, col, row):
         if not self.in_bounds(col, row):
             return
+        changed = False
         for dc in (-1, 0, 1):
             for dr in (-1, 0, 1):
                 c, r = col + dc, row + dr
                 if not self.in_bounds(c, r):
                     continue
                 index = self.index(c, r)
-                self.data[index] = OCCUPIED
+                if self.data[index] != OCCUPIED:
+                    self.data[index] = OCCUPIED
+                    changed = True
                 self._block_around(c, r)
                 self._block_mow_around(c, r)
         self.version += 1
+        if changed:
+            self.data_version += 1
 
     def _block_around(self, col, row):
         for dc in range(-INFLATE_CELLS, INFLATE_CELLS + 1):
@@ -122,41 +136,70 @@ class GridMap(object):
                 distance = math.hypot(x - cx, y - cy)
                 index = self.index(col, row)
                 if distance <= r_occ:
-                    self.data[index] = OCCUPIED
-                    changed = True
+                    if self.data[index] != OCCUPIED:
+                        self.data[index] = OCCUPIED
+                        changed = True
                 if distance <= r_mow:
                     self.mow_blocked[index] = 1
                 if distance <= r_block:
                     self.blocked[index] = 1
         if changed:
             self.version += 1
+            self.data_version += 1
 
     def update_from_scan(self, pose, readings, max_range):
         x, y, theta = pose
-        self.mark_free(*self.cell_of(x, y))
-        step = 0.05
+        cell = self.cell
+        cols = self.cols
+        rows = self.rows
+        data = self.data
+        changed_data = False
+
+        def mark_free_grid(px, py):
+            nonlocal changed_data
+            col = int(px / cell)
+            row = int(py / cell)
+            if 0 <= col < cols and 0 <= row < rows:
+                index = row * cols + col
+                if data[index] == UNKNOWN:
+                    data[index] = FREE
+                    changed_data = True
+
+        if not self.mask_ready:
+            mark_free_grid(x, y)
+        # 每格采样一次即可；0.05 m 采样会在同一栅格内重复写入多次。
+        step = cell
         for relative, distance in readings:
             heading = theta + relative
             dx, dy = math.cos(heading), math.sin(heading)
-            samples = int(distance / step)
-            for index in range(1, samples + 1):
-                px = x + dx * step * index
-                py = y + dy * step * index
-                self.mark_free(*self.cell_of(px, py))
+            if not self.mask_ready:
+                samples = int(distance / step)
+                for index in range(1, samples + 1):
+                    mark_free_grid(x + dx * step * index, y + dy * step * index)
             if distance < max_range - 1e-6:
                 px = x + dx * max(0.0, distance - 0.02)
                 py = y + dy * max(0.0, distance - 0.02)
-                self.mark_occupied(*self.cell_of(px, py))
+                before = self.data_version
+                self.mark_occupied(int(px / cell), int(py / cell))
+                changed_data = changed_data or self.data_version != before
+        if changed_data:
+            self.data_version += 1
         self.version += 1
 
     def boundary_discovery(self):
         if not self.wall_cells:
             return 0.0
+        if self._boundary_cache_version == self.data_version:
+            return self._boundary_cache
         seen = 0
+        data = self.data
+        cols = self.cols
         for col, row in self.wall_cells:
-            if self.data[self.index(col, row)] != UNKNOWN:
+            if data[row * cols + col] != UNKNOWN:
                 seen += 1
-        return seen / float(len(self.wall_cells))
+        self._boundary_cache_version = self.data_version
+        self._boundary_cache = seen / float(len(self.wall_cells))
+        return self._boundary_cache
 
     # ----------------------------------------------------------- 自由区与分区
     def build_free_area(self, seed):
@@ -208,190 +251,36 @@ class GridMap(object):
         return True
 
     def partition_zones(self):
-        """递归矩形切分自由区，生成尽量规则的割草区域。"""
-        cols = [
-            (col, row)
-            for row in range(self.rows)
-            for col in range(self.cols)
-            if self.free_mask[self.index(col, row)]
-        ]
+        """按实际连通自由区划分区域；规则连通域保持整体，哑铃形才拆分。"""
         self.zones = []
         self.zone_totals = {}
         self.zone_mowed = {}
-        if not cols:
+        min_zone_free = max(
+            100, int(round(MIN_ZONE_AREA / (self.cell * self.cell)))
+        )
+        components = self._free_components()
+        if not components:
             return self.zones
 
-        prefix = self._build_prefix()
-        min_col = min(col for col, _ in cols)
-        max_col = max(col for col, _ in cols)
-        min_row = min(row for _, row in cols)
-        max_row = max(row for _, row in cols)
-
-        rects = []
-
-        def free_count(c0, r0, c1, r1):
-            if c1 < c0 or r1 < r0:
-                return 0
-            return (
-                prefix[r1 + 1][c1 + 1]
-                - prefix[r0][c1 + 1]
-                - prefix[r1 + 1][c0]
-                + prefix[r0][c0]
-            )
-
-        def recurse(c0, r0, c1, r1, depth):
-            count = free_count(c0, r0, c1, r1)
-            if count <= 0:
-                return
-            width = c1 - c0 + 1
-            height = r1 - r0 + 1
-            area = width * height
-            fill = count / float(area)
-            if (
-                fill >= 0.97
-                or (area <= 2000 and fill >= 0.78)
-                or area <= 400
-                or depth >= 8
-                or width <= 4
-                or height <= 4
-            ):
-                rects.append((c0, r0, c1, r1))
-                return
-
-            best = None
-            if width >= height:
-                for cut in range(c0 + 3, c1 - 2, 2):
-                    left = free_count(c0, r0, cut, r1)
-                    right = free_count(cut + 1, r0, c1, r1)
-                    if left == 0 or right == 0:
-                        continue
-                    strip = free_count(max(c0, cut - 1), r0, min(c1, cut + 1), r1)
-                    cost = strip * 6.0 + abs(left - right) * 0.8
-                    if best is None or cost < best[0]:
-                        best = (cost, "v", cut)
-            else:
-                for cut in range(r0 + 3, r1 - 2, 2):
-                    top = free_count(c0, r0, c1, cut)
-                    bottom = free_count(c0, cut + 1, c1, r1)
-                    if top == 0 or bottom == 0:
-                        continue
-                    strip = free_count(c0, max(r0, cut - 1), c1, min(r1, cut + 1))
-                    cost = strip * 6.0 + abs(top - bottom) * 0.8
-                    if best is None or cost < best[0]:
-                        best = (cost, "h", cut)
-            if best is None:
-                rects.append((c0, r0, c1, r1))
-                return
-            if best[1] == "v":
-                recurse(c0, r0, best[2], r1, depth + 1)
-                recurse(best[2] + 1, r0, c1, r1, depth + 1)
-            else:
-                recurse(c0, r0, c1, best[2], depth + 1)
-                recurse(c0, best[2] + 1, c1, r1, depth + 1)
-
-        recurse(min_col, min_row, max_col, max_row, 0)
-
-        # 合并相邻且接近矩形的分区，避免产生过多碎片
-        while True:
-            best = None
-            for i in range(len(rects)):
-                a = rects[i]
-                if a is None:
-                    continue
-                for j in range(i + 1, len(rects)):
-                    b = rects[j]
-                    if b is None:
-                        continue
-                    union = None
-                    if a[0] == b[0] and a[2] == b[2] and (a[3] + 1 == b[1] or b[3] + 1 == a[1]):
-                        union = (a[0], min(a[1], b[1]), a[2], max(a[3], b[3]))
-                    elif a[1] == b[1] and a[3] == b[3] and (a[2] + 1 == b[0] or b[2] + 1 == a[0]):
-                        union = (min(a[0], b[0]), a[1], max(a[2], b[2]), a[3])
-                    if union is None:
-                        continue
-                    area = (union[2] - union[0] + 1) * (union[3] - union[1] + 1)
-                    if area > 2200:
-                        continue
-                    free = free_count(*union)
-                    fill = free / float(area)
-                    if fill < 0.64:
-                        continue
-                    score = fill - area / 12000.0
-                    if best is None or score > best[0]:
-                        best = (score, i, j, union)
-            if best is None:
-                break
-            _, i, j, union = best
-            rects[i] = union
-            rects[j] = None
-        rects = [rect for rect in rects if rect is not None]
-
-        # 将互不重叠的 BSP 叶子组合成区域；区域使用“格子集合”归属，
-        # 因此 bbox 允许包裹少量空白，但不会遗漏或重复计算自由区。
-        groups = []
-        for c0, r0, c1, r1 in rects:
-            cells = [
-                (col, row)
-                for row in range(r0, r1 + 1)
-                for col in range(c0, c1 + 1)
-                if self.free_mask[self.index(col, row)]
-            ]
-            if cells:
-                groups.append({"cells": set(cells), "free": len(cells)})
-
-        min_zone_free = 1000
-
-        def group_bbox(group):
-            cols_ = [cell[0] for cell in group["cells"]]
-            rows_ = [cell[1] for cell in group["cells"]]
-            return min(cols_), min(rows_), max(cols_), max(rows_)
-
-        def bbox_gap(a, b):
-            ax0, ay0, ax1, ay1 = group_bbox(a)
-            bx0, by0, bx1, by1 = group_bbox(b)
-            dx = max(0, bx0 - ax1 - 1, ax0 - bx1 - 1)
-            dy = max(0, by0 - ay1 - 1, ay0 - by1 - 1)
-            return dx + dy
-
-        while len(groups) > 1:
-            small_indices = [i for i, group in enumerate(groups) if group["free"] < min_zone_free]
-            if not small_indices:
-                break
-            i = min(small_indices, key=lambda index: groups[index]["free"])
-            best = None
-            for j, other in enumerate(groups):
-                if j == i:
-                    continue
-                ax0, ay0, ax1, ay1 = group_bbox(groups[i])
-                bx0, by0, bx1, by1 = group_bbox(other)
-                union_area = (max(ax1, bx1) - min(ax0, bx0) + 1) * (
-                    max(ay1, by1) - min(ay0, by0) + 1
-                )
-                score = bbox_gap(groups[i], other) * 100 + union_area
-                if best is None or score < best[0]:
-                    best = (score, j)
-            if best is None:
-                break
-            j = best[1]
-            groups[i]["cells"].update(groups[j]["cells"])
-            groups[i]["free"] = len(groups[i]["cells"])
-            groups.pop(j)
-            if j < i:
-                i -= 1
+        zone_cells = []
+        for component in components:
+            zone_cells.extend(self._split_component(component, min_zone_free))
+        zone_cells = self._merge_small_components(zone_cells, min_zone_free)
 
         normalized = []
-        for group in groups:
-            cells = group["cells"]
-            cols_ = [cell[0] for cell in cells]
-            rows_ = [cell[1] for cell in cells]
+        for cells in zone_cells:
+            if not cells:
+                continue
+            cols_ = [cell % self.cols for cell in cells]
+            rows_ = [cell // self.cols for cell in cells]
             c0, c1 = min(cols_), max(cols_)
             r0, r1 = min(rows_), max(rows_)
             x0 = c0 * self.cell
             y0 = r0 * self.cell
             x1 = (c1 + 1) * self.cell
             y1 = (r1 + 1) * self.cell
-            cx = sum((cell[0] + 0.5) * self.cell for cell in cells) / len(cells)
-            cy = sum((cell[1] + 0.5) * self.cell for cell in cells) / len(cells)
+            cx = sum((cell % self.cols + 0.5) * self.cell for cell in cells) / len(cells)
+            cy = sum((cell // self.cols + 0.5) * self.cell for cell in cells) / len(cells)
             normalized.append(
                 {
                     "x0": round(x0, 2),
@@ -405,23 +294,6 @@ class GridMap(object):
                 }
             )
 
-        if not normalized:
-            x0, y0 = self.center_of(min_col, min_row)
-            x1, y1 = self.center_of(max_col, max_row)
-            cells = set(cols)
-            normalized.append(
-                {
-                    "x0": round(x0 - self.cell, 2),
-                    "y0": round(y0 - self.cell, 2),
-                    "x1": round(x1 + self.cell, 2),
-                    "y1": round(y1 + self.cell, 2),
-                    "cx": round((x0 + x1) / 2.0, 2),
-                    "cy": round((y0 + y1) / 2.0, 2),
-                    "free": len(cells),
-                    "cells": cells,
-                }
-            )
-
         normalized.sort(key=lambda zone: (-zone["cy"], zone["cx"]))
         self.zone_id_map = bytearray(self.cols * self.rows)
         for index, zone in enumerate(normalized, start=1):
@@ -430,12 +302,143 @@ class GridMap(object):
             self.zones.append(zone)
             self.zone_totals[index] = zone["free"]
             self.zone_mowed[index] = 0
-            for col, row in zone.pop("cells"):
-                self.zone_id_map[self.index(col, row)] = index
+            for cell in zone.pop("cells"):
+                self.zone_id_map[cell] = index
         self.free_total = sum(1 for value in self.free_mask if value)
         self.covered_free = sum(self.zone_totals.values())
         self.version += 1
         return self.zones
+
+    def _free_components(self):
+        visited = set()
+        components = []
+        for start in range(self.cols * self.rows):
+            if not self.free_mask[start] or start in visited:
+                continue
+            visited.add(start)
+            stack = [start]
+            cells = []
+            while stack:
+                index = stack.pop()
+                cells.append(index)
+                col = index % self.cols
+                row = index // self.cols
+                for dc in (-1, 0, 1):
+                    for dr in (-1, 0, 1):
+                        if dc == 0 and dr == 0:
+                            continue
+                        nc, nr = col + dc, row + dr
+                        if not self.in_bounds(nc, nr):
+                            continue
+                        nindex = self.index(nc, nr)
+                        if self.free_mask[nindex] and nindex not in visited:
+                            visited.add(nindex)
+                            stack.append(nindex)
+            components.append(set(cells))
+        return components
+
+    def _component_distances(self, start, cells):
+        from collections import deque
+
+        distances = {start: 0}
+        queue = deque([start])
+        while queue:
+            index = queue.popleft()
+            col = index % self.cols
+            row = index // self.cols
+            for dc, dr, _cost in _NEIGHBORS:
+                nc, nr = col + dc, row + dr
+                if not self.in_bounds(nc, nr):
+                    continue
+                nindex = self.index(nc, nr)
+                if nindex not in cells or nindex in distances:
+                    continue
+                distances[nindex] = distances[index] + 1
+                queue.append(nindex)
+        return distances
+
+    def _split_component(self, cells, min_zone_free):
+        if len(cells) < 2 * min_zone_free:
+            return [cells]
+        hull_area = self._convex_hull_area(cells)
+        solidity = len(cells) / max(1.0, hull_area)
+        if solidity >= REGULAR_SOLIDITY:
+            return [cells]
+
+        start = next(iter(cells))
+        first_dist = self._component_distances(start, cells)
+        endpoint_a = max(first_dist, key=first_dist.get)
+        dist_a = self._component_distances(endpoint_a, cells)
+        endpoint_b = max(dist_a, key=dist_a.get)
+        dist_b = self._component_distances(endpoint_b, cells)
+        part_a = set()
+        part_b = set()
+        for index in cells:
+            if dist_a.get(index, 1e18) <= dist_b.get(index, 1e18):
+                part_a.add(index)
+            else:
+                part_b.add(index)
+        if (
+            len(part_a) < min_zone_free
+            or len(part_b) < min_zone_free
+            or not part_a
+            or not part_b
+        ):
+            return [cells]
+        return [part_a, part_b]
+
+    def _convex_hull_area(self, cells):
+        points = set()
+        for index in cells:
+            col = index % self.cols
+            row = index // self.cols
+            boundary = False
+            for dc, dr in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nc, nr = col + dc, row + dr
+                if not self.in_bounds(nc, nr) or self.index(nc, nr) not in cells:
+                    boundary = True
+                    break
+            if boundary:
+                points.update(
+                    ((col, row), (col + 1, row), (col, row + 1), (col + 1, row + 1))
+                )
+        points = sorted(points)
+        if len(points) < 3:
+            return float(len(cells))
+        return _polygon_area(_convex_hull(points))
+
+    def _merge_small_components(self, zones, min_zone_free):
+        groups = [set(cells) for cells in zones if cells]
+        while len(groups) > 1:
+            small = [index for index, cells in enumerate(groups) if len(cells) < min_zone_free]
+            if not small:
+                break
+            index = min(small, key=lambda item: len(groups[item]))
+            best = None
+            for other_index, other in enumerate(groups):
+                if other_index == index:
+                    continue
+                gap = self._cell_group_gap(groups[index], other)
+                if best is None or gap < best[0]:
+                    best = (gap, other_index)
+            if best is None:
+                break
+            other_index = best[1]
+            groups[index].update(groups[other_index])
+            groups.pop(other_index)
+        return groups
+
+    def _cell_group_gap(self, a, b):
+        def bounds(cells):
+            cols_ = [cell % self.cols for cell in cells]
+            rows_ = [cell // self.cols for cell in cells]
+            return min(cols_), min(rows_), max(cols_), max(rows_)
+
+        ax0, ay0, ax1, ay1 = bounds(a)
+        bx0, by0, bx1, by1 = bounds(b)
+        dx = max(0, bx0 - ax1 - 1, ax0 - bx1 - 1)
+        dy = max(0, by0 - ay1 - 1, ay0 - by1 - 1)
+        return dx + dy
 
     def _build_prefix(self):
         prefix = [[0] * (self.cols + 1) for _ in range(self.rows + 1)]
@@ -468,7 +471,13 @@ class GridMap(object):
 
     # ----------------------------------------------------------- 覆盖
     def mark_mowed(self, x, y, radius=None):
-        radius = world.MOWER_WIDTH / 2.0 if radius is None else radius
+        # 栅格中心与连续刀盘边界存在最多半格量化误差，补 0.3 格避免
+        # 沿边时把实际已割到的区域误记成漏扫。
+        radius = (
+            world.MOWER_WIDTH / 2.0 + world.CELL * 0.3
+            if radius is None
+            else radius
+        )
         col0, row0 = self.cell_of(x - radius, y - radius)
         col1, row1 = self.cell_of(x + radius, y + radius)
         for col in range(col0, col1 + 1):
@@ -614,16 +623,27 @@ class GridMap(object):
 
     # ----------------------------------------------------------- 障碍聚类
     def obstacle_circles(self, zone=None):
+        if self._circle_cache_version != self.data_version:
+            self._circle_cache = self._compute_obstacle_circles()
+            self._circle_cache_version = self.data_version
+        if zone is None:
+            return self._circle_cache
+        expanded = (
+            zone["x0"] - 0.6,
+            zone["y0"] - 0.6,
+            zone["x1"] + 0.6,
+            zone["y1"] + 0.6,
+        )
+        return [
+            circle
+            for circle in self._circle_cache
+            if expanded[0] <= circle["x"] <= expanded[2]
+            and expanded[1] <= circle["y"] <= expanded[3]
+        ]
+
+    def _compute_obstacle_circles(self):
         visited = set()
         circles = []
-        expanded = None
-        if zone is not None:
-            expanded = (
-                zone["x0"] - 0.6,
-                zone["y0"] - 0.6,
-                zone["x1"] + 0.6,
-                zone["y1"] + 0.6,
-            )
         for row in range(self.rows):
             for col in range(self.cols):
                 index = self.index(col, row)
@@ -682,9 +702,6 @@ class GridMap(object):
                     if extent >= LARGE_OBSTACLE_EXTENT or len(cells) >= 90
                     else "small"
                 )
-                if expanded is not None:
-                    if not (expanded[0] <= cx <= expanded[2] and expanded[1] <= cy <= expanded[3]):
-                        continue
                 circles.append(
                     {
                         "x": round(cx, 2),
@@ -762,6 +779,61 @@ class GridMap(object):
         path.reverse()
         return self.smooth(path)
 
+    def plan_near(self, start, goal):
+        """当目标点不可达时，规划到当前位置连通域内离目标最近的栅格。"""
+        from collections import deque
+
+        start_col, start_row = self._nearest_open(start)
+        if start_col is None:
+            return [], float("inf")
+        start_index = self.index(start_col, start_row)
+        goal_index = self.index(*self.cell_of(*goal))
+        queue = deque([start_index])
+        came_from = {start_index: None}
+
+        def metric(index):
+            x, y = self.center_of(index % self.cols, index // self.cols)
+            return math.hypot(x - goal[0], y - goal[1])
+
+        best_index = start_index
+        best_distance = metric(start_index)
+        expansions = 0
+        while queue and expansions < 80000:
+            current = queue.popleft()
+            expansions += 1
+            col = current % self.cols
+            row = current // self.cols
+            distance = metric(current)
+            if distance < best_distance:
+                best_distance = distance
+                best_index = current
+                if best_distance <= 0.55:
+                    break
+            if current == goal_index:
+                best_index = current
+                best_distance = 0.0
+                break
+            for dc, dr, _cost in _NEIGHBORS:
+                nc, nr = col + dc, row + dr
+                if not self._open(nc, nr):
+                    continue
+                nindex = self.index(nc, nr)
+                if nindex in came_from:
+                    continue
+                if self.data[nindex] == OCCUPIED:
+                    continue
+                came_from[nindex] = current
+                queue.append(nindex)
+        if best_index == start_index and best_distance > 0.55:
+            return [], best_distance
+        path = []
+        node = best_index
+        while node is not None:
+            path.append(self.center_of(node % self.cols, node // self.cols))
+            node = came_from.get(node)
+        path.reverse()
+        return self.smooth(path), best_distance
+
     def smooth(self, path):
         if len(path) <= 2:
             return path
@@ -836,6 +908,34 @@ class GridMap(object):
 
 
 _ASCII_TABLE = bytes.maketrans(b"\x00\x01\x02", b"012")
+
+
+def _polygon_area(points):
+    area = 0.0
+    for index, point in enumerate(points):
+        nxt = points[(index + 1) % len(points)]
+        area += point[0] * nxt[1] - nxt[0] * point[1]
+    return abs(area) * 0.5
+
+
+def _convex_hull(points):
+    def cross(origin, a, b):
+        return (a[0] - origin[0]) * (b[1] - origin[1]) - (
+            a[1] - origin[1]
+        ) * (b[0] - origin[0])
+
+    lower = []
+    for point in points:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0:
+            lower.pop()
+        lower.append(point)
+    upper = []
+    for point in reversed(points):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0:
+            upper.pop()
+        upper.append(point)
+    return lower[:-1] + upper[:-1]
+
 
 _NEIGHBORS = (
     (1, 0, 1.0),

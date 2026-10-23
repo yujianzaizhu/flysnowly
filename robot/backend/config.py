@@ -25,6 +25,7 @@ class Settings(object):
         self.battery_resume = 80.0
         self.charge_rate = 8.0
         self.battery_drain_factor = 0.6
+        self.dock_radius = 0.70
         # 割草
         self.mowing_mode = "A"
         self.edge_inset = 0.22
@@ -33,11 +34,14 @@ class Settings(object):
         self.nav_speed = 0.38
         self.map_speed = 0.50
         self.mow_speed = 0.48
+        self.edge_speed = 0.50
+        self.inner_corner_advance = 0.16
         # 障碍物分类（来自视觉建图，不使用真值）
         self.large_obstacle_extent = 0.85
         self.small_obstacle_radius = 0.45
         # 弓字重规划 / 断点
-        self.max_zone_plan_passes = 8
+        self.max_zone_plan_passes = 30
+        self.min_zone_area = 20.0
 
 
 settings = Settings()
@@ -57,15 +61,19 @@ _RANGES = {
     "battery_resume": (40.0, 100.0),
     "charge_rate": (0.5, 30.0),
     "battery_drain_factor": (0.10, 2.00),
+    "dock_radius": (0.30, 1.50),
     "edge_inset": (0.12, 0.60),
     "lane_spacing": (0.15, 0.80),
     "ring_margin": (0.20, 1.50),
     "nav_speed": (0.10, 2.00),
     "map_speed": (0.10, 2.00),
     "mow_speed": (0.10, 2.00),
+    "edge_speed": (0.15, 1.20),
+    "inner_corner_advance": (0.04, 0.40),
     "large_obstacle_extent": (0.40, 2.00),
     "small_obstacle_radius": (0.10, 1.00),
-    "max_zone_plan_passes": (1, 30),
+    "max_zone_plan_passes": (1, 50),
+    "min_zone_area": (8.0, 100.0),
 }
 
 
@@ -107,6 +115,9 @@ def apply():
     world.VISION_FOV = math.radians(float(settings.vision_fov_deg))
     world.VISION_RANGE = float(settings.vision_range)
     world.VISION_RAYS = max(9, int(settings.vision_rays))
+    world.DOCK_RADIUS = float(settings.dock_radius)
+    if world.DOCK:
+        world.DOCK["r"] = world.DOCK_RADIUS
 
     robot_car.MAX_LINEAR = float(settings.max_linear)
     robot_car.MAX_ANGULAR = float(settings.max_angular)
@@ -122,11 +133,14 @@ def apply():
     tasks.NAV_SPEED = float(settings.nav_speed)
     tasks.MAP_SPEED = float(settings.map_speed)
     tasks.MOW_SPEED = float(settings.mow_speed)
+    tasks.EDGE_SPEED = float(settings.edge_speed)
+    tasks.INNER_CORNER_ADVANCE = float(settings.inner_corner_advance)
     tasks.DEFAULT_MOWING_MODE = settings.mowing_mode
     tasks.MAX_ZONE_PLAN_PASSES = int(settings.max_zone_plan_passes)
 
     grid_map.LARGE_OBSTACLE_EXTENT = float(settings.large_obstacle_extent)
     grid_map.SMALL_OBSTACLE_RADIUS = float(settings.small_obstacle_radius)
+    grid_map.MIN_ZONE_AREA = float(settings.min_zone_area)
 
 
 def reset():

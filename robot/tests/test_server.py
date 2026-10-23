@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import sys
@@ -81,10 +82,21 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(state["task"]["phase"].startswith("map"))
 
     def test_start_mowing_with_order(self):
-        _, state = self.post("/api/task", {"task": "mow", "zones": [2, 1], "mode": "B"})
+        self.post("/api/map", {"map": 3})
+        with self.httpd.simulator.lock:
+            manager = self.httpd.manager
+            manager.grid.build_free_area(
+                (manager.robot.pose[0], manager.robot.pose[1])
+            )
+            zones = manager.grid.partition_zones()
+        self.assertGreaterEqual(len(zones), 2)
+        order = [zones[1]["id"], zones[0]["id"]]
+        _, state = self.post(
+            "/api/task", {"task": "mow", "zones": order, "mode": "B"}
+        )
         self.assertEqual(state["task"]["type"], "mow")
-        self.assertEqual(state["task"]["zone_order"], [2, 1])
-        self.assertEqual(state["task"]["current_zone"], 2)
+        self.assertEqual(state["task"]["zone_order"], order)
+        self.assertEqual(state["task"]["current_zone"], order[0])
         self.assertEqual(state["task"]["mode"], "B")
         self.assertEqual(state["mowing_mode"], "B")
 
@@ -110,10 +122,11 @@ class ServerTest(unittest.TestCase):
         self.assertGreater(state["velocity"]["linear"], 0.0)
 
     def test_speed_endpoint(self):
-        _, state = self.post("/api/speed", {"speed": 8})
-        self.assertEqual(state["speed"], 8)
-        _, body = self.get("/api/state")
-        self.assertEqual(json.loads(body)["speed"], 8)
+        for speed in (8, 16, 32):
+            _, state = self.post("/api/speed", {"speed": speed})
+            self.assertEqual(state["speed"], speed)
+            _, body = self.get("/api/state")
+            self.assertEqual(json.loads(body)["speed"], speed)
         self.post("/api/speed", {"speed": 1})
 
     def test_charge_and_resume_endpoints(self):
@@ -132,12 +145,59 @@ class ServerTest(unittest.TestCase):
             state["map"]["cols"] * state["map"]["rows"],
         )
 
+    @unittest.skipUnless(
+        os.path.isdir("/home/fibocom/heyufei/data/map/map"), "真实地图目录不存在"
+    )
+    def test_import_real_map_endpoint(self):
+        _, state = self.post(
+            "/api/map/import",
+            {"path": "/home/fibocom/heyufei/data/map/map"},
+        )
+        self.assertTrue(state["world"]["imported"])
+        self.assertGreater(state["world"]["import_meta"]["free_area_m2"], 10.0)
+        self.assertIn("实景", state["map_name"])
+        self.assertEqual(
+            len(state["map"]["occupancy"]),
+            state["map"]["cols"] * state["map"]["rows"],
+        )
+
+    def test_upload_map_endpoint(self):
+        width, height = 40, 30
+        pixels = bytearray(width * height)
+        for row in range(4, height - 4):
+            for col in range(4, width - 4):
+                pixels[row * width + col] = 255
+        pgm = b"P5\n40 30\n255\n" + bytes(pixels)
+        files = [
+            {
+                "path": "map/grid_map.pgm",
+                "data": base64.b64encode(pgm).decode("ascii"),
+            },
+            {
+                "path": "map/path/default.json",
+                "data": base64.b64encode(b'{"resolution":"0.1"}').decode("ascii"),
+            },
+        ]
+        _, state = self.post("/api/map/upload", {"files": files})
+        self.assertTrue(state["world"]["imported"])
+        self.assertAlmostEqual(state["world"]["import_meta"]["resolution"], 0.1)
+        self.assertAlmostEqual(state["world"]["width"], 4.4, places=1)
+        self.assertGreater(state["world"]["import_meta"]["free_area_m2"], 1.0)
+        imported_id = state["map_id"]
+        _, state = self.post("/api/map/delete", {"map": imported_id})
+        self.assertEqual(state["map_id"], 1)
+        self.assertNotIn(
+            imported_id,
+            [item["id"] for item in state["world"]["maps"]],
+        )
+
     def test_invalid_payloads(self):
         for path, payload in (
             ("/api/command", {"command": "fly"}),
             ("/api/task", {"task": "unknown"}),
             ("/api/speed", {"speed": 3}),
             ("/api/map", {"map": 99}),
+            ("/api/map/delete", {"map": 1}),
             ("/api/task", {"task": "mow", "zones": [1], "mode": "C"}),
             ("/api/config", {"robot_radius": 5.0}),
         ):

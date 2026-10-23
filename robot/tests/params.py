@@ -32,6 +32,7 @@ BATTERY_PARAMS = {
     "battery_resume": 80.0,
     "charge_rate": 8.0,
     "battery_drain_factor": 0.6,
+    "dock_radius": 0.70,
 }
 
 MOWING_PARAMS = {
@@ -42,9 +43,12 @@ MOWING_PARAMS = {
     "nav_speed": 0.38,
     "map_speed": 0.50,
     "mow_speed": 0.48,
+    "edge_speed": 0.50,
+    "inner_corner_advance": 0.16,
     "large_obstacle_extent": 0.85,
     "small_obstacle_radius": 0.45,
-    "max_zone_plan_passes": 8,
+    "max_zone_plan_passes": 30,
+    "min_zone_area": 20.0,
 }
 
 

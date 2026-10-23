@@ -9,6 +9,37 @@ EDGE_INSET = 0.22
 RING_MARGIN = 0.34
 
 
+def _polygon_area(points):
+    area = 0.0
+    for index, point in enumerate(points):
+        nxt = points[(index + 1) % len(points)]
+        area += point[0] * nxt[1] - nxt[0] * point[1]
+    return area * 0.5
+
+
+def _path_length(points):
+    return sum(
+        math.hypot(points[index][0] - points[index - 1][0], points[index][1] - points[index - 1][1])
+        for index in range(1, len(points))
+    )
+
+
+def _densify(points, max_step=0.16):
+    if len(points) < 2:
+        return points
+    result = [points[0]]
+    for target in points[1:]:
+        ax, ay = result[-1]
+        distance = math.hypot(target[0] - ax, target[1] - ay)
+        count = max(1, int(math.ceil(distance / max_step)))
+        for index in range(1, count + 1):
+            ratio = index / float(count)
+            result.append(
+                (ax + (target[0] - ax) * ratio, ay + (target[1] - ay) * ratio)
+            )
+    return result
+
+
 def edge_corners(zone, inset=None):
     inset = EDGE_INSET if inset is None else inset
     """区域边缘（内缩）矩形的四个角，按逆时针排列。"""
@@ -34,41 +65,81 @@ def edge_route(zone, start_xy, inset=None):
 
 
 def edge_route_grid(grid, zone, start_xy, clearance=None):
-    clearance = max(0.14, EDGE_INSET - 0.02) if clearance is None else clearance
     """沿区域自由区边界（内缩 clearance）生成闭合巡边路径。"""
+    # 路径中心离开边界约一个车体半径即可；割草宽度半幅略大于该距离，
+    # 保证刀盘覆盖到区域边界/障碍物边界的最后一小条草。
+    clearance = (
+        max(0.12, min(EDGE_INSET, world.ROBOT_RADIUS - 0.04))
+        if clearance is None
+        else clearance
+    )
+    from collections import deque
+
+    zone_id = zone["id"]
+    cols = grid.cols
+    rows = grid.rows
+    zone_map = grid.zone_id_map
     cells = []
-    for row in range(grid.rows):
-        for col in range(grid.cols):
-            index = grid.index(col, row)
-            if not grid.free_mask[index]:
-                continue
-            x, y = grid.center_of(col, row)
-            found = grid.zone_at(x, y)
-            if found is None or found["id"] != zone["id"]:
-                continue
-            cells.append((col, row, x, y))
+    for index, assigned in enumerate(zone_map):
+        if assigned != zone_id or not grid.free_mask[index]:
+            continue
+        col = index % cols
+        row = index // cols
+        cells.append((col, row))
     if len(cells) < 20:
         return edge_route(zone, start_xy)
 
-    safe = set()
-    for col, row, x, y in cells:
-        ok = True
-        for angle_index in range(12):
-            angle = 2.0 * math.pi * angle_index / 12.0
-            nx = x + clearance * math.cos(angle)
-            ny = y + clearance * math.sin(angle)
-            nc, nr = grid.cell_of(nx, ny)
+    # 在区域栅格内做一次多源 BFS，距离边界 >= 2 格的内部栅格即为安全巡边带，
+    # 比逐格 12 方向采样快一个数量级。
+    distance = [-1] * (cols * rows)
+    queue = deque()
+    for col, row in cells:
+        index = row * cols + col
+        boundary_cell = False
+        for dc, dr in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nc, nr = col + dc, row + dr
+            if not grid.in_bounds(nc, nr) or zone_map[nr * cols + nc] != zone_id:
+                boundary_cell = True
+                break
+        if boundary_cell:
+            distance[index] = 0
+            queue.append((col, row))
+    while queue:
+        col, row = queue.popleft()
+        index = row * cols + col
+        for dc, dr in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nc, nr = col + dc, row + dr
             if not grid.in_bounds(nc, nr):
-                ok = False
-                break
-            nindex = grid.index(nc, nr)
-            if not grid.free_mask[nindex]:
-                ok = False
-                break
-            found = grid.zone_at(nx, ny)
-            if found is None or found["id"] != zone["id"]:
-                ok = False
-                break
+                continue
+            nindex = nr * cols + nc
+            if zone_map[nindex] != zone_id or distance[nindex] >= 0:
+                continue
+            distance[nindex] = distance[index] + 1
+            queue.append((nc, nr))
+
+    safe = set()
+    for col, row in cells:
+        index = row * cols + col
+        if distance[index] < 2:
+            continue
+        x, y = grid.center_of(col, row)
+        ok = True
+        if world.boundary_distance(x, y) < world.ROBOT_RADIUS + 0.05:
+            ok = False
+        if ok:
+            for polygon in world.OBSTACLE_POLYGONS:
+                if (
+                    world.point_in_polygon(x, y, polygon)
+                    or world.boundary_distance(x, y, polygon)
+                    < world.ROBOT_RADIUS + 0.05
+                ):
+                    ok = False
+                    break
+        if ok:
+            for ox, oy, radius in world.OBSTACLES:
+                if math.hypot(x - ox, y - oy) < radius + world.ROBOT_RADIUS + 0.05:
+                    ok = False
+                    break
         if ok:
             safe.add((col, row))
     if len(safe) < 8:
@@ -98,49 +169,102 @@ def edge_route_grid(grid, zone, start_xy, clearance=None):
                         stack.append(neighbour)
                         component.append(neighbour)
         components.append(component)
-    loop_cells = set(max(components, key=len))
-    start_cell = min(
-        loop_cells,
-        key=lambda cell: math.hypot(
-            grid.center_of(*cell)[0] - start_xy[0],
-            grid.center_of(*cell)[1] - start_xy[1],
-        ),
-    )
-    walk = [start_cell]
-    visited = {start_cell}
-    current = start_cell
-    previous = None
-    while True:
-        candidates = []
-        for dc in (-1, 0, 1):
-            for dr in (-1, 0, 1):
-                if dc == 0 and dr == 0:
-                    continue
-                neighbour = (current[0] + dc, current[1] + dr)
-                if neighbour in loop_cells and neighbour not in visited:
-                    candidates.append(neighbour)
-        if not candidates:
-            break
-        if previous is None:
-            chosen = min(candidates, key=lambda cell: abs(cell[0] - current[0]) + abs(cell[1] - current[1]))
-        else:
-            previous_heading = math.atan2(current[1] - previous[1], current[0] - previous[0])
+    def walk_component(component):
+        loop_cells = set(component)
+        start_cell = min(
+            loop_cells,
+            key=lambda cell: math.hypot(
+                grid.center_of(*cell)[0] - start_xy[0],
+                grid.center_of(*cell)[1] - start_xy[1],
+            ),
+        )
+        walk = [start_cell]
+        visited = {start_cell}
+        current = start_cell
+        previous = None
+        while True:
+            candidates = []
+            for dc in (-1, 0, 1):
+                for dr in (-1, 0, 1):
+                    if dc == 0 and dr == 0:
+                        continue
+                    neighbour = (current[0] + dc, current[1] + dr)
+                    if neighbour in loop_cells and neighbour not in visited:
+                        candidates.append(neighbour)
+            if not candidates:
+                break
+            if previous is None:
+                chosen = min(
+                    candidates,
+                    key=lambda cell: abs(cell[0] - current[0])
+                    + abs(cell[1] - current[1]),
+                )
+            else:
+                previous_heading = math.atan2(
+                    current[1] - previous[1], current[0] - previous[0]
+                )
 
-            def score(cell):
-                heading = math.atan2(cell[1] - current[1], cell[0] - current[0])
-                turn = abs(world.wrap_angle(heading - previous_heading))
-                diagonal = abs(cell[0] - current[0]) + abs(cell[1] - current[1]) > 1
-                return turn + (0.45 if diagonal else 0.0)
+                def score(cell):
+                    heading = math.atan2(
+                        cell[1] - current[1], cell[0] - current[0]
+                    )
+                    turn = abs(world.wrap_angle(heading - previous_heading))
+                    diagonal = abs(cell[0] - current[0]) + abs(cell[1] - current[1]) > 1
+                    return turn + (0.45 if diagonal else 0.0)
 
-            chosen = min(candidates, key=score)
-        walk.append(chosen)
-        visited.add(chosen)
-        previous, current = current, chosen
-    points = [grid.center_of(col, row) for col, row in walk]
-    if len(points) < 2:
+                chosen = min(candidates, key=score)
+            walk.append(chosen)
+            visited.add(chosen)
+            previous, current = current, chosen
+        points = [grid.center_of(col, row) for col, row in walk]
+        if len(points) < 2:
+            return []
+        points.append(points[0])
+        return points
+
+    loops = []
+    for component in components:
+        if len(component) < 8:
+            continue
+        points = walk_component(component)
+        if len(points) < 3:
+            continue
+        if _polygon_area(points) < 0.0:
+            points = list(reversed(points))
+        loops.append(points)
+    if not loops:
         return edge_route(zone, start_xy)
-    points.append(points[0])
-    return points
+    loops.sort(key=lambda points: -_path_length(points))
+    # 外边界先由沿边阶段完成；区域内部障碍由后续环形补割按实体边界处理，
+    # 避免在沿边路径中插入长距离切换造成碰撞。
+    loops = loops[:1]
+
+    route = []
+    current = start_xy
+    for loop in loops:
+        if len(loop) < 3:
+            continue
+        entry_index = min(
+            range(len(loop) - 1),
+            key=lambda index: math.hypot(
+                loop[index][0] - current[0], loop[index][1] - current[1]
+            ),
+        )
+        loop = loop[entry_index:-1] + loop[:entry_index] + [loop[entry_index]]
+        if not route:
+            route = list(loop)
+        else:
+            if grid.line_clear(current, loop[0]):
+                bridge = [current, loop[0]]
+            else:
+                bridge = grid.plan(current, loop[0])
+            if bridge and len(bridge) > 1:
+                route.extend(bridge[1:])
+            route.extend(loop[1:])
+        current = route[-1]
+    if len(route) < 2:
+        return edge_route(zone, start_xy)
+    return _densify(route)
 
 
 def lane_segments(grid, zone, spacing=None, axis="h"):

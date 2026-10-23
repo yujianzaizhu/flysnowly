@@ -1,9 +1,12 @@
 """机器人小车 Web 服务：静态界面 + 任务/遥控 JSON 接口。"""
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -13,6 +16,7 @@ from urllib.parse import unquote, urlsplit
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config  # noqa: E402
+import map_import  # noqa: E402
 import world  # noqa: E402
 from grid_map import GridMap  # noqa: E402
 from robot_car import RobotCar  # noqa: E402
@@ -33,7 +37,62 @@ CONTENT_TYPES = {
 }
 
 MAX_BODY_BYTES = 64 * 1024
+MAX_UPLOAD_BODY_BYTES = 40 * 1024 * 1024
+MAX_UPLOAD_FILE_BYTES = 16 * 1024 * 1024
+MAP_UPLOAD_EXTENSIONS = (".pgm", ".json", ".yaml", ".yml")
 SIM_DT = 0.02
+
+
+def _store_uploaded_map(files):
+    """把浏览器上传的文件按相对路径落到稳定临时目录。"""
+    if not isinstance(files, list) or not files:
+        raise ValueError("没有上传文件")
+    normalized = []
+    digest = hashlib.sha256()
+    total = 0
+    for item in files:
+        if not isinstance(item, dict):
+            raise ValueError("上传文件格式无效")
+        relative = str(item.get("path") or item.get("name") or "").replace("\\", "/")
+        relative = os.path.normpath(relative).lstrip("/")
+        if relative in ("", ".", "..") or relative.startswith("../"):
+            raise ValueError("上传文件路径无效")
+        name = os.path.basename(relative).lower()
+        if not name.endswith(MAP_UPLOAD_EXTENSIONS):
+            raise ValueError("不支持的文件类型: {}".format(os.path.basename(relative)))
+        try:
+            raw = base64.b64decode(str(item.get("data") or ""), validate=True)
+        except (ValueError, TypeError):
+            raise ValueError("文件 {} 的 base64 数据无效".format(relative))
+        if len(raw) > MAX_UPLOAD_FILE_BYTES:
+            raise ValueError("文件 {} 超过 16 MB".format(relative))
+        total += len(raw)
+        if total > 24 * 1024 * 1024:
+            raise ValueError("上传文件总大小超过 24 MB")
+        normalized.append((relative, raw))
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(raw)
+
+    # 浏览器目录选择会把顶层目录名带进相对路径；统一剥掉，方便 map_import 解析。
+    first_parts = {relative.split("/", 1)[0] for relative, _ in normalized}
+    has_nested = all("/" in relative for relative, _ in normalized)
+    if len(first_parts) == 1 and has_nested:
+        prefix = next(iter(first_parts)) + "/"
+        normalized = [(relative[len(prefix) :], raw) for relative, raw in normalized]
+
+    root = os.path.join(
+        tempfile.gettempdir(), "robot_map_uploads", digest.hexdigest()[:20]
+    )
+    os.makedirs(root, exist_ok=True)
+    for relative, raw in normalized:
+        target = os.path.normpath(os.path.join(root, relative))
+        if not target.startswith(root + os.sep):
+            raise ValueError("上传文件路径越界")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as handle:
+            handle.write(raw)
+    return root
 
 
 class Simulator(threading.Thread):
@@ -103,7 +162,12 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "接口不存在"}, status=404)
             return
         try:
-            payload = self._read_json()
+            limit = (
+                MAX_UPLOAD_BODY_BYTES
+                if path == "/api/map/upload"
+                else MAX_BODY_BYTES
+            )
+            payload = self._read_json(limit)
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=400)
             return
@@ -145,6 +209,65 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                     self.server.grid = grid
                     self.server.manager = manager
                     self.server.simulator.manager = manager
+            elif path == "/api/map/delete":
+                map_id = int(payload.get("map", 0))
+                world.delete_map(map_id)
+                with self.server.simulator.lock:
+                    if world.MAP_ID == map_id:
+                        world.select_map(1)
+                        robot = RobotCar()
+                        grid = GridMap()
+                        manager = TaskManager(robot, grid)
+                        self.server.robot = robot
+                        self.server.grid = grid
+                        self.server.manager = manager
+                        self.server.simulator.manager = manager
+            elif path == "/api/map/import":
+                source = str(payload.get("path") or "").strip()
+                if not source:
+                    raise ValueError("请填写真实地图目录或 PGM 文件路径")
+                max_extent = payload.get("max_extent", 24.0)
+                try:
+                    max_extent = float(max_extent)
+                except (TypeError, ValueError):
+                    raise ValueError("地图最大边长必须是数字")
+                if not (8.0 <= max_extent <= 120.0):
+                    raise ValueError("地图最大边长范围 8-120 m")
+                definition = map_import.build_map(
+                    source, payload.get("name"), max_extent=max_extent
+                )
+                with self.server.simulator.lock:
+                    map_id = world.register_map(definition)
+                    world.select_map(map_id)
+                    robot = RobotCar()
+                    grid = GridMap()
+                    manager = TaskManager(robot, grid)
+                    self.server.robot = robot
+                    self.server.grid = grid
+                    self.server.manager = manager
+                    self.server.simulator.manager = manager
+            elif path == "/api/map/upload":
+                max_extent = payload.get("max_extent", 24.0)
+                try:
+                    max_extent = float(max_extent)
+                except (TypeError, ValueError):
+                    raise ValueError("地图最大边长必须是数字")
+                if not (8.0 <= max_extent <= 120.0):
+                    raise ValueError("地图最大边长范围 8-120 m")
+                root = _store_uploaded_map(payload.get("files"))
+                definition = map_import.build_map(
+                    root, payload.get("name"), max_extent=max_extent
+                )
+                with self.server.simulator.lock:
+                    map_id = world.register_map(definition)
+                    world.select_map(map_id)
+                    robot = RobotCar()
+                    grid = GridMap()
+                    manager = TaskManager(robot, grid)
+                    self.server.robot = robot
+                    self.server.grid = grid
+                    self.server.manager = manager
+                    self.server.simulator.manager = manager
             elif path == "/api/config":
                 if manager.task is not None and manager.phase not in ("idle", "done", "stopped"):
                     raise ValueError("请先暂停或结束任务，再修改参数")
@@ -160,8 +283,8 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                 manager.mowing_mode = config.settings.mowing_mode
             elif path == "/api/speed":
                 speed = int(payload.get("speed", 1))
-                if speed not in (1, 2, 4, 8):
-                    raise ValueError("仿真速度仅支持 1/2/4/8")
+                if speed not in (1, 2, 4, 8, 16, 32):
+                    raise ValueError("仿真速度仅支持 1/2/4/8/16/32")
                 self.server.simulator.speed = speed
             else:
                 self._send_json({"error": "接口不存在"}, status=404)
@@ -181,14 +304,14 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
         state["config"] = dict(config.settings.__dict__)
         return state
 
-    def _read_json(self):
+    def _read_json(self, limit=MAX_BODY_BYTES):
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             raise ValueError("Content-Length 无效")
         if length <= 0:
             return {}
-        if length > MAX_BODY_BYTES:
+        if length > limit:
             raise ValueError("请求体过大")
         raw = self.rfile.read(length)
         try:

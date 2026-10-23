@@ -652,6 +652,56 @@ body {
   width: 100%;
   height: 100%;
   display: block;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.stage canvas.is-panning {
+  cursor: grabbing;
+}
+
+.map-view-tools {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  display: flex;
+  gap: 4px;
+  z-index: 3;
+}
+
+.map-view-tools button {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: rgba(6, 11, 22, 0.78);
+  color: var(--text);
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+}
+
+.map-view-tools button:hover {
+  border-color: rgba(55, 224, 160, 0.5);
+  color: var(--accent);
+}
+
+.map-cursor {
+  position: absolute;
+  display: none;
+  z-index: 4;
+  padding: 4px 7px;
+  border-radius: 6px;
+  border: 1px solid rgba(79, 195, 255, 0.35);
+  background: rgba(5, 9, 20, 0.9);
+  color: rgba(190, 225, 255, 0.95);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+  transform: translate(12px, 12px);
 }
 
 .legend {
@@ -1000,6 +1050,57 @@ body {
 .param-grid input:focus {
   outline: none;
   border-color: rgba(55, 224, 160, 0.55);
+}
+
+.map-import-block {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 7px 8px;
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px dashed var(--line);
+}
+
+.map-import-block label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 9.5px;
+  letter-spacing: 0.2px;
+}
+
+.map-import-block label:first-child {
+  flex: 1 1 100%;
+}
+
+.map-import-block label:nth-child(2) {
+  flex: 0 0 92px;
+}
+
+.map-import-block input {
+  width: 100%;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(5, 9, 20, 0.8);
+  color: var(--text);
+  font: inherit;
+  font-size: 10.5px;
+}
+
+.map-import-block input:focus {
+  outline: none;
+  border-color: rgba(55, 224, 160, 0.55);
+}
+
+.map-import-block .task-btn {
+  flex: 1 1 auto;
+  align-self: end;
+  padding: 5px 6px;
+  font-size: 10px;
+  white-space: nowrap;
 }
 
 .param-actions {

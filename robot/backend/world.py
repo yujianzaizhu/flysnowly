@@ -125,11 +125,19 @@ WIDTH = 1.0
 HEIGHT = 1.0
 COLS = 1
 ROWS = 1
+ACTIVE_SCALE = MAP_SCALE
 POLYGON = []
+POLYGON_SEGMENTS = []
+OBSTACLE_SEGMENTS = []
 OBSTACLE_SHAPES = []
+OBSTACLE_OUTLINES = []
 OBSTACLES = []
-DOCK = {"x": 0.0, "y": 0.0, "r": 0.45}
+OBSTACLE_POLYGONS = []
+DOCK_RADIUS = 0.70
+DOCK = {"x": 0.0, "y": 0.0, "r": DOCK_RADIUS}
 START = {"x": 0.0, "y": 0.0, "theta": 0.0}
+IMPORTED_MAPS = {}
+NEXT_IMPORTED_ID = 101
 
 
 def clamp(value, low, high):
@@ -142,29 +150,47 @@ def wrap_angle(angle):
 
 def select_map(map_id):
     """切换当前场地；调用方负责重建 GridMap / TaskManager。"""
-    global MAP_ID, MAP_NAME, WIDTH, HEIGHT, COLS, ROWS
-    global POLYGON, OBSTACLE_SHAPES, OBSTACLES, DOCK, START
+    global MAP_ID, MAP_NAME, WIDTH, HEIGHT, COLS, ROWS, ACTIVE_SCALE
+    global POLYGON, POLYGON_SEGMENTS, OBSTACLE_SEGMENTS
+    global OBSTACLE_SHAPES, OBSTACLE_OUTLINES, OBSTACLES, OBSTACLE_POLYGONS, DOCK, START
     definition = MAPS[int(map_id)]
     MAP_ID = definition["id"]
     MAP_NAME = definition["name"]
-    scale = MAP_SCALE
-    WIDTH = definition["width"] * scale
-    HEIGHT = definition["height"] * scale
+    native = bool(definition.get("native"))
+    scale = 1.0 if native else MAP_SCALE
+    ACTIVE_SCALE = scale
+    WIDTH = definition["width"] if native else definition["width"] * scale
+    HEIGHT = definition["height"] if native else definition["height"] * scale
     COLS = int(round(WIDTH / CELL))
     ROWS = int(round(HEIGHT / CELL))
     POLYGON = [(x * scale, y * scale) for x, y in definition["polygon"]]
-    OBSTACLE_SHAPES = [
-        {
-            "kind": shape["kind"],
-            "parts": [(x * scale, y * scale, radius) for x, y, radius in shape["parts"]],
-        }
-        for shape in definition["obstacles"]
-    ]
+    POLYGON_SEGMENTS = _segments(POLYGON)
+    raw_shapes = definition.get("obstacles", [])
+    OBSTACLE_SHAPES = []
+    for shape in raw_shapes:
+        item = {"kind": shape["kind"]}
+        item["parts"] = [
+            (x * scale, y * scale, radius) for x, y, radius in shape.get("parts", [])
+        ]
+        if "outline" in shape:
+            item["outline"] = [(x * scale, y * scale) for x, y in shape["outline"]]
+        OBSTACLE_SHAPES.append(item)
+    OBSTACLE_OUTLINES = [obstacle_outline(shape) for shape in OBSTACLE_SHAPES]
     OBSTACLES = [part for shape in OBSTACLE_SHAPES for part in shape["parts"]]
+    OBSTACLE_POLYGONS = [
+        shape["outline"]
+        for shape in OBSTACLE_SHAPES
+        if len(shape.get("outline", [])) >= 3
+    ]
+    OBSTACLE_SEGMENTS = [
+        segment
+        for polygon in OBSTACLE_POLYGONS
+        for segment in _segments(polygon)
+    ]
     DOCK = {
         "x": definition["dock"]["x"] * scale,
         "y": definition["dock"]["y"] * scale,
-        "r": definition["dock"]["r"],
+        "r": DOCK_RADIUS,
     }
     START = {
         "x": definition["start"]["x"] * scale,
@@ -173,13 +199,52 @@ def select_map(map_id):
     }
 
 
+def register_map(definition):
+    """注册导入地图并返回其编号；重复导入同一来源时覆盖原编号。"""
+    global NEXT_IMPORTED_ID
+    source = definition.get("source_path")
+    if source:
+        for map_id, known in IMPORTED_MAPS.items():
+            if known.get("source_path") == source:
+                definition["id"] = map_id
+                MAPS[map_id] = definition
+                IMPORTED_MAPS[map_id] = definition
+                return map_id
+    map_id = NEXT_IMPORTED_ID
+    NEXT_IMPORTED_ID += 1
+    definition["id"] = map_id
+    MAPS[map_id] = definition
+    IMPORTED_MAPS[map_id] = definition
+    return map_id
+
+
+def delete_map(map_id):
+    map_id = int(map_id)
+    if map_id not in IMPORTED_MAPS:
+        raise ValueError("内置地图不可删除")
+    MAPS.pop(map_id, None)
+    IMPORTED_MAPS.pop(map_id, None)
+    return map_id
+
+
 def map_list():
     return [
         {
             "id": definition["id"],
             "name": definition["name"],
-            "width": round(definition["width"] * MAP_SCALE, 1),
-            "height": round(definition["height"] * MAP_SCALE, 1),
+            "width": round(
+                definition["width"]
+                if definition.get("native")
+                else definition["width"] * MAP_SCALE,
+                1,
+            ),
+            "height": round(
+                definition["height"]
+                if definition.get("native")
+                else definition["height"] * MAP_SCALE,
+                1,
+            ),
+            "imported": bool(definition.get("imported")),
         }
         for definition in sorted(MAPS.values(), key=lambda item: item["id"])
     ]
@@ -208,6 +273,14 @@ def _segment_distance(px, py, ax, ay, bx, by):
         return math.hypot(px - ax, py - ay)
     t = clamp(((px - ax) * vx + (py - ay) * vy) / length_sq, 0.0, 1.0)
     return math.hypot(px - (ax + vx * t), py - (ay + vy * t))
+
+
+def _segments(polygon):
+    count = len(polygon)
+    return [
+        (polygon[index][0], polygon[index][1], polygon[(index + 1) % count][0], polygon[(index + 1) % count][1])
+        for index in range(count)
+    ]
 
 
 def boundary_distance(x, y, polygon=None):
@@ -255,15 +328,16 @@ def raycast(x, y, angle, max_range=None):
     max_range = VISION_RANGE if max_range is None else max_range
     dx, dy = math.cos(angle), math.sin(angle)
     best = max_range
-    count = len(POLYGON)
-    for index in range(count):
-        ax, ay = POLYGON[index]
-        bx, by = POLYGON[(index + 1) % count]
+    for ax, ay, bx, by in POLYGON_SEGMENTS:
         hit = _ray_segment(x, y, dx, dy, ax, ay, bx, by)
         if hit is not None:
             best = min(best, hit)
     for ox, oy, radius in OBSTACLES:
         hit = _ray_circle(x, y, dx, dy, ox, oy, radius)
+        if hit is not None:
+            best = min(best, hit)
+    for ax, ay, bx, by in OBSTACLE_SEGMENTS:
+        hit = _ray_segment(x, y, dx, dy, ax, ay, bx, by)
         if hit is not None:
             best = min(best, hit)
     return clamp(best, 0.0, max_range)
@@ -289,6 +363,11 @@ def collision(x, y, radius=None):
         return True
     for ox, oy, oradius in OBSTACLES:
         if (x - ox) ** 2 + (y - oy) ** 2 < (oradius + radius) ** 2:
+            return True
+    for polygon in OBSTACLE_POLYGONS:
+        if point_in_polygon(x, y, polygon):
+            return True
+        if boundary_distance(x, y, polygon) < radius:
             return True
     return False
 
@@ -316,6 +395,8 @@ def boundary_cells():
 
 def obstacle_outline(shape, steps=48):
     """场地真实障碍物轮廓（仅用于界面展示，不参与机器人感知）。"""
+    if len(shape.get("outline", [])) >= 3:
+        return [tuple(point) for point in shape["outline"]]
     parts = shape.get("parts", [])
     if not parts:
         return []
@@ -348,15 +429,22 @@ def obstacle_outline(shape, steps=48):
 
 
 def world_dict():
-    shapes = [dict(shape, outline=obstacle_outline(shape)) for shape in OBSTACLE_SHAPES]
+    shapes = [
+        dict(shape, outline=OBSTACLE_OUTLINES[index])
+        for index, shape in enumerate(OBSTACLE_SHAPES)
+    ]
+    definition = MAPS.get(MAP_ID, {})
     return {
         "id": MAP_ID,
         "name": MAP_NAME,
         "width": WIDTH,
         "height": HEIGHT,
         "cell": CELL,
-        "map_scale": MAP_SCALE,
+        "map_scale": ACTIVE_SCALE,
         "map_area_factor": MAP_AREA_FACTOR,
+        "imported": bool(definition.get("imported")),
+        "source_path": definition.get("source_path"),
+        "import_meta": definition.get("import_meta", {}),
         "cols": COLS,
         "rows": ROWS,
         "polygon": POLYGON,

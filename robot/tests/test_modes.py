@@ -28,8 +28,10 @@ def make_system():
     return robot, grid, TaskManager(robot, grid)
 
 
-def advance(manager, seconds, phases=None, stop=("done",)):
-    for _ in range(int(round(seconds / DT))):
+def advance(manager, seconds, phases=None, stop=("done",), keep_battery=False):
+    for index in range(int(round(seconds / DT))):
+        if keep_battery and index % 50 == 0:
+            manager.robot.battery = 100.0
         manager.tick(DT)
         if phases is not None:
             phases.append(manager.phase)
@@ -44,7 +46,13 @@ def map_field(robot, grid, manager):
 
 class ModeFlowTest(unittest.TestCase):
     def setUp(self):
-        params.apply_params()
+        params.apply_params(
+            max_linear=1.5,
+            nav_speed=1.0,
+            map_speed=1.0,
+            mow_speed=1.3,
+            edge_speed=0.85,
+        )
 
     def tearDown(self):
         params.reset_params()
@@ -53,25 +61,27 @@ class ModeFlowTest(unittest.TestCase):
         robot, grid, manager = make_system()
         map_field(robot, grid, manager)
         phases = []
-        manager.start_mowing([3], mode="A")
-        advance(manager, 650.0, phases=phases)
+        zone_id = grid.zones[0]["id"]
+        manager.start_mowing([zone_id], mode="A")
+        advance(manager, 1850.0, phases=phases, keep_battery=True)
         self.assertEqual(manager.phase, "done")
         self.assertLess(phases.index("zone_edge"), phases.index("zone_stripes"))
-        self.assertGreaterEqual(grid.zone_coverage(3), 0.80)
+        self.assertGreaterEqual(grid.zone_coverage(zone_id), 0.80)
 
     def test_b_mode_stripes_then_final_edge(self):
         robot, grid, manager = make_system()
         map_field(robot, grid, manager)
         phases = []
-        manager.start_mowing([3], mode="B")
-        advance(manager, 1150.0, phases=phases)
+        zone_id = grid.zones[0]["id"]
+        manager.start_mowing([zone_id], mode="B")
+        advance(manager, 1850.0, phases=phases, keep_battery=True)
         self.assertEqual(manager.phase, "done")
         self.assertLess(phases.index("zone_plan"), phases.index("zone_edge"))
         self.assertGreaterEqual(phases.count("zone_edge"), 1)
         messages = [entry["message"] for entry in robot.events]
         self.assertTrue(any("B 模式" in message for message in messages))
         self.assertTrue(any("弓字完成，开始沿边割草" in message for message in messages))
-        self.assertGreaterEqual(grid.zone_coverage(3), 0.78)
+        self.assertGreaterEqual(grid.zone_coverage(zone_id), 0.78)
 
     def test_b_mode_large_obstacle_replans_without_ring(self):
         robot, grid, manager = make_system()
@@ -156,6 +166,28 @@ class ModeFlowTest(unittest.TestCase):
         self.assertGreater(target[0], 0.45)
         self.assertLess(target[0], 0.65)
 
+    def test_charge_during_edge_restores_unfinished_edge(self):
+        robot, grid, manager = make_system()
+        manager.task = {"type": "mow", "zones": [1], "mode": "A"}
+        manager.zone_id = 1
+        manager.zone_stage = "edge"
+        manager.edge_points = [(0.0, 0.0), (5.0, 0.0), (5.0, 5.0), (0.0, 5.0)]
+        manager.edge_index = 2
+        manager.edge_start_sim = robot.sim_time - 30.0
+        manager.phase = "zone_edge"
+        manager.request_charge()
+        self.assertIsNotNone(manager.breakpoint)
+        manager._resume_from_charge()
+        manager._arrive_breakpoint()
+        self.assertEqual(manager.phase, "zone_edge")
+        self.assertEqual(manager.edge_index, 2)
+        self.assertEqual(len(manager.edge_points), 4)
+
+    def test_edge_timeout_scales_with_path_length(self):
+        robot, grid, manager = make_system()
+        manager.edge_points = [(float(index), 0.0) for index in range(60)]
+        self.assertGreater(manager._edge_time_limit(), 120.0)
+
     def test_pause_during_edge_keeps_edge_after_long_pause(self):
         robot, grid, manager = make_system()
         manager.task = {"type": "mow", "zones": [1], "mode": "A"}
@@ -234,6 +266,88 @@ class ModeFlowTest(unittest.TestCase):
             self.assertTrue(0.0 <= y <= data["height"])
 
 
+
+
+    def test_outer_corners_flow_without_forward_reverse(self):
+        robot, grid, manager = make_system()
+        manager.task = {"type": "mow", "zones": [1], "mode": "A"}
+        manager.zone_id = 1
+        manager.edge_points = [
+            (0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0), (0.0, 0.0)
+        ]
+        manager.edge_index = 0
+        manager._prepare_edge_corners()
+        self.assertEqual(manager.edge_corners, [])
+
+    def test_inner_corner_advances_past_vertex_before_reverse(self):
+        robot, grid, manager = make_system()
+        manager.task = {"type": "mow", "zones": [1], "mode": "A"}
+        manager.zone_id = 1
+        manager.edge_points = [
+            (0.0, 0.0), (4.0, 0.0), (4.0, 1.5), (3.0, 1.5),
+            (3.0, 2.5), (4.0, 2.5), (4.0, 4.0), (0.0, 4.0), (0.0, 0.0),
+        ]
+        manager.edge_index = 0
+        manager._prepare_edge_corners()
+        self.assertGreaterEqual(len(manager.edge_corners), 2)
+        self.assertTrue(all(corner[4] < 0.0 for corner in manager.edge_corners))
+        corner = min(
+            manager.edge_corners,
+            key=lambda item: math.hypot(item[1] - 3.0, item[2] - 1.5),
+        )
+        manager.edge_index = corner[0]
+        robot.pose = [corner[1], corner[2], corner[3]]
+        manager.phase = "zone_edge"
+        self.assertTrue(manager._maybe_start_corner())
+        self.assertEqual(manager.phase, "corner_clean")
+        self.assertEqual(manager.corner_stage, "forward")
+        self.assertGreater(
+            math.hypot(
+                manager.corner_vertex[0] - corner[1],
+                manager.corner_vertex[1] - corner[2],
+            ),
+            0.10,
+        )
+        robot.pose = [
+            manager.corner_vertex[0],
+            manager.corner_vertex[1],
+            corner[3],
+        ]
+        manager._corner_step(DT, 0.0)
+        self.assertEqual(manager.corner_stage, "reverse")
+        for _ in range(400):
+            manager._corner_step(DT, 0.002)
+            if manager.phase == "zone_edge":
+                break
+        self.assertEqual(manager.phase, "zone_edge")
+        self.assertIn(corner[0], manager.edge_corner_done)
+
+    def test_mapping_stuck_can_escape_along_history(self):
+        robot, grid, manager = make_system()
+        robot.pose = [5.0, 5.0, 0.0]
+        manager.history = deque(
+            [(4.4, 5.0), (4.6, 5.0), (4.8, 5.0), (4.95, 5.0)]
+        )
+        manager.phase = "map_follow"
+        self.assertTrue(manager._begin_escape("map_follow"))
+        self.assertEqual(manager.phase, "escape")
+        manager._resume_after_escape()
+        self.assertEqual(manager.phase, "map_seek")
+
+    def test_goto_segment_uses_reachable_entry_when_start_is_blocked(self):
+        robot, grid, manager = make_system()
+        self.assertTrue(grid.build_free_area((world.START["x"], world.START["y"])))
+        grid.partition_zones()
+        manager.task = {"type": "mow", "zones": [1], "mode": "A"}
+        manager.zone_id = 1
+        start = (world.START["x"], world.START["y"])
+        end = (start[0] + 1.2, start[1])
+        grid.stamp_obstacle(start[0], start[1], 0.35)
+        manager.segments = [(start, end)]
+        manager._goto_segment(0)
+        self.assertIsNotNone(manager.segment)
+        entry = manager.segment[0]
+        self.assertFalse(grid.is_blocked_world(entry[0], entry[1]))
 
     def test_stuck_escape_reverses_along_history(self):
         robot, grid, manager = make_system()

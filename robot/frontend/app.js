@@ -33,8 +33,6 @@
     zoneChip: document.getElementById("zoneChip"),
     mapFill: document.getElementById("mapFill"),
     mapText: document.getElementById("mapText"),
-    mowFill: document.getElementById("mowFill"),
-    mowText: document.getElementById("mowText"),
     overallFill: document.getElementById("overallFill"),
     overallText: document.getElementById("overallText"),
     taskDistance: document.getElementById("taskDistance"),
@@ -54,9 +52,22 @@
     estopBtn: document.getElementById("estopBtn"),
     speedButtons: Array.from(document.querySelectorAll(".speed-btn")),
     mapSelect: document.getElementById("mapSelect"),
+    deleteMapBtn: document.getElementById("deleteMapBtn"),
     applyParamsBtn: document.getElementById("applyParamsBtn"),
     resetParamsBtn: document.getElementById("resetParamsBtn"),
     paramMessage: document.getElementById("paramMessage"),
+    importMapPath: document.getElementById("importMapPath"),
+    importMapExtent: document.getElementById("importMapExtent"),
+    importMapBtn: document.getElementById("importMapBtn"),
+    importFileBtn: document.getElementById("importFileBtn"),
+    importDirBtn: document.getElementById("importDirBtn"),
+    importFileInput: document.getElementById("importFileInput"),
+    importDirInput: document.getElementById("importDirInput"),
+    importMapMessage: document.getElementById("importMapMessage"),
+    zoomInBtn: document.getElementById("zoomInBtn"),
+    zoomOutBtn: document.getElementById("zoomOutBtn"),
+    zoomResetBtn: document.getElementById("zoomResetBtn"),
+    mapCursor: document.getElementById("mapCursor"),
     collapseAllBtn: document.getElementById("collapseAllBtn"),
     expandAllBtn: document.getElementById("expandAllBtn"),
     visionSpec: document.getElementById("visionSpec"),
@@ -80,7 +91,14 @@
   let logSignature = "";
   let zoneRows = [];
   let lastMapId = null;
-  let mapOptionsBuilt = false;
+  let mapOptionsSignature = "";
+  let viewWorldKey = "";
+  let viewZoom = 1;
+  let viewCenterX = 0;
+  let viewCenterY = 0;
+  let viewReady = false;
+  let lastGeometry = null;
+  let panState = null;
   let zoneAutoValue = "";
   let zoneInputDirty = false;
   let modeTouched = false;
@@ -146,6 +164,7 @@
     }
     if (state.world && state.world.maps) {
       updateMapOptions(state.world.maps);
+      updateDeleteButton();
     }
 
     if (state.time + 1e-6 < lastSampleTime) {
@@ -204,15 +223,33 @@
   }
 
   function updateMapOptions(maps) {
-    if (mapOptionsBuilt) return;
+    const signature = maps
+      .map((item) => item.id + ":" + item.name + ":" + (item.imported ? 1 : 0))
+      .join("|");
+    if (signature === mapOptionsSignature) return;
+    mapOptionsSignature = signature;
     els.mapSelect.textContent = "";
     maps.forEach((item) => {
       const option = document.createElement("option");
       option.value = String(item.id);
-      option.textContent = item.id + " · " + item.name;
+      option.textContent =
+        item.id + " · " + item.name + (item.imported ? " · 导入" : "");
       els.mapSelect.append(option);
     });
-    mapOptionsBuilt = true;
+    if (current && current.map_id != null) {
+      els.mapSelect.value = String(current.map_id);
+    }
+  }
+
+  function updateDeleteButton() {
+    const maps = (current && current.world && current.world.maps) || [];
+    const selected = maps.find(
+      (item) => String(item.id) === String(els.mapSelect.value)
+    );
+    els.deleteMapBtn.disabled = !selected || !selected.imported;
+    els.deleteMapBtn.title = selected && selected.imported
+      ? "删除当前导入地图"
+      : "内置地图不可删除";
   }
 
   // ------------------------------------------------------------- 地图位图
@@ -305,9 +342,9 @@
     els.angularSpeed.textContent = state.velocity.angular.toFixed(2);
     const heading = ((((state.pose.theta * 180) / Math.PI) % 360) + 360) % 360;
     els.heading.textContent = heading.toFixed(0) + "°";
-    els.distance.textContent = state.distance.toFixed(2);
+    els.distance.textContent = Math.round(state.distance);
     els.collisions.textContent = String(state.collisions);
-    els.simTime.textContent = state.time.toFixed(1);
+    els.simTime.textContent = Math.round(state.time);
     els.leftWheel.textContent = (state.velocity.left_wheel || 0).toFixed(2);
     els.rightWheel.textContent = (state.velocity.right_wheel || 0).toFixed(2);
 
@@ -399,11 +436,9 @@
     );
     els.mapFill.style.width = (mapProgress * 100).toFixed(2) + "%";
     els.mapText.textContent = (mapProgress * 100).toFixed(2) + "%";
-    els.mowFill.style.width = (coverage * 100).toFixed(2) + "%";
-    els.mowText.textContent = (coverage * 100).toFixed(2) + "%";
     els.overallFill.style.width = (overall * 100).toFixed(2) + "%";
     els.overallText.textContent = (overall * 100).toFixed(2) + "%";
-    els.taskDistance.textContent = Number(task.distance || state.distance || 0).toFixed(2);
+    els.taskDistance.textContent = Math.round(Number(task.distance || state.distance || 0));
     els.taskDuration.textContent = formatDuration(task.duration || 0);
     els.missionMessage.textContent = task.message || "";
     els.speedButtons.forEach((button) => {
@@ -435,22 +470,44 @@
   }
 
   // ------------------------------------------------------------- 绘制
-  function makeGeometry(world, width, height) {
+  function fitScale(world, width, height) {
     const padding = 30;
-    const scale = Math.min(
+    return Math.min(
       (width - padding * 2) / world.width,
       (height - padding * 2) / world.height
     );
-    const ox = (width - world.width * scale) / 2;
-    const oy = (height - world.height * scale) / 2;
+  }
+
+  function makeGeometry(world, width, height) {
+    const scale = fitScale(world, width, height) * viewZoom;
     return {
       width,
       height,
       scale,
       world,
-      x: (value) => ox + value * scale,
-      y: (value) => height - oy - value * scale,
+      x: (value) => width / 2 + (value - viewCenterX) * scale,
+      y: (value) => height / 2 - (value - viewCenterY) * scale,
+      toWorld: (sx, sy) => ({
+        x: viewCenterX + (sx - width / 2) / scale,
+        y: viewCenterY - (sy - height / 2) / scale,
+      }),
     };
+  }
+
+  function resetView(world) {
+    viewZoom = 1;
+    viewCenterX = world.width / 2;
+    viewCenterY = world.height / 2;
+    viewReady = true;
+  }
+
+  function zoomAt(screenX, screenY, factor) {
+    if (!lastGeometry) return;
+    const before = lastGeometry.toWorld(screenX, screenY);
+    viewZoom = clamp(viewZoom * factor, 0.35, 12);
+    const scale = fitScale(lastGeometry.world, lastGeometry.width, lastGeometry.height) * viewZoom;
+    viewCenterX = before.x - (screenX - lastGeometry.width / 2) / scale;
+    viewCenterY = before.y + (screenY - lastGeometry.height / 2) / scale;
   }
 
   function poseAt(now) {
@@ -488,8 +545,20 @@
       obstacles: [],
       dock: { x: 5.05, y: 3.5, r: 0.45 },
     };
+    const worldKey =
+      (state ? state.map_id : "none") +
+      ":" +
+      world.width.toFixed(2) +
+      "x" +
+      world.height.toFixed(2);
+    if (!viewReady || worldKey !== viewWorldKey) {
+      viewWorldKey = worldKey;
+      resetView(world);
+    }
     const geom = makeGeometry(world, width, height);
+    lastGeometry = geom;
     drawBackground(geom);
+    drawGroundBoundary(geom, world.polygon || []);
 
     if (state) {
       drawMap(geom, state.map);
@@ -560,6 +629,25 @@
     ctx.strokeStyle = "rgba(110, 190, 255, 0.35)";
     ctx.lineWidth = 2;
     ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+  }
+
+  function drawGroundBoundary(geom, polygon) {
+    if (!polygon || polygon.length < 3) return;
+    ctx.save();
+    ctx.beginPath();
+    polygon.forEach((point, index) => {
+      const x = geom.x(point[0]);
+      const y = geom.y(point[1]);
+      if (index === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.closePath();
+    ctx.fillStyle = "rgba(33, 76, 116, 0.11)";
+    ctx.fill();
+    ctx.lineWidth = 1.2;
+    ctx.strokeStyle = "rgba(98, 157, 217, 0.42)";
+    ctx.stroke();
+    ctx.restore();
   }
 
   function drawMap(geom, map) {
@@ -1019,12 +1107,169 @@
     send("/api/task", { task: "mow", zones, mode: els.mowMode.value });
   });
 
+  els.deleteMapBtn.addEventListener("click", async () => {
+    const selected = current && current.world && current.world.maps
+      ? current.world.maps.find(
+          (item) => String(item.id) === String(els.mapSelect.value)
+        )
+      : null;
+    if (!selected || !selected.imported) return;
+    if (!window.confirm("删除导入地图“" + selected.name + "”？")) return;
+    try {
+      const state = await request("/api/map/delete", {
+        map: Number(selected.id),
+      });
+      trail = [];
+      mapVersion = -1;
+      viewWorldKey = "";
+      zoneAutoValue = "";
+      zoneInputDirty = false;
+      els.zoneOrder.value = "";
+      ingest(state);
+      els.importMapMessage.textContent =
+        "已删除导入地图 " + selected.name + "，当前切换回 1 号内置地图";
+    } catch (error) {
+      els.importMapMessage.textContent = "删除失败：" + error.message;
+    }
+  });
+
   els.mapSelect.addEventListener("change", () => {
     trail = [];
     mapVersion = -1;
+    viewWorldKey = "";
     zoneAutoValue = "";
     zoneInputDirty = false;
+    updateDeleteButton();
     send("/api/map", { map: Number(els.mapSelect.value) });
+  });
+
+  function applyImportedMap(state) {
+    trail = [];
+    mapVersion = -1;
+    viewWorldKey = "";
+    zoneAutoValue = "";
+    zoneInputDirty = false;
+    els.zoneOrder.value = "";
+    ingest(state);
+    const meta = (state.world && state.world.import_meta) || {};
+    els.importMapMessage.textContent =
+      "已导入 " +
+      state.map_name +
+      " · " +
+      (meta.free_area_m2 != null ? meta.free_area_m2 + " m² 自由区" : "地图就绪") +
+      " · " +
+      (meta.obstacle_count != null ? meta.obstacle_count + " 个内部障碍" : "");
+  }
+
+  function mapImportExtent() {
+    return Number(els.importMapExtent.value) || 24;
+  }
+
+  function setImportBusy(busy, message) {
+    [els.importMapBtn, els.importFileBtn, els.importDirBtn].forEach((button) => {
+      button.disabled = busy;
+    });
+    if (message) els.importMapMessage.textContent = message;
+  }
+
+  els.importMapBtn.addEventListener("click", async () => {
+    const path = els.importMapPath.value.trim();
+    if (!path) {
+      els.importMapMessage.textContent = "请填写服务端地图目录或 PGM 文件路径";
+      return;
+    }
+    setImportBusy(true, "正在解析 PGM 并生成模拟地图…");
+    try {
+      const state = await request("/api/map/import", {
+        path,
+        max_extent: mapImportExtent(),
+      });
+      applyImportedMap(state);
+    } catch (error) {
+      els.importMapMessage.textContent = "导入失败：" + error.message;
+    } finally {
+      setImportBusy(false);
+    }
+  });
+
+  function allowedMapFile(name) {
+    return /\.(pgm|json|ya?ml)$/i.test(name);
+  }
+
+  function uploadRelativePath(file) {
+    const relative = (file.webkitRelativePath || "").replace(/\\/g, "/");
+    if (relative) return relative;
+    if (file.name.toLowerCase() === "default.json") return "path/default.json";
+    return file.name;
+  }
+
+  function readFileBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = String(reader.result || "");
+        const comma = result.indexOf(",");
+        resolve(comma >= 0 ? result.slice(comma + 1) : result);
+      };
+      reader.onerror = () => reject(new Error("无法读取文件 " + file.name));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function uploadMapFiles(fileList) {
+    const selected = Array.from(fileList || []).filter((file) =>
+      allowedMapFile(file.name)
+    );
+    if (!selected.length) {
+      throw new Error("请选择 .pgm 文件，或包含 .pgm/.json 的地图目录");
+    }
+    const entries = [];
+    let total = 0;
+    for (const file of selected) {
+      if (file.size > 16 * 1024 * 1024) {
+        throw new Error(file.name + " 超过 16 MB");
+      }
+      total += file.size;
+      if (total > 24 * 1024 * 1024) {
+        throw new Error("所选文件总大小超过 24 MB");
+      }
+      entries.push({
+        path: uploadRelativePath(file),
+        data: await readFileBase64(file),
+      });
+    }
+    if (!entries.some((entry) => /\.pgm$/i.test(entry.path))) {
+      throw new Error("缺少 .pgm 栅格地图文件");
+    }
+    return request("/api/map/upload", {
+      files: entries,
+      max_extent: mapImportExtent(),
+    });
+  }
+
+  async function chooseMapFiles(fileList) {
+    setImportBusy(true, "正在读取文件并上传…");
+    try {
+      const state = await uploadMapFiles(fileList);
+      applyImportedMap(state);
+    } catch (error) {
+      els.importMapMessage.textContent = "导入失败：" + error.message;
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  els.importFileBtn.addEventListener("click", () => els.importFileInput.click());
+  els.importDirBtn.addEventListener("click", () => els.importDirInput.click());
+  els.importFileInput.addEventListener("change", () => {
+    const files = Array.from(els.importFileInput.files || []);
+    els.importFileInput.value = "";
+    chooseMapFiles(files);
+  });
+  els.importDirInput.addEventListener("change", () => {
+    const files = Array.from(els.importDirInput.files || []);
+    els.importDirInput.value = "";
+    chooseMapFiles(files);
   });
 
   els.zoneOrder.addEventListener("input", () => {
@@ -1052,6 +1297,7 @@
     trail = [];
     lastSampleTime = -1;
     mapVersion = -1;
+    viewWorldKey = "";
     zoneAutoValue = "";
     zoneInputDirty = false;
     els.zoneOrder.value = "";
@@ -1257,6 +1503,87 @@
     applyCollapsed();
   });
   applyCollapsed();
+
+  // ------------------------------------------------------------- 地图缩放/坐标
+  function canvasPoint(event) {
+    const rect = canvas.getBoundingClientRect();
+    return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+  }
+
+  function updateMapCursor(event) {
+    if (!lastGeometry) return;
+    const point = canvasPoint(event);
+    const worldPoint = lastGeometry.toWorld(point.x, point.y);
+    els.mapCursor.textContent =
+      "X " + worldPoint.x.toFixed(2) + " m · Y " + worldPoint.y.toFixed(2) + " m";
+    els.mapCursor.style.display = "block";
+    const maxLeft = Math.max(4, canvas.clientWidth - els.mapCursor.offsetWidth - 20);
+    const maxTop = Math.max(4, canvas.clientHeight - els.mapCursor.offsetHeight - 20);
+    els.mapCursor.style.left = clamp(point.x, 4, maxLeft) + "px";
+    els.mapCursor.style.top = clamp(point.y, 4, maxTop) + "px";
+  }
+
+  canvas.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    const point = canvasPoint(event);
+    panState = {
+      screenX: point.x,
+      screenY: point.y,
+      centerX: viewCenterX,
+      centerY: viewCenterY,
+      scale: lastGeometry ? lastGeometry.scale : 1,
+    };
+    canvas.classList.add("is-panning");
+    canvas.setPointerCapture(event.pointerId);
+  });
+
+  canvas.addEventListener("pointermove", (event) => {
+    updateMapCursor(event);
+    if (!panState) return;
+    const point = canvasPoint(event);
+    viewCenterX = panState.centerX - (point.x - panState.screenX) / panState.scale;
+    viewCenterY = panState.centerY + (point.y - panState.screenY) / panState.scale;
+  });
+
+  function finishPan(event) {
+    if (!panState) return;
+    panState = null;
+    canvas.classList.remove("is-panning");
+    if (event && canvas.hasPointerCapture(event.pointerId)) {
+      canvas.releasePointerCapture(event.pointerId);
+    }
+  }
+
+  canvas.addEventListener("pointerup", finishPan);
+  canvas.addEventListener("pointercancel", finishPan);
+  canvas.addEventListener("pointerleave", (event) => {
+    if (!panState) els.mapCursor.style.display = "none";
+    else updateMapCursor(event);
+  });
+
+  canvas.addEventListener(
+    "wheel",
+    (event) => {
+      event.preventDefault();
+      const point = canvasPoint(event);
+      zoomAt(point.x, point.y, Math.exp(-event.deltaY * 0.0012));
+    },
+    { passive: false }
+  );
+
+  canvas.addEventListener("dblclick", () => {
+    if (lastGeometry) resetView(lastGeometry.world);
+  });
+
+  function zoomFromCenter(factor) {
+    zoomAt(canvas.clientWidth / 2, canvas.clientHeight / 2, factor);
+  }
+
+  els.zoomInBtn.addEventListener("click", () => zoomFromCenter(1.25));
+  els.zoomOutBtn.addEventListener("click", () => zoomFromCenter(0.8));
+  els.zoomResetBtn.addEventListener("click", () => {
+    if (lastGeometry) resetView(lastGeometry.world);
+  });
 
   // ------------------------------------------------------------- 启动
   function frame(now) {

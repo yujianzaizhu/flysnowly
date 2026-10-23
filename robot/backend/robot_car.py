@@ -41,7 +41,7 @@ def approach(current, target, max_delta):
 class RobotCar(object):
     def __init__(self):
         self.lock = threading.RLock()
-        self.events = deque(maxlen=80)
+        self.events = deque(maxlen=500)
         self.reset(first_run=True)
 
     # ----------------------------------------------------------- 状态

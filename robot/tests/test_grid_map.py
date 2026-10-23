@@ -43,14 +43,38 @@ class MappingTest(unittest.TestCase):
         grid = GridMap()
         self.assertTrue(grid.build_free_area((world.START["x"], world.START["y"])))
         zones = grid.partition_zones()
-        self.assertGreaterEqual(len(zones), 2)
-        self.assertLessEqual(len(zones), 18)
+        self.assertGreaterEqual(len(zones), 1)
+        self.assertLessEqual(len(zones), 8)
         free_total = sum(1 for value in grid.free_mask if value)
         covered = sum(zone["free"] for zone in zones)
         self.assertGreater(covered, free_total * 0.80)
         for zone in zones:
             area = (zone["x1"] - zone["x0"]) * (zone["y1"] - zone["y0"])
             self.assertGreater(zone["free"] / max(area, 1e-6), 0.30)
+
+    def test_partition_splits_dumbbell_but_keeps_regular_component(self):
+        grid = GridMap()
+        grid.mask_ready = True
+        for row in range(20, 71):
+            for col in range(10, 61):
+                grid.free_mask[grid.index(col, row)] = 1
+            for col in range(95, 146):
+                grid.free_mask[grid.index(col, row)] = 1
+        for row in range(43, 48):
+            for col in range(61, 95):
+                grid.free_mask[grid.index(col, row)] = 1
+        zones = grid.partition_zones()
+        self.assertEqual(len(zones), 2)
+        for zone in zones:
+            self.assertGreaterEqual(zone["free"] * grid.cell * grid.cell, 20.0)
+
+        grid = GridMap()
+        grid.mask_ready = True
+        for row in range(20, 71):
+            for col in range(20, 71):
+                grid.free_mask[grid.index(col, row)] = 1
+        zones = grid.partition_zones()
+        self.assertEqual(len(zones), 1)
 
     def test_mowing_counts_zone_coverage(self):
         grid = GridMap()
@@ -116,7 +140,7 @@ class MappingTest(unittest.TestCase):
             self.assertTrue(zones)
             self.assertEqual(grid.covered_free, grid.free_total)
             for zone in zones:
-                self.assertGreaterEqual(zone["free"] * grid.cell * grid.cell, 9.9)
+                self.assertGreaterEqual(zone["free"] * grid.cell * grid.cell, 19.9)
         world.select_map(1)
 
     def test_stamp_obstacle_blocks_navigation(self):
@@ -152,6 +176,20 @@ class PlannerTest(unittest.TestCase):
         path = grid.plan((1.0, 1.0), (4.0, 1.0))
         self.assertGreaterEqual(len(path), 2)
         self.assertLess(math.hypot(path[-1][0] - 4.0, path[-1][1] - 1.0), 0.35)
+
+    def test_plan_near_finds_reachable_cell_when_goal_is_covered(self):
+        grid = GridMap()
+        self.assertTrue(grid.build_free_area((world.START["x"], world.START["y"])))
+        start = (world.START["x"], world.START["y"])
+        goal = (start[0] + 2.0, start[1])
+        col, row = grid.cell_of(*goal)
+        for dc in range(-2, 3):
+            for dr in range(-2, 3):
+                grid.mark_occupied(col + dc, row + dr)
+        path, distance = grid.plan_near(start, goal)
+        self.assertTrue(path)
+        self.assertLess(distance, 1.0)
+        self.assertFalse(grid.is_occupied_world(path[-1][0], path[-1][1]))
 
     def test_astar_avoids_known_obstacle(self):
         grid = GridMap()
@@ -191,7 +229,7 @@ class PlannerTest(unittest.TestCase):
         self.assertTrue(irregular)
         route = planner.edge_route_grid(grid, irregular[0], (irregular[0]["cx"], irregular[0]["cy"]))
         self.assertGreater(len(route), 8)
-        self.assertEqual(route[0], route[-1])
+        # 区域包含障碍物时会连接外边界和障碍物边界两个闭环，整条路线可以不是闭合的。
         jumps = [
             math.hypot(route[index + 1][0] - route[index][0], route[index + 1][1] - route[index][1])
             for index in range(len(route) - 1)
