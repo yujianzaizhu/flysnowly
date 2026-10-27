@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>1.0.4 机器人控制台 · Mower Console</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='26' fill='%230b1020' stroke='%2337e0a0' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='9' fill='%2337e0a0'/%3E%3C/svg%3E" />
+  <script>
+    try {
+      document.documentElement.dataset.theme =
+        localStorage.getItem("mowerThemeV1") || "dark";
+    } catch (error) {
+      document.documentElement.dataset.theme = "dark";
+    }
+  </script>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-title">1.0.4 机器人控制台</span>
+      <span class="brand-sub">Vision Mower Console</span>
+    </div>
+    <div class="status-chips">
+      <span id="modeChip" class="chip chip--manual">待机</span>
+      <span id="linkChip" class="chip chip--ok">已连接</span>
+      <label class="theme-picker" title="界面配色">
+        主题
+        <select id="themeSelect" aria-label="界面配色">
+          <option value="dark">深色</option>
+          <option value="light">浅色</option>
+          <option value="warm">暖色</option>
+        </select>
+      </label>
+      <div class="module-menu">
+        <button id="moduleBtn" class="chip chip--modules" type="button" aria-haspopup="true" aria-expanded="false">模块 ▾</button>
+        <div id="moduleMenu" class="module-menu-pop" hidden>
+          <label><input type="checkbox" data-module-toggle="telemetry" checked /> 遥测数据</label>
+          <label><input type="checkbox" data-module-toggle="manual" checked /> 手动控制</label>
+          <label><input type="checkbox" data-module-toggle="zones" checked /> 区域覆盖</label>
+          <label><input type="checkbox" data-module-toggle="events" checked /> 事件日志</label>
+          <label><input type="checkbox" data-module-toggle="params" checked /> 参数设置</label>
+          <button id="collapseAllBtn" type="button">全部折叠</button>
+          <button id="expandAllBtn" type="button">全部展开</button>
+          <button id="resetLayoutBtn" type="button">重置布局</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <div class="sidebar">
+      <section class="panel panel--telemetry" data-module="telemetry" data-drag-panel="telemetry" aria-label="遥测数据">
+        <h2><span class="drag-grip" data-drag-handle title="拖动模块">⋮⋮</span>遥测 <span>Telemetry</span></h2>
+
+        <div class="battery">
+          <div class="battery-head">
+            <span>🔋 电量</span>
+            <strong id="batteryText">--</strong>
+          </div>
+          <div class="bar bar--battery"><i id="batteryFill"></i></div>
+          <p id="chargeRow" class="charge-row">初始化中…</p>
+        </div>
+
+        <div class="metrics">
+          <div class="metric"><span>线速度</span><strong id="linearSpeed">0.00</strong><em>m/s</em></div>
+          <div class="metric"><span>角速度</span><strong id="angularSpeed">0.00</strong><em>rad/s</em></div>
+          <div class="metric"><span>航向角</span><strong id="heading">0°</strong><em>deg</em></div>
+          <div class="metric"><span>累计里程</span><strong id="distance">0.00</strong><em>m</em></div>
+          <div class="metric"><span>碰撞次数</span><strong id="collisions">0</strong><em>次</em></div>
+          <div class="metric"><span>运行时长</span><strong id="simTime">0.0</strong><em>s</em></div>
+        </div>
+
+        <div class="wheels">
+          <span>左后轮 <strong id="leftWheel">0.00</strong> m/s</span>
+          <span>右后轮 <strong id="rightWheel">0.00</strong> m/s</span>
+        </div>
+
+        <h3>视觉传感器 <span id="visionSpec">100° FOV · 1 m</span></h3>
+        <div class="sensors">
+          <div class="sensor" data-vision="front">
+            <span class="sensor-name">前方</span>
+            <div class="sensor-bar"><i></i></div>
+            <span class="sensor-value">--</span>
+          </div>
+          <div class="sensor" data-vision="left">
+            <span class="sensor-name">左侧</span>
+            <div class="sensor-bar"><i></i></div>
+            <span class="sensor-value">--</span>
+          </div>
+          <div class="sensor" data-vision="right">
+            <span class="sensor-name">右侧</span>
+            <div class="sensor-bar"><i></i></div>
+            <span class="sensor-value">--</span>
+          </div>
+          <div class="sensor" data-vision="nearest">
+            <span class="sensor-name">最近</span>
+            <div class="sensor-bar"><i></i></div>
+            <span class="sensor-value">--</span>
+          </div>
+        </div>
+
+      </section>
+
+      <section class="panel" data-module="zones" data-drag-panel="zones" aria-label="区域覆盖">
+        <h2><span class="drag-grip" data-drag-handle title="拖动模块">⋮⋮</span>区域覆盖 <span>Zones</span></h2>
+        <div id="zoneList" class="zone-list"></div>
+      </section>
+
+      <section class="panel" data-module="params" data-drag-panel="params" aria-label="参数设置">
+        <h2><span class="drag-grip" data-drag-handle title="拖动模块">⋮⋮</span>参数 <span>Parameters</span></h2>
+        <div class="param-tabs" role="tablist" aria-label="参数分类">
+          <button class="param-tab is-active" type="button" role="tab" data-param-tab="robot">机器人实体</button>
+          <button class="param-tab" type="button" role="tab" data-param-tab="sensor">传感器</button>
+          <button class="param-tab" type="button" role="tab" data-param-tab="map">地图</button>
+        </div>
+
+        <div class="param-pane is-active" data-param-pane="robot">
+          <div class="param-grid">
+            <label>车体半径 (m)<input type="number" step="0.01" min="0.08" max="0.50" data-config="robot_radius" data-type="float" /></label>
+            <label>割草宽度 (m)<input type="number" step="0.01" min="0.10" max="1.00" data-config="mower_width" data-type="float" /></label>
+            <label>最大速度 (m/s)<input type="number" step="0.01" min="0.10" max="2.00" data-config="max_linear" data-type="float" /></label>
+            <label>充电桩半径 (m)<input type="number" step="0.05" min="0.30" max="1.50" data-config="dock_radius" data-type="float" /></label>
+            <label>弓字间距 (m)<input type="number" step="0.01" min="0.15" max="0.80" data-config="lane_spacing" data-type="float" /></label>
+            <label>边缘内缩 (m)<input type="number" step="0.01" min="0.12" max="0.60" data-config="edge_inset" data-type="float" /></label>
+            <label>沿边速度 (m/s)<input type="number" step="0.01" min="0.15" max="1.20" data-config="edge_speed" data-type="float" /></label>
+            <label>内直角前移 (m)<input type="number" step="0.01" min="0.04" max="0.40" data-config="inner_corner_advance" data-type="float" /></label>
+            <label>绕障余量 (m)<input type="number" step="0.01" min="0.20" max="1.50" data-config="ring_margin" data-type="float" /></label>
+          </div>
+          <div class="param-sub">电源 · Power</div>
+          <div class="param-grid">
+            <label>低电回充 (%)<input type="number" step="1" min="5" max="60" data-config="battery_low" data-type="float" /></label>
+            <label>恢复电量 (%)<input type="number" step="1" min="40" max="100" data-config="battery_resume" data-type="float" /></label>
+            <label>耗电系数<input type="number" step="0.05" min="0.10" max="2.00" data-config="battery_drain_factor" data-type="float" /></label>
+          </div>
+        </div>
+
+        <div class="param-pane" data-param-pane="sensor">
+          <div class="param-sub">视觉 · Vision</div>
+          <div class="param-grid">
+            <label>视觉 FOV (°)<input type="number" step="1" min="30" max="180" data-config="vision_fov_deg" data-type="float" /></label>
+            <label>视觉量程 (m)<input type="number" step="0.05" min="0.30" max="4.00" data-config="vision_range" data-type="float" /></label>
+            <label>视觉射线数<input type="number" step="2" min="9" max="181" data-config="vision_rays" data-type="int" /></label>
+          </div>
+          <p class="hint param-message">视觉为唯一感知源，只有 100° FOV / 1 m 内探明的障碍物才视为已知。</p>
+        </div>
+
+        <div class="param-pane" data-param-pane="map">
+          <div class="param-grid">
+            <label>最小区块面积 (m²)<input type="number" step="1" min="8" max="100" data-config="min_zone_area" data-type="float" /></label>
+            <label>大型阈值 (m)<input type="number" step="0.01" min="0.40" max="2.00" data-config="large_obstacle_extent" data-type="float" /></label>
+          </div>
+          <div class="map-import-block">
+            <button id="importFileBtn" class="task-btn task-btn--primary" type="button">选择文件</button>
+            <button id="importDirBtn" class="task-btn task-btn--primary" type="button">选择目录</button>
+            <input id="importFileInput" type="file" accept=".pgm,.json,.yaml,.yml" multiple hidden />
+            <input id="importDirInput" type="file" webkitdirectory directory multiple hidden />
+          </div>
+          <p id="importMapMessage" class="hint param-message">
+            可用文件：.pgm 栅格地图（必需），path/default.json、map_info.json（可选，提供分辨率与名称），也可选择包含这些文件的目录。
+          </p>
+        </div>
+
+        <div class="param-actions">
+          <button id="applyParamsBtn" class="task-btn task-btn--primary" type="button">应用参数</button>
+          <button id="resetParamsBtn" class="task-btn task-btn--ghost" type="button">恢复默认</button>
+        </div>
+        <p id="paramMessage" class="hint param-message">参数在待机/暂停时应用，下一次规划生效。</p>
+      </section>
+
+      <aside class="panel panel--controls" data-module="manual" data-drag-panel="manual" aria-label="手动控制">
+        <h2><span class="drag-grip" data-drag-handle title="拖动模块">⋮⋮</span>手动控制 <span>Manual</span></h2>
+        <div class="dpad">
+          <button class="pad-btn pad-btn--up" data-command="forward" aria-label="前进">▲</button>
+          <button class="pad-btn pad-btn--left" data-command="left" aria-label="左转">◀</button>
+          <button class="pad-btn pad-btn--stop" data-command="stop" aria-label="停止">■</button>
+          <button class="pad-btn pad-btn--right" data-command="right" aria-label="右转">▶</button>
+          <button class="pad-btn pad-btn--down" data-command="backward" aria-label="后退">▼</button>
+        </div>
+        <div class="mode-row">
+          <button id="estopBtn" class="mode-btn" type="button">急停</button>
+          <button id="resetBtn" class="mode-btn mode-btn--ghost" type="button">复位</button>
+        </div>
+      </aside>
+    </div>
+
+    <div class="workspace">
+      <section class="mission" aria-label="任务控制">
+        <div class="mission-row">
+          <label class="map-picker">地图
+            <select id="mapSelect"></select>
+          </label>
+          <button id="deleteMapBtn" class="task-btn task-btn--ghost" type="button" disabled>删除地图</button>
+          <label class="map-picker">模式
+            <select id="mowMode">
+              <option value="A">A · 先沿边</option>
+              <option value="B">B · 先弓字</option>
+            </select>
+          </label>
+          <button id="mapBtn" class="task-btn task-btn--primary" type="button">自动建图</button>
+          <div class="zone-field">
+            <label for="zoneOrder">割草区域</label>
+            <input id="zoneOrder" value="" placeholder="自动" spellcheck="false" inputmode="numeric" />
+            <button id="mowBtn" class="task-btn task-btn--primary" type="button">开始割草</button>
+          </div>
+          <button id="chargeBtn" class="task-btn" type="button">立即回充</button>
+          <button id="resumeBtn" class="task-btn" type="button">继续任务</button>
+          <button id="stopBtn" class="task-btn task-btn--ghost" type="button">停止任务</button>
+          <div class="speed-group">
+            <span>仿真</span>
+            <button class="speed-btn active" data-speed="1" type="button">1x</button>
+            <button class="speed-btn" data-speed="2" type="button">2x</button>
+            <button class="speed-btn" data-speed="4" type="button">4x</button>
+            <button class="speed-btn" data-speed="8" type="button">8x</button>
+            <button class="speed-btn" data-speed="16" type="button">16x</button>
+            <button class="speed-btn" data-speed="32" type="button">32x</button>
+          </div>
+        </div>
+        <div class="mission-row mission-row--status">
+          <span id="phaseChip" class="chip">待机</span>
+          <span id="zoneChip" class="chip chip--zone">区域 -</span>
+          <div class="progress">
+            <span>边界建图</span>
+            <div class="bar"><i id="mapFill"></i></div>
+            <em id="mapText">0%</em>
+          </div>
+          <div class="progress">
+            <span>总覆盖</span>
+            <div class="bar"><i id="overallFill"></i></div>
+            <em id="overallText">0.00%</em>
+          </div>
+          <span class="stat">总路程 <strong id="taskDistance">0.00</strong> m</span>
+          <span class="stat">任务时长 <strong id="taskDuration">00:00</strong></span>
+          <span id="missionMessage" class="mission-message">等待任务</span>
+        </div>
+      </section>
+
+      <section class="stage" aria-label="场地地图">
+        <canvas id="arena"></canvas>
+        <div class="map-view-tools">
+          <button id="zoomInBtn" type="button" title="放大">＋</button>
+          <button id="zoomOutBtn" type="button" title="缩小">－</button>
+          <button id="zoomResetBtn" type="button" title="复位视图">⤢</button>
+        </div>
+        <div id="mapCursor" class="map-cursor" aria-live="off">X -- · Y --</div>
+        <div class="legend">
+          <span><i class="dot dot--robot"></i>小车</span>
+          <span><i class="dot dot--vision"></i>视觉 100°/1m</span>
+          <span><i class="dot dot--mowed"></i>已割草</span>
+          <span><i class="dot dot--obstacle-real"></i>真实边界</span>
+          <span><i class="dot dot--obstacle-large"></i>大障碍估计</span>
+          <span><i class="dot dot--obstacle-small"></i>小障碍估计</span>
+          <span><i class="dot dot--path"></i>规划路径</span>
+        </div>
+        <div class="tips">滚轮缩放 · 拖动平移 · 双击复位 · 建图 → 割草 → 回充</div>
+      </section>
+    </div>
+  </main>
+
+  <section class="log-dock" data-module="events" data-drag-panel="events" aria-label="事件日志">
+    <div class="log-dock-head">
+      <span class="log-dock-title">事件日志 <span>Events</span></span>
+      <span id="logCount" class="log-dock-count">0 条</span>
+      <button id="logToggleBtn" class="log-toggle" type="button" aria-expanded="true">收起</button>
+    </div>
+    <ul id="log" class="log-list"></ul>
+  </section>
+
+  <script src="app.js"></script>
+</body>
+</html>

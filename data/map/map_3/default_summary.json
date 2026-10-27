@@ -1,0 +1,32 @@
+{
+  "source_json": "D:/work/record/26-10/19/【昶氪双目】覆盖切割时路径点过多导致APP不显示/test/1/path_o/default.json",
+  "resolution": 0.05,
+  "origin": [
+    -26.217,
+    -36.442
+  ],
+  "grid": [
+    1828,
+    1900
+  ],
+  "row_order": "row0 = min_y (device convention, same as room_map.pgm)",
+  "mask_semantics": {
+    "254": "inside",
+    "205": "outside/unknown"
+  },
+  "extent_m": [
+    91.4,
+    95.0
+  ],
+  "rings": 1,
+  "boundary_points": 8358,
+  "area_shoelace_m2": 1751.462,
+  "area_raster_m2": 1751.41,
+  "area_declared_m2": 1762.4850000000004,
+  "area_delta_percent": -0.628,
+  "perimeter_m": 458.8,
+  "cells_inside": 700564,
+  "cells_total": 3473200,
+  "fill_ratio": 0.2017,
+  "costmap_pgm": "D:/work/record/26-10/19/【昶氪双目】覆盖切割时路径点过多导致APP不显示/data/map/reachable_room_map.pgm"
+}
