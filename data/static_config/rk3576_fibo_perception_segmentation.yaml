@@ -1,0 +1,196 @@
+use_ai_depth: false
+
+use_jpeg: false
+# seg_weights
+ai_seg_weight: /app/fibot/config/rknn/grassrgb260702_soil.rknn
+ai_seg_weight_nosoil: /app/fibot/config/rknn/grassrgb260518.rknn
+ai_seg_weight_night: /app/fibot/config/rknn/grassrgb260317_night.rknn
+ai_seg_factory_weight: /app/fibot/config/rknn/grassrgb1211_3576.rknn
+# det weights
+ai_det_weight: /app/fibot/config/rknn/segment_all_20260518_p2.rknn
+ai_det_weight_night: /app/fibot/config/rknn/segment_all_20260518_p2.rknn
+# charge
+ai_charge_always_on_flag: false #充电板位姿估计常开用于测试
+ai_segdet_always_on_flag: false #AI检查常开用于测试
+ai_charge_weight: /app/fibot/config/static_config/rk3576_yolov8_seg_int8_cut_rk210_changke_261010.rknn #新的路径
+ai_charge_board_yaml: /app/fibot/config/static_config/changke_charge.yaml
+ai_charge_board_real: ""
+ai_charge_model_class_mum: 6 # changke:6 yate:6
+ai_charge_model_nmsThresh: 0.7 
+ai_charge_model_detectObjectThresh: 0.60
+#changke
+ai_rgbcam_struct_installroll: -10
+ai_rgbcam_struct_installpitch: 0
+ai_rgbcam_struct_installyaw: 0
+ai_rgbcam_struct_installheight: 0.21
+ai_rgbcam_struct_installX: 0.35
+ai_rgbcam_struct_installY: 0.0275
+ai_robot_width: 0.35  #车宽
+ai_robot_center: 0.35  #车前到中心
+ai_robot_length: 0.54  #车长
+
+ai_obstacle_height_max: 0.27
+ai_obstacle_height_min: -0.10
+ai_obstacle_height_max_rigour: 0.27
+ai_obstacle_height_min_rigour: -0.10
+ai_obstacle_height_max_night: 0.27
+ai_obstacle_height_min_night: -0.10
+
+# 通用参数
+ai_mask_dilate_element_size: 15
+# 一般模式
+ai_grassSegChannel: 1
+ai_grassSegThreshold: 0.4
+ai_obstacle_by_plane_X_max: 0.6
+mask_min_height_: 0.55
+mask_max_height_: 0.98
+mask_min_width_: 0.1
+mask_max_width_: 0.9
+ai_obstacle_distance_max: 0.60
+ai_obstacle_distance_min: 0.05
+ai_obstacle_width_min: -0.80
+ai_obstacle_width_max: 0.80
+
+# 严厉模式设置（沿边需要比较多的障碍物）
+ai_grassSegChannel_rigour: 1
+ai_grassSegThreshold_rigour: 0.5
+ai_obstacle_by_plane_X_max_rigour: 0.6
+mask_min_height_rigour: 0.55
+mask_max_height_rigour: 0.98
+mask_min_width_rigour: 0.1
+mask_max_width_rigour: 0.9
+ai_obstacle_distance_max_rigour: 0.60
+ai_obstacle_distance_min_rigour: 0.05
+ai_obstacle_width_min_rigour: -1.0
+ai_obstacle_width_max_rigour: 1.0
+
+#夜間模式
+ai_grassSegChannel_night: 1
+ai_grassSegThreshold_night: 0.35
+ai_obstacle_by_plane_X_max_night: 0.50
+mask_min_height_night: 0.60
+mask_max_height_night: 0.98
+mask_min_width_night: 0.1
+mask_max_width_night: 0.9
+ai_obstacle_distance_max_night: 0.60
+ai_obstacle_distance_min_night: 0.05
+ai_obstacle_width_min_night: -0.60
+ai_obstacle_width_max_night: 0.60
+
+# 深度映射的聚类参数，同时代码中的深度映射距离最小值限制在>15cm
+ai_noise_filter_radius: 0.05
+ai_noise_filter_k: 30
+
+# 是否使用IMU
+ai_need_imu_data: true
+ai_invert_IMU: true # m1是true n1\n2是false
+ai_use_adjustROI: true
+
+# 输出下采样
+ai_downsample_pie_angle_start: -55
+ai_downsample_pie_angle_end: 55
+ai_downsample_pie_angle_step: 3.0
+ai_downsample_pie_height_start: -0.1
+ai_downsample_pie_height_end: 0.4
+ai_downsample_pie_height_step: 0.2
+ai_downsample_pie_origin_shiftX: 0
+
+
+# frameid
+ai_frame_id: depth_camera
+ai_robot_frame_id: base_link1
+ai_world_frame_id: world
+# 是否有标定文件
+ai_hasRGBCalibrateFile: false
+# 是否是调试模式
+ai_m_debug_mode: true
+# 节点设置的容易模式最大帧率
+ai_easymaxfps: 5
+# 节点设置的繁忙模式最大帧率
+ai_busymaxfps: 8
+# 忙碌模式至少持续3s
+ai_busyDuration: 3.0
+# 是否去除跳变分割
+ai_use_rectifySegmentation: false
+# 去除跳变分割前后帧图像相似度
+ai_histro_threshold_rectifySegmentation: 0.7
+# 去除跳变分割前后帧mask相似度
+ai_binary_threshold_rectifySegmentation: 0.95
+
+# 屏蔽检测功能
+ai_no_detection: false
+# 检测类
+#0高草
+ai_det_use_highgrass: false
+ai_det_threshold_midhighgrass: 0.7
+#1喷头
+ai_det_use_sprinkler: true
+ai_det_threshold_sprinkler: 0.6
+#2二维码
+ai_det_use_qrcode: false
+ai_det_publish_qrcode: false
+ai_det_threshold_qrcode: 0.7
+ai_det_fiducial_len_qrcode: 0.11  #二维码大小
+ai_det_distance_close_qrcode: 0  #距离区间
+ai_det_distance_far_qrcode: 1.1  #距离区间
+ai_det_yaw_angle_qrcode: 90 #二维码可视角度
+#3脏污
+ai_det_use_obsured: true
+ai_det_threshold_obsured: 0.5
+ai_det_count_limit_obsured: 30
+ai_det_pixels_count_obsured: 10000
+ai_det_count_AI_limit_obsured: 2
+ai_det_count_black_limit_obsured: 10
+ai_det_black_thresh_obsured: 20 #0-255
+#4充电座
+ai_det_use_dock: false
+ai_det_threshold_dock: 0.8
+ai_det_edge_rec_distance_dock: 0.5
+#5落叶
+ai_det_use_leaf: true
+ai_det_threshold_leaf: 0.5
+ai_det_count_limit_leaf: 4
+ai_leaf_area_threshold: 0.1
+ai_leaf_switch: false
+#6刺猬
+ai_det_use_hedgehog: true
+ai_det_threshold_hedgehog: 0.6
+#7网球
+ai_det_use_tennis: true
+ai_det_threshold_tennis: 0.6
+#8石板路
+ai_det_use_flagging: false
+ai_det_flagging_thresh: 1.0
+#9边界线
+ai_det_use_line: true
+ai_det_threshold_line: 0.6
+#10秃地
+ai_det_use_tudi: true
+ai_det_threshold_tudi: 1.0
+ai_large_tudi_retention_frames: 5
+ai_tudi_area_threshold: 0.4
+ai_tudi_switch: true
+ai_tudi_region_margin_pixels: 40
+#11石子路
+ai_det_use_shizilu: true
+ai_det_threshold_shizilu: 0.6
+#12跑道
+ai_det_use_paodao: true
+ai_det_threshold_paodao: 0.6
+#13yateQR
+ai_det_use_yateQR: false
+ai_det_threshold_yateQR: 0.6
+# 检测框nms
+ai_det_nms_all: 0.7
+
+
+#速度判断运动
+forward_speed: 0.4 #前进运动状态判断
+backward_speed: 0.15 #后退运动状态判断
+rotate_speed: 0.25 #旋转运动状态判断
+
+#非草地虚拟墙
+use_fake_edge: true
+fake_edge_obstacle_area: 0.9
+fake_edge_distance: 0
+fake_edge_count_limit: 10

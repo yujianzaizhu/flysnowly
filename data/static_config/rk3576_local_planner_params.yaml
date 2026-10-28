@@ -1,0 +1,119 @@
+# Common param
+controller_frequency: 10
+patience: 90
+goal_distance: 1.0
+detect_obstacle_distance: 0.85
+tolerance_distance: 0.25
+shutdown_costmaps: false #true
+stop_mode: false
+coverage_mode: 20
+record_point: true
+path_width: 0.80
+max_times_escape: 9.0
+use_rpm_limit: true
+motor_max_rpm: 38.0
+linear_rpm: 100.0
+angular_rpm: 20.0
+edge_task_vel: 0.30
+coverage_task_vel: 0.35
+tolerance_distance_boundary: 1.0
+footprint_delta_x: 0.00
+footprint_delta_y: 0.00
+downhill_vel_flag: true
+forward_detection_width: 0.20
+forward_detection_front_len: 0.41
+forward_detection_rear_len: 0.15
+waiting_for_replan_time: 10
+
+# Recovery behavior param
+Behavior:
+  sim_granularity: 0.05
+  frequency: 10.0
+  tolerance: 0.10
+  robot_radius: 0.25
+  
+  RotateBehavior:
+    max_vel_theta: 0.50
+    rot_distance: 1.5
+
+  BackUpBehavior:
+    move_distance: 0.25
+    velocity_x: 0.10
+    mark_obstacle: true
+    robot_front_size: 0.41
+    robot_wide_size: 0.18
+    robot_back_size: 0.15
+
+DWAPlannerROS:
+# Robot Configuration Parameters - stdr robot
+  acc_lim_x: 0.4  #0.5
+  acc_lim_y: 0.0
+  acc_lim_theta: 3.0
+  acc_limit_trans: 1.2
+
+  max_trans_vel: 1.2 #choose slightly less than the base's capability
+  min_trans_vel: 0.0 #this is the min trans velocity when there is negligible rotational velocity
+
+  trans_stopped_vel: 0.1
+  rot_stopped_vel: 0.1
+
+  max_vel_x: 0.4
+  min_vel_x: 0.0  #
+  max_vel_y: 0  #  0.2 diff drive robot,don't need set vel_y
+  min_vel_y: 0
+  max_rot_vel: 0.8
+  min_rot_vel: 0.1
+
+# Goal Tolerance Parameters
+  yaw_goal_tolerance: 0.2  # 0.1 rad = 5.7 degree
+  xy_goal_tolerance: 0.15
+  latch_xy_goal_tolerance: true
+
+# Forward Simulation Parameters
+  sim_time: 1.0    # 1.7
+  sim_granularity: 0.05 #0.025
+  angular_sim_granularity: 0.1
+  vx_samples: 8    # default 3
+  vy_samples: 0    # diff drive robot, there is only one sample3
+  vth_samples: 8 # 20
+  controller_frequency: 10
+
+# Trajectory Scoring Parameters
+  path_distance_bias: 47.0  # 47.0  -weighting for how much it should stick to the global path plan
+  goal_distance_bias: 19.0  # 19.0  -wighting for how much it should attempt to reach its goal
+  occdist_scale: 0.002       # 0.01  -weighting for how much the controller should avoid obstacles
+  forward_point_distance: 0.10 # 0.325 -how far along to place an additional scoring point
+  stop_time_buffer: 0.2     # 0.2   -amount of time a robot must stop in before colliding for a valid traj.
+  scaling_speed: 0.20       # 0.25  -absolute velocity at which to start scaling the robot's footprint
+  max_scaling_factor: 0.3   # 0.2   -how much to scale the robot's footprint when at speed.
+  publish_cost_grid: false
+  twirling_scale: 5.0
+  svel_scale: 0.5
+
+# Oscillation Prevention Parameters
+  oscillation_reset_dist: 0.05  # default 0.05
+
+  hdiff_scale: 1.0 #全局和局部角度判断
+  heading_points: 1
+
+# dwa low speed rotation mode
+  low_speed_rotation_times: 16
+  low_speed_rotation_quit_times: 4
+  low_speed_rotation_vel: 0.03  #0.02
+  low_speed_rotation_vel_variance: 0.01
+  low_speed_rotation_vel_times: 3
+  low_speed_rotation_theta_variance: 0.01
+  low_speed_rotation_theta_times: 3
+  low_speed_rotation_theta_averange_times: 4
+
+# time compensation
+  time_compensation: 0.1
+
+# Global Plan Parameters
+  prune_plan: true
+
+  odom_topic: loc_wio_pose
+  publish_traj_pc : true
+  publish_cost_grid_pc: false
+  global_frame_id: world
+  use_publish_debug: false

@@ -1,0 +1,45 @@
+%YAML:1.0
+---
+  tof_dev: /dev/video22
+  tof_i2c_dev: /dev/i2c-6
+  tof_width: 240
+  tof_height: 1413
+  tof_fps: 10
+  tof_format: RAW12
+  tof_fps: 10
+  tof_wait_time: 2
+  tof_buffer_count: 3
+  tof_pmd_path: /app/fibot/config/static_config/pmd.spc
+  tof_output_width: 240
+  tof_output_height: 156
+  tof_raw_image_save: false
+  tof_raw_image_path: /userdata/tof/raw
+  tof_decode_image_save: false
+  tof_decode_image_path: /userdata/tof/decode
+  tof_rrf_image_save: false
+  tof_rrf_image_path: /userdata/tof/rrf
+
+  left_rgb_dev: /dev/video42
+  left_rgb_width: 1088
+  left_rgb_height: 1280
+  left_rgb_format: NV12
+  left_rgb_fps: 20
+  left_rgb_wait_time: 2
+  left_rgb_buffer_count: 3
+  left_rgb_output_width: 640
+  left_rgb_output_height: 544
+  left_rgb_output_format: RGB888
+
+  right_rgb_dev: /dev/video33
+  right_rgb_width: 1088
+  right_rgb_height: 1280
+  right_rgb_format: NV12
+  right_rgb_fps: 20
+  right_rgb_wait_time: 2
+  right_rgb_buffer_count: 3
+  right_rgb_output_width: 640
+  right_rgb_output_height: 544
+  right_rgb_output_format: RGB888
+
+  target_on_gain: 2000000
+  target_off_gain: 1500000

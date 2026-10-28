@@ -84,18 +84,19 @@ class ModeFlowTest(unittest.TestCase):
         self.assertGreaterEqual(grid.zone_coverage(zone_id), 0.78)
 
     def test_b_mode_large_obstacle_replans_without_ring(self):
+        # 大型障碍物按面积判定（>= 5 m²），这里构造半径 1.4 m 的障碍（≈6.2 m²）
         robot, grid, manager = make_system()
-        for row in range(30, 51):
-            for col in range(40, 61):
+        for row in range(10, 71):
+            for col in range(10, 71):
                 x, y = grid.center_of(col, row)
-                if math.hypot(x - 4.0, y - 4.0) <= 0.55:
+                if math.hypot(x - 4.0, y - 4.0) <= 1.40:
                     grid.mark_occupied(col, row)
-        robot.pose = [3.1, 4.0, 0.0]
+        robot.pose = [2.1, 4.0, 0.0]
         manager.task = {"type": "mow", "zones": [1], "mode": "B"}
         manager.zone_id = 1
         manager.mowing_mode = "B"
         manager.phase = "zone_stripes"
-        manager.segment = ((3.2, 4.0), (4.5, 4.0))
+        manager.segment = ((2.2, 4.0), (3.0, 4.0))
         manager._begin_detour("stripes")
         self.assertEqual(manager.phase, "zone_plan")
         self.assertIsNone(manager.ring_circle)

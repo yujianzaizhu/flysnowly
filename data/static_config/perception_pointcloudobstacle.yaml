@@ -1,0 +1,117 @@
+use_ai_depth: false
+
+pco_normalcut_obstcale_filterparas_type: 1 #选择模式
+pco_coveredge_obstcale_filterparas_type: 1 #选择模式
+#模式0 最少障碍物
+remvoe_small_obstacle_easy: true
+pco_obstacle_height_max_easy: 0.27
+pco_obstacle_height_min_easy: 0.25
+small_obstacle_size_num_easy: 10
+pco_noise_filter_radius_easy: 0.05
+pco_noise_filter_k_easy: 6
+#模式1 一般模式
+remvoe_small_obstacle_normal: true
+pco_obstacle_height_max_normal: 0.27
+pco_obstacle_height_min_normal: 0.15
+small_obstacle_size_num_normal: 15
+pco_noise_filter_radius_normal: 0.05
+pco_noise_filter_k_normal: 10
+#模式2 严厉模式最多障碍物
+remvoe_small_obstacle_rigour: true
+pco_obstacle_height_max_rigour: 0.27
+pco_obstacle_height_min_rigour: 0.10
+small_obstacle_size_num_rigour: 10
+pco_noise_filter_radius_rigour: 0.05
+pco_noise_filter_k_rigour: 6
+
+# frameid
+pco_frame_id: depth_camera
+# 使用tof 深度
+pco_use_ofilm_tof: true
+ros_topic_depth: depth_image
+#changke
+pco_depthcam_struct_installroll: -10 #基于水平放置的相机坐标系描述
+pco_depthcam_struct_installpitch: 0 #基于水平放置的相机坐标系描述
+pco_depthcam_struct_installyaw: 0 #基于水平放置的相机坐标系描述
+pco_depthcam_struct_installheight: 0.21 # 基于机器人坐标系描述
+pco_depthcam_struct_installX: 0.35 # 基于机器人坐标系描述
+pco_depthcam_struct_installY: -0.008 # 基于机器人坐标系描述
+
+
+# 是否启动悬崖检测
+pco_enable_cliff: false
+# 深度图是mm还是m
+pco_depth_is_meter: false
+# 是否有标定文件
+pco_hasCalibrateFile: false
+# 是否有使用不变的深度相机内参，从而不用订阅相机内参
+pco_useConstDepthCamInfo: false
+# 是否是调试模式
+pco_m_debug_mode: false
+# 输入的深度相机内参话题
+ros_camera_info: camera_info
+# 输出的深度图转点云话题
+pco_topic_orgin_cloud: /pointcloudobstacle/origincloud
+# 输出的点云障碍物话题
+pco_topic_obstacle_cloud: /pointcloudobstacle/obstaclecloud
+# 输出的非地面点云话题
+pco_topic_ground_cloud: /pointcloudobstacle/groundcloud
+# 输出的地面点云话题
+pco_topic_noground_cloud: /pointcloudobstacle/nogroundcloud
+# 输出的悬崖点云话题
+pco_topic_cliff_cloud: /pointcloudobstacle/cliffcloud
+# 节点设置的容易模式最大帧率
+pco_easymaxfps: 8
+# 节点设置的繁忙模式最大帧率
+pco_busymaxfps: 12
+# 忙碌模式至少持续3s
+pco_busyDuration: 3.0
+# 深度图转点云下采样
+pco_depth_sampling_step_u: 2
+pco_depth_sampling_step_v: 1
+pco_depth_max: 1.0
+pco_depth_min: 0.1
+pco_width_min: -0.8
+pco_width_max: 0.8
+pco_voxel_grid_sampling_leaf: 0.03
+
+# 地面分割参数
+pco_groundseg_floor_min_height: -0.05
+pco_groundseg_num_iter: 15
+pco_groundseg_num_lpr: 500
+pco_groundseg_th_dist: 0.05
+pco_groundseg_th_seeds: 0.03
+pco_groundseg_height_difference_threshold: 0.001
+
+# 输出下采样参数
+pco_downsample_pie_angle_step: 3.0
+pco_downsample_pie_height_start: -0.1
+pco_downsample_pie_height_end: 0.4
+pco_downsample_pie_height_step: 0.2
+pco_downsample_pie_origin_shiftX: 0
+# 悬崖检测参数
+cliff_filter_flag_: false
+cliff_nosie_filter_k_: 6
+cliff_nosie_filter_radius_: 0.05
+cliff_block_num_: 9 # 悬崖检测分块数
+cliff_min_dis_: 0.5 # 第一个点距离大于该值认为是悬崖
+cliff_max_dis_: 0.6 # 最后一个点距离小于该值认为是悬崖
+cliff_length_: 0.2
+cliff_stride_uncertain_: 0.3 #0.3
+cliff_stride_certain_: 0.2 #找到低值点后，跨步距离大于该值为肯定为悬崖点，cliff_stride_certain_ && cliff_height_
+cliff_height_: -0.10 # 低于该值认为是悬崖
+cliff_output_certain_height_: -0.10 # 输出悬崖点的高度（确定）
+cliff_output_uncertain_height_: 0.01 # 输出悬崖点的高度 （不确定）
+# cliff_block_angle_start_: -40
+# cliff_block_angle_end_: 40
+cliff_block_angle_Shift_x_: -0.1
+cliff_maxD_: 2.0
+cliff_empty_block_threshlod_: 10 # block中少于10个点则认为是悬崖
+cliff_virtual_wall_x_: 0.2
+cliff_normal_height_: -0.02 # 向前找到悬崖点前可行驶点的高度
+cliff_nn_radius_in_block_: 0.05 #可行驶点的向前搜索半径
+cliff_cluster_certain_block_num_: 3
+cliff_cluster_minNUM_: 3
+cliff_cluster_maxNUM_: 1000
+cliff_cluster_radius_: 0.05
+

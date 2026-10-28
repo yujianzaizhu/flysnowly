@@ -1,0 +1,83 @@
+app_path: /app/fibot/app/
+fps_health_manage: 2.0
+fps_monitor_system: 0.2
+fps_monitor_heartbeat: 0.1
+fps_monitor_processes: 0.5
+app_log_max_size: 100           #单位M，applog最大存储大小限制
+remaining_memory_size: 500      #单位M，系统剩余内存限制
+check_storage_disk: /userdata   #需要检测的磁盘
+monitor_who: process_name_rk3576
+enable_log_statistics: true
+process_name_qr_x3m:
+#  - fibot_imu_node
+  - fibot_odom_node
+  - fibot_camera_node
+  - fibot_zmq_proxy_node
+  - fibot_manager_node
+  - fibot_robot_pose_ekf_node
+  - fibot_nav_planner_node
+  - fibot_aruco_detect_node
+  - fibot_seg_mono_node
+  - fibot_static_transform_publisher_node
+  - fibot_ota_upgrade_node
+#  - fibot_cls_mono_node
+  - fibot_bridge_node
+  - fibot_wifi_server_node
+process_name_ai_x3m:
+#  - fibot_imu_node
+  - fibot_odom_node
+  - fibot_camera_node
+  - fibot_zmq_proxy_node
+  - fibot_manager_node
+  - fibot_robot_pose_ekf_node
+  - fibot_nav_planner_node
+  - fibot_docking_mono_node
+  - fibot_seg_mono_node
+  - fibot_static_transform_publisher_node
+  - fibot_ota_upgrade_node
+#  - fibot_cls_mono_node
+  - fibot_bridge_node
+  - fibot_wifi_server_node
+  - fibot_obstacle_detection
+  - fibot_mono_depth_node
+process_name_ai_x3m_pro:
+#  - fibot_imu_node
+  - fibot_rtk_node
+  - fibot_odom_node
+  - fibot_camera_node
+  - fibot_zmq_proxy_node
+  - fibot_manager_node
+  - fibot_robot_pose_ekf_node
+  - fibot_nav_planner_node
+  - fibot_docking_mono_node
+  - fibot_seg_mono_node
+  - fibot_static_transform_publisher_node
+  - fibot_ota_upgrade_node
+#  - fibot_cls_mono_node
+  - fibot_bridge_node
+  - fibot_wifi_server_node
+  - fibot_obstacle_detection
+  - fibot_mono_depth_node
+process_name_rk3576:
+  fibot_odom_node: "0x0F"
+  fibot_rtk_node: "0x0F"
+  fibot_binocular_camera: "0x30"
+  fibot_zmq_proxy_node: "0x0F"
+  fibot_manager_node: "0x0F"
+  fibot_robot_pose_ekf_node: "0x0F"
+  fibot_seg_mono_node: "0x30"
+  fibot_static_transform_publisher_node: "0x0F"
+  fibot_ota_upgrade_node: "0x0F"
+  fibot_bridge_node: "0x0F"
+  fibot_wifi_server_node: ""
+  fibot_obstacle_detection: "0x30"
+#  fibot_ai_stereo: "0x0F"
+  fibot_nav_dock_node: "0x40"
+  fibot_trajectory_map: "0x40"
+  fibot_region_manager: "0x40"
+  fibot_nav_planner_node: "0x40"
+  fibot_slip_node: "0x0F"
+  fibot_vio_node: "0x80"
+#  - fibot_aruco_detect_node
+#  - fibot_docking_mono_node
+#  - fibot_cls_mono_node

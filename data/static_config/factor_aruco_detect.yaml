@@ -1,0 +1,33 @@
+image_transport: compressed #图像压缩格式
+publish_images: true #向外发布图像
+fiducial_len: 0.14 #二维码尺寸 14*14
+dictionary: 8  #二维码有多少个格子
+do_pose_estimation: true #是否启用二维码姿态估计
+vis_msgs: false #是否发布可视化消息
+ignore_fiducials: '' #跳过的二维码编号
+fiducial_len_override: '' #特定二维码默认物理尺寸
+verbose: false #是否输出详细的调试信息
+adaptiveThreshConstant: 7 #图像二值化时的亮度偏移
+adaptiveThreshWinSizeMax: 33 #自适应窗口大小的最大值，大窗口鲁棒，但速度慢
+adaptiveThreshWinSizeMin: 3 #自适应串钩最小值，用于捕捉细节
+adaptiveThreshWinSizeStep: 6 #自适应窗口步长，控制从最小大最大窗口的增长速度
+cornerRefinementMaxIterations: 30 #角点迭代的最大次数，保证角点足够准确
+cornerRefinementMinAccuracy: 0.01 #角点提取的最小精度，值越小越精确，但计算时间更长
+cornerRefinementWinSize: 5 #角点提取的搜索窗口大小，值越大越容易找到角点，但精度可能降低
+doCornerRefinement: true #是否启用角点提取
+cornerRefinementSubPix: true #是否使用亚像素角点提取
+errorCorrectionRate: 0.6 #容错率，表示二维码检测时允许的误码比例
+minCornerDistanceRate: 0.05 #角点之间的最小距离占二维码边长的比例
+markerBorderBits: 1 #二维码边框的黑白单元格数量
+maxErroneousBitsInBorderRate: 0.04 #二维码边框中错误单元格比例
+minDistanceToBorder: 3 #二维码边缘与图像边框的最小距离（单位：像素）
+minMarkerDistanceRate: 0.1 #两个二维码之间的最小距离占二维码边长的比例
+minMarkerPerimeterRate: 0.03 #二维码周长的最小比例
+maxMarkerPerimeterRate: 4 #二维码周长的最大比例，用于绿岛过大的伪标志
+minOtsuStdDev: 5  #Otsu 阈值分割法中，标准差的最小值，用于图像二值化的稳定性。
+perspectiveRemoveIgnoredMarginPerCell: 0.13 # 透视矫正时，单元格周围忽略的边缘比例
+perspectiveRemovePixelPerCell: 8 # 透视矫正时，每个单元格的像素数量，调整矫正精度
+polygonalApproxAccuracyRate: 0.01 # 多边形逼近的精度，用于检测二维码外形轮廓的准确性。
+imager_output_HZ: 4 # 发布图像数据的频率，单位为 Hz
+publish_fiducial_tf: true # 是否发布二维码姿态的 tf 变换
+aruco_switch: false  # false:默认一直开启 true:切换模式

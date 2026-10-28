@@ -1,0 +1,9 @@
+home_dir: /userdata/fibot/config/map
+record_frame: world
+base_link_frame: base_link1
+dilate_size: 0.7
+path_dilate_size: 0.4
+visual_edge_dilate_size: 0.2
+visual_ride_mowing_dilate_size: 0.35
+path_end_point_dilate_size: 1.5
+white_list_area_dilate_size: 1.0

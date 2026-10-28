@@ -17,6 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config  # noqa: E402
 import map_import  # noqa: E402
+import nav_bus  # noqa: E402
+import nav_bridge  # noqa: E402
 import world  # noqa: E402
 from grid_map import GridMap  # noqa: E402
 from robot_car import RobotCar  # noqa: E402
@@ -145,6 +147,12 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
             self._send_json(self._state())
         elif path == "/api/world":
             self._send_json(world.world_dict())
+        elif path == "/api/nav/config":
+            nav = self.server.manager.nav
+            self._send_json(nav.static_summary() if nav is not None else {"loaded": False})
+        elif path == "/api/nav":
+            nav = self.server.manager.nav
+            self._send_json(nav.snapshot() if nav is not None else {"error": "导航节点未启用"})
         elif path == "/api/config":
             self._send_json(self._state())
         elif path == "/api/health":
@@ -204,11 +212,73 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                     world.select_map(map_id)
                     robot = RobotCar()
                     grid = GridMap()
-                    manager = TaskManager(robot, grid)
+                    manager, nav = build_manager(robot, grid)
+                    nav.set_enabled(getattr(self.server.nav, "enabled", True))
                     self.server.robot = robot
                     self.server.grid = grid
                     self.server.manager = manager
+                    self.server.nav = nav
                     self.server.simulator.manager = manager
+            elif path == "/api/map/edit":
+                action = str(payload.get("action") or "")
+                kind = str(payload.get("kind") or "")
+                manager = self.server.manager
+                if not manager.grid.zones:
+                    raise ValueError("请先完成自动建图，再编辑地图")
+                busy = (
+                    manager.task is not None
+                    and manager.phase not in ("idle", "done", "stopped")
+                )
+                if busy:
+                    raise ValueError("任务进行中不能编辑地图，请先停止任务")
+                if action == "update_dynamic":
+                    world.update_dynamic_path(
+                        payload.get("id", 0),
+                        payload.get("ax", 0.0),
+                        payload.get("ay", 0.0),
+                        payload.get("bx", 0.0),
+                        payload.get("by", 0.0),
+                    )
+                elif action == "add_static":
+                    world.add_static_obstacle(
+                        float(payload.get("x", 0.0)),
+                        float(payload.get("y", 0.0)),
+                        float(payload.get("r", 0.35)),
+                    )
+                elif action == "add_dynamic":
+                    world.add_dynamic_obstacle(
+                        float(payload.get("x", 0.0)),
+                        float(payload.get("y", 0.0)),
+                        float(payload.get("r", 0.30)),
+                        float(payload.get("span", 1.6)),
+                        float(payload.get("heading", 0.0)),
+                    )
+                elif action == "add_no_go":
+                    if payload.get("x0") is not None and payload.get("y0") is not None:
+                        world.add_no_go_zone(
+                            float(payload.get("x0", 0.0)),
+                            float(payload.get("y0", 0.0)),
+                            float(payload.get("x1", 0.0)),
+                            float(payload.get("y1", 0.0)),
+                        )
+                    else:
+                        # 兼容旧调用：以圆（中心 + 半径）描述，转成外接正方形
+                        radius = float(payload.get("r", 1.0))
+                        world.add_no_go_zone(
+                            float(payload.get("x", 0.0)) - radius,
+                            float(payload.get("y", 0.0)) - radius,
+                            float(payload.get("x", 0.0)) + radius,
+                            float(payload.get("y", 0.0)) + radius,
+                        )
+                elif action == "delete":
+                    world.remove_edit(kind, payload.get("id", 0))
+                elif action == "clear":
+                    world.clear_edits(kind or None)
+                else:
+                    raise ValueError("未知的地图编辑动作: {}".format(action))
+                with self.server.simulator.lock:
+                    self.server.grid.apply_no_go(world.NO_GO)
+                    self.server.grid.version += 1
             elif path == "/api/map/delete":
                 map_id = int(payload.get("map", 0))
                 world.delete_map(map_id)
@@ -217,16 +287,18 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                         world.select_map(1)
                         robot = RobotCar()
                         grid = GridMap()
-                        manager = TaskManager(robot, grid)
+                        manager, nav = build_manager(robot, grid)
+                        nav.set_enabled(getattr(self.server.nav, "enabled", True))
                         self.server.robot = robot
                         self.server.grid = grid
                         self.server.manager = manager
+                        self.server.nav = nav
                         self.server.simulator.manager = manager
             elif path == "/api/map/import":
                 source = str(payload.get("path") or "").strip()
                 if not source:
                     raise ValueError("请填写真实地图目录或 PGM 文件路径")
-                max_extent = payload.get("max_extent", 24.0)
+                max_extent = payload.get("max_extent", 40.0)
                 try:
                     max_extent = float(max_extent)
                 except (TypeError, ValueError):
@@ -241,13 +313,15 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                     world.select_map(map_id)
                     robot = RobotCar()
                     grid = GridMap()
-                    manager = TaskManager(robot, grid)
+                    manager, nav = build_manager(robot, grid)
+                    nav.set_enabled(getattr(self.server.nav, "enabled", True))
                     self.server.robot = robot
                     self.server.grid = grid
                     self.server.manager = manager
+                    self.server.nav = nav
                     self.server.simulator.manager = manager
             elif path == "/api/map/upload":
-                max_extent = payload.get("max_extent", 24.0)
+                max_extent = payload.get("max_extent", 40.0)
                 try:
                     max_extent = float(max_extent)
                 except (TypeError, ValueError):
@@ -263,10 +337,12 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                     world.select_map(map_id)
                     robot = RobotCar()
                     grid = GridMap()
-                    manager = TaskManager(robot, grid)
+                    manager, nav = build_manager(robot, grid)
+                    nav.set_enabled(getattr(self.server.nav, "enabled", True))
                     self.server.robot = robot
                     self.server.grid = grid
                     self.server.manager = manager
+                    self.server.nav = nav
                     self.server.simulator.manager = manager
             elif path == "/api/config":
                 if manager.task is not None and manager.phase not in ("idle", "done", "stopped"):
@@ -281,6 +357,32 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                     raise ValueError("请先暂停或结束任务，再重置参数")
                 config.reset()
                 manager.mowing_mode = config.settings.mowing_mode
+            elif path == "/api/nav/config":
+                nav = manager.nav
+                if nav is None:
+                    raise ValueError("导航节点未启用")
+                summary = nav.apply_static_config(payload.get("path") or None)
+                self._send_json(summary)
+                return
+            elif path == "/api/nav/mode":
+                nav = manager.nav
+                if nav is None:
+                    raise ValueError("导航节点未启用")
+                enabled = payload.get("enabled")
+                if enabled is None:
+                    raise ValueError("缺少 enabled 字段")
+                nav.set_enabled(bool(enabled))
+            elif path == "/api/nav/action":
+                nav = manager.nav
+                if nav is None:
+                    raise ValueError("导航节点未启用")
+                action = str(payload.get("action") or "nav_task_action")
+                goal = payload.get("goal") or {}
+                request = {"cmd": int(payload.get("cmd", nav_bus.ACTION_START)), "goal": goal}
+                response = nav.call_action(str(payload.get("node") or "planner"), action, request)
+                if response.get("error"):
+                    raise ValueError(response["error"])
+                self._apply_nav_side_effects(manager, action, request["cmd"], goal, response)
             elif path == "/api/speed":
                 speed = int(payload.get("speed", 1))
                 if speed not in (1, 2, 4, 8, 16, 32):
@@ -296,12 +398,34 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
         self._send_json(self._state())
 
     # --------------------------------------------------------------- 工具
+    def _apply_nav_side_effects(self, manager, action, cmd, goal, response):
+        """把节点动作命令翻译成仿真任务控制（节点 → 仿真的下行链路）。"""
+        if response.get("status") != nav_bus.RESULT_SUCCEED:
+            return
+        if action == "autodock_action" and cmd == nav_bus.ACTION_START:
+            manager.request_charge()
+        elif action == "leave_dock_action" and cmd == nav_bus.ACTION_START:
+            manager.request_resume()
+        elif action == "nav_task_action":
+            mode = int(goal.get("mode", 0) or 0)
+            if cmd == nav_bus.ACTION_START and mode == nav_bus.MODE_COVERAGE:
+                zones = goal.get("path_name") or goal.get("zones")
+                manager.start_mowing(zones, goal.get("mow_mode"))
+            elif cmd == nav_bus.ACTION_PAUSE:
+                manager.stop_task("planner 节点请求暂停")
+            elif cmd == nav_bus.ACTION_CONTINUE:
+                manager.request_resume()
+            elif cmd in (nav_bus.ACTION_CANCEL, nav_bus.ACTION_FINISHED):
+                manager.stop_task("planner 节点请求结束任务", resumable=False)
+
     def _state(self):
         state = self.server.manager.get_state()
         state["speed"] = self.server.simulator.speed
         state["map_id"] = world.MAP_ID
         state["map_name"] = world.MAP_NAME
         state["config"] = dict(config.settings.__dict__)
+        nav = self.server.manager.nav if self.server.manager else None
+        state["nav"] = nav.snapshot() if nav is not None else None
         return state
 
     def _read_json(self, limit=MAX_BODY_BYTES):
@@ -373,15 +497,26 @@ class RobotHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
+def build_manager(robot, grid):
+    """创建任务管理器，并接入 planner / dock / region_manager / trajectory_map 四个节点。"""
+    nav = nav_bridge.NavBridge(robot, grid)
+    try:
+        nav.apply_static_config()
+    except Exception as exc:  # static_config 缺失时保持默认参数
+        print("static_config 未导入：{}".format(exc))
+    return TaskManager(robot, grid, nav=nav), nav
+
+
 def create_server(host="127.0.0.1", port=8000):
     world.select_map(1)
     robot = RobotCar()
     grid = GridMap()
-    manager = TaskManager(robot, grid)
+    manager, nav = build_manager(robot, grid)
     httpd = RobotHTTPServer((host, port), RobotRequestHandler)
     httpd.robot = robot
     httpd.grid = grid
     httpd.manager = manager
+    httpd.nav = nav
     httpd.simulator = Simulator(manager)
     httpd.simulator.start()
     return httpd

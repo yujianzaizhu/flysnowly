@@ -1,0 +1,10 @@
+OTA_package_storage_path_pc: /home/mo/ota/12183.0000.01.03.01_1000.01_ota_signed.zip
+OTA_package_path: /userdata/fibot/ota/
+OTA_package_name: ota_upgrade.zip
+AutoTest_Storage_directory: /userdata/fibot/autotest/server/
+Python_Environment_Zip: /userdata/python.zip
+Python_Environment_Path: /userdata/python
+AutoTest_Decompression_directory: /app/fibot/ft_test/
+receive_serial_port: /dev/ttyUSB0
+send_serial_port: /dev/ttyUSB0
+rtk_connect_detection: true

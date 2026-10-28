@@ -1,0 +1,32 @@
+rtk_agrica_frame_id: rtk_agrica
+rtk_status_frame_id: rtk_status
+rtk_gngga_frame_id: rtk_gngga
+rtk_pvtsln_frame_id: rtk_pvtsln
+rtk_sysrts_frame_id: rtk_sysrts
+rtk_gngst_frame_id: rtk_gngst
+rtk_gngsa_frame_id: rtk_gngsa
+rtk_gnrmc_frame_id: rtk_gnrmc
+save_uart_data: false
+save_gngga_data: false
+save_gngga_data_downclocking: 10
+
+aic_frame_flag: true
+pub_agrica_flag: true 
+pub_status_flag: true 
+pub_gngga_flag: true 
+pub_pvtsln_flag: true 
+pub_sysrts_flag: true 
+pub_gngst_flag: false 
+pub_gngsa_flag: false
+pub_gnrmc_flag: false
+pub_gnepe_flag: false
+pub_gngsv_flag: false
+
+serial_port: /dev/rtk
+baud_rate: 921600
+
+save_debug_data_: true
+open_pps_time_sync: false
+gps_serial_port: /dev/ttyS2
+pps_serial_port: /dev/pps0
+pps_baud_rate: 115200

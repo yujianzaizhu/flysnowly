@@ -1,0 +1,32 @@
+send_frame_id_odom: odom
+send_frame_id_charge_state: odom
+send_frame_id_odom_state: odom
+serial_port: /dev/ttyS6
+baud_rate: 460800
+chassis_imu_en: true
+cut_speed_control: 2500
+imu_installation_mode: 1 # 0 大叶  1 昶氪  2 星月  3 亚特
+
+#Chassis Structure Parameters
+wheel_radius: 0.1
+wheel_distance: 0.378
+wheel_vel_dir: -1
+led_pwm_value: 1
+#Controller Parameters
+linear_emax: 5.0
+linear_demax: 2.0
+linear_umax: 0.1
+angular_emax: 5.0
+angular_demax: 2.0
+angular_umax: 5.0
+ang_vel_emax: 5.0
+ang_vel_demax: 2.0
+ang_vel_umax: 0.2
+#Control Filter Parameters
+yaw_filter_alpha_: 0.5
+#Control Velocity Smoothing Parameters
+max_linear_acceleration: 3.0
+max_linear_deceleration: 1.5
+max_angular_acceleration: 2.0
+max_angular_deceleration: 2.0
+acceleration_timeout: 0.2 

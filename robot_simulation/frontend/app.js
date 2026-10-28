@@ -28,6 +28,13 @@
     leftWheel: document.getElementById("leftWheel"),
     rightWheel: document.getElementById("rightWheel"),
     zoneList: document.getElementById("zoneList"),
+    navModeToggle: document.getElementById("navModeToggle"),
+    navModeHint: document.getElementById("navModeHint"),
+    navNodeList: document.getElementById("navNodeList"),
+    navStaticBtn: document.getElementById("navStaticBtn"),
+    navStaticHint: document.getElementById("navStaticHint"),
+    navStaticList: document.getElementById("navStaticList"),
+    navTopicList: document.getElementById("navTopicList"),
     log: document.getElementById("log"),
     phaseChip: document.getElementById("phaseChip"),
     zoneChip: document.getElementById("zoneChip"),
@@ -74,6 +81,14 @@
     logCount: document.getElementById("logCount"),
     paramTabs: Array.from(document.querySelectorAll("[data-param-tab]")),
     paramPanes: Array.from(document.querySelectorAll("[data-param-pane]")),
+    dockTabs: Array.from(document.querySelectorAll("[data-dock-tab]")),
+    dockPanes: Array.from(document.querySelectorAll("[data-dock-pane]")),
+    editButtons: Array.from(document.querySelectorAll("[data-edit-kind]")),
+    editRadius: document.getElementById("editRadius"),
+    editSpan: document.getElementById("editSpan"),
+    editMapMessage: document.getElementById("editMapMessage"),
+    mapEditList: document.getElementById("mapEditList"),
+    editClearBtn: document.getElementById("editClearBtn"),
   };
 
   const visionEls = {};
@@ -250,6 +265,10 @@
       updateMapOptions(state.world.maps);
       updateDeleteButton();
     }
+    if (state.world) {
+      updateEditAvailability(state);
+      renderMapEdits(state.world.edits);
+    }
 
     if (state.time + 1e-6 < lastSampleTime) {
       trail = [];
@@ -325,6 +344,327 @@
     }
   }
 
+  // ------------------------------------------------------------- 地图编辑
+  const EDIT_LABELS = {
+    static: "静态障碍",
+    dynamic: "动态障碍",
+    no_go: "禁区",
+  };
+  let editKind = null;
+  let rectStart = null;
+  let rectDraft = null;
+  let editLocked = true;
+  let editLockReason = "请先完成自动建图";
+  let pathEditId = null;
+  let pathEditA = null;
+  let hoverWorld = null;
+  let editSignature = "";
+  let editBusy = false;
+
+  function currentEditRadius() {
+    const value = parseFloat(els.editRadius ? els.editRadius.value : "0.35");
+    if (!isFinite(value)) return 0.35;
+    return Math.min(1.5, Math.max(0.12, value));
+  }
+
+  function defaultEditRadius(kind) {
+    if (kind === "dynamic") return 0.30;
+    return 0.35;
+  }
+
+  function updateEditHint() {
+    els.editButtons.forEach((button) => {
+      button.classList.toggle("is-active", button.dataset.editKind === editKind);
+    });
+    if (els.editMapMessage) {
+      if (editLocked) {
+        els.editMapMessage.textContent = editLockReason;
+      } else if (pathEditId) {
+        els.editMapMessage.textContent =
+          pathEditA
+            ? "动态障碍物 #" + pathEditId + "：已选起点 A，请点击终点 B"
+            : "动态障碍物 #" + pathEditId + "：请点击巡逻路径起点 A";
+      } else if (!editKind) {
+        els.editMapMessage.textContent =
+          "点“添加…”后在地图上点击放置；禁区按住拖动框选矩形。静态/动态障碍是实体（视觉可探测），禁区只禁止进入与切割。";
+      } else if (editKind === "no_go") {
+        els.editMapMessage.textContent = "在地图上按住左键拖出矩形框选禁区，松开即生效；再次点击按钮取消";
+      } else {
+        els.editMapMessage.textContent =
+          "在地图上点击放置" +
+          EDIT_LABELS[editKind] +
+          "（半径 " +
+          currentEditRadius().toFixed(2) +
+          " m），再次点击按钮取消";
+      }
+    }
+    canvas.style.cursor = editKind
+      ? editKind === "no_go"
+        ? "crosshair"
+        : "crosshair"
+      : "";
+  }
+
+  function setEditKind(kind) {
+    if (editLocked) {
+      if (els.editMapMessage) els.editMapMessage.textContent = editLockReason;
+      return;
+    }
+    if (editKind !== kind) {
+      editKind = kind;
+      els.editRadius.value = defaultEditRadius(editKind).toFixed(2);
+    } else {
+      editKind = null;
+    }
+    updateEditHint();
+  }
+
+  async function placeEdit(point) {
+    if (!editKind || editBusy) return;
+    editBusy = true;
+    const payload = {
+      action:
+        editKind === "static"
+          ? "add_static"
+          : editKind === "dynamic"
+          ? "add_dynamic"
+          : "add_no_go",
+      x: Number(point.x.toFixed(2)),
+      y: Number(point.y.toFixed(2)),
+      r: currentEditRadius(),
+    };
+    if (editKind === "dynamic") {
+      const span = parseFloat(els.editSpan ? els.editSpan.value : "1.6");
+      payload.span = isFinite(span) ? span : 1.6;
+    }
+    try {
+      const state = await request("/api/map/edit", payload);
+      ingest(state);
+      if (els.editMapMessage) {
+        els.editMapMessage.textContent =
+          "已添加" + EDIT_LABELS[editKind] + " @ (" + payload.x.toFixed(2) + ", " + payload.y.toFixed(2) + ")";
+      }
+    } catch (error) {
+      if (els.editMapMessage) els.editMapMessage.textContent = "添加失败：" + error.message;
+    } finally {
+      editBusy = false;
+    }
+  }
+
+  function updateEditAvailability(state) {
+    const zones = (state.zones || []).length;
+    const task = state.task || {};
+    const phase = task.phase || "idle";
+    const busy = !!task.type && !["idle", "done", "stopped"].includes(phase);
+    const locked = zones === 0 || busy;
+    const reason = zones === 0 ? "请先完成自动建图，再编辑地图" : busy ? "任务进行中不能编辑地图" : "";
+    if (locked) {
+      editKind = null;
+      pathEditId = null;
+      pathEditA = null;
+      rectStart = null;
+      rectDraft = null;
+    }
+    const changed = locked !== editLocked || reason !== editLockReason;
+    editLocked = locked;
+    editLockReason = reason;
+    els.editButtons.forEach((button) => {
+      button.disabled = locked;
+    });
+    if (els.editClearBtn) els.editClearBtn.disabled = locked;
+    if (changed) updateEditHint();
+  }
+
+  async function commitPathEdit(point) {
+    if (!pathEditId || editLocked) return;
+    if (!pathEditA) {
+      pathEditA = point;
+      if (els.editMapMessage) {
+        els.editMapMessage.textContent = "已选择起点 A，请点击终点 B（路径下限 0.4 m）";
+      }
+      return;
+    }
+    const a = pathEditA;
+    const id = pathEditId;
+    pathEditA = null;
+    pathEditId = null;
+    editBusy = true;
+    try {
+      const state = await request("/api/map/edit", {
+        action: "update_dynamic",
+        id,
+        ax: Number(a.x.toFixed(2)),
+        ay: Number(a.y.toFixed(2)),
+        bx: Number(point.x.toFixed(2)),
+        by: Number(point.y.toFixed(2)),
+      });
+      ingest(state);
+      if (els.editMapMessage) {
+        els.editMapMessage.textContent =
+          "动态障碍物 #" +
+          id +
+          " 路径已更新：( " +
+          a.x.toFixed(2) +
+          ", " +
+          a.y.toFixed(2) +
+          " ) → ( " +
+          point.x.toFixed(2) +
+          ", " +
+          point.y.toFixed(2) +
+          " )";
+      }
+    } catch (error) {
+      if (els.editMapMessage) els.editMapMessage.textContent = "更新路径失败：" + error.message;
+    } finally {
+      editBusy = false;
+    }
+  }
+
+  function startPathEdit(id) {
+    if (editLocked) {
+      if (els.editMapMessage) els.editMapMessage.textContent = editLockReason;
+      return;
+    }
+    editKind = null;
+    pathEditA = null;
+    pathEditId = pathEditId === id ? null : id;
+    updateEditHint();
+  }
+
+  async function commitRect() {
+    const draft = rectDraft;
+    rectStart = null;
+    rectDraft = null;
+    if (!draft || editBusy) return;
+    if (draft.x1 - draft.x0 < 0.3 || draft.y1 - draft.y0 < 0.3) {
+      if (els.editMapMessage) els.editMapMessage.textContent = "禁区太小（至少 0.3 m），请重新框选";
+      return;
+    }
+    editBusy = true;
+    try {
+      const state = await request("/api/map/edit", {
+        action: "add_no_go",
+        x0: Number(draft.x0.toFixed(2)),
+        y0: Number(draft.y0.toFixed(2)),
+        x1: Number(draft.x1.toFixed(2)),
+        y1: Number(draft.y1.toFixed(2)),
+      });
+      ingest(state);
+      if (els.editMapMessage) {
+        els.editMapMessage.textContent =
+          "已添加矩形禁区 (" +
+          draft.x0.toFixed(2) +
+          ", " +
+          draft.y0.toFixed(2) +
+          ") → (" +
+          draft.x1.toFixed(2) +
+          ", " +
+          draft.y1.toFixed(2) +
+          ")";
+      }
+    } catch (error) {
+      if (els.editMapMessage) els.editMapMessage.textContent = "添加禁区失败：" + error.message;
+    } finally {
+      editBusy = false;
+    }
+  }
+
+  async function deleteEdit(kind, id) {
+    try {
+      const state = await request("/api/map/edit", { action: "delete", kind, id });
+      ingest(state);
+      if (els.editMapMessage) els.editMapMessage.textContent = "已删除" + (EDIT_LABELS[kind] || kind);
+    } catch (error) {
+      if (els.editMapMessage) els.editMapMessage.textContent = "删除失败：" + error.message;
+    }
+  }
+
+  function renderMapEdits(edits) {
+    if (!els.mapEditList) return;
+    const data = edits || { static: [], dynamic: [], no_go: [] };
+    const signature = JSON.stringify(data);
+    if (signature === editSignature) return;
+    editSignature = signature;
+    els.mapEditList.textContent = "";
+    const rows = [];
+    ["static", "dynamic", "no_go"].forEach((kind) => {
+      (data[kind] || []).forEach((item) => {
+        rows.push({ kind, item });
+      });
+    });
+    if (!rows.length) {
+      const empty = document.createElement("p");
+      empty.className = "hint";
+      empty.textContent = "当前地图没有编辑对象";
+      els.mapEditList.appendChild(empty);
+      return;
+    }
+    rows.forEach(({ kind, item }) => {
+      const row = document.createElement("div");
+      row.className = "edit-item";
+      const title = document.createElement("strong");
+      title.textContent = EDIT_LABELS[kind] + " ";
+      const meta = document.createElement("em");
+      meta.textContent =
+        kind === "dynamic" && item.ax != null
+          ? "#" +
+            item.id +
+            " · 路径 (" +
+            item.ax.toFixed(2) +
+            ", " +
+            item.ay.toFixed(2) +
+            ") → (" +
+            item.bx.toFixed(2) +
+            ", " +
+            item.by.toFixed(2) +
+            ") · r " +
+            item.r.toFixed(2) +
+            " m"
+          : kind === "no_go" && item.x0 != null
+          ? "#" +
+            item.id +
+            " · (" +
+            item.x0.toFixed(2) +
+            ", " +
+            item.y0.toFixed(2) +
+            ") → (" +
+            item.x1.toFixed(2) +
+            ", " +
+            item.y1.toFixed(2) +
+            ")"
+          : "#" +
+            item.id +
+            " · (" +
+            item.x.toFixed(2) +
+            ", " +
+            item.y.toFixed(2) +
+            ") · r " +
+            item.r.toFixed(2) +
+            " m";
+      if (kind === "dynamic") {
+        const pathBtn = document.createElement("button");
+        pathBtn.type = "button";
+        pathBtn.className = "edit-path";
+        pathBtn.textContent = pathEditId === item.id ? "取消编辑" : "编辑路径";
+        pathBtn.disabled = editLocked;
+        pathBtn.addEventListener("click", () => startPathEdit(item.id));
+        row.appendChild(title);
+        row.appendChild(meta);
+        row.appendChild(pathBtn);
+      } else {
+        row.appendChild(title);
+        row.appendChild(meta);
+      }
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = "删除";
+      remove.disabled = editLocked;
+      remove.addEventListener("click", () => deleteEdit(kind, item.id));
+      row.appendChild(remove);
+      els.mapEditList.appendChild(row);
+    });
+  }
+
   function updateDeleteButton() {
     const maps = (current && current.world && current.world.maps) || [];
     const selected = maps.find(
@@ -346,19 +686,22 @@
     const data = image.data;
     const occupancy = map.occupancy;
     const mowed = map.mowed;
-    for (let index = 0; index < map.cols * map.rows; index += 1) {
+    const cols = map.cols;
+    const rows = map.rows;
+    for (let index = 0; index < cols * rows; index += 1) {
       const pixel = index * 4;
       const occ = occupancy.charCodeAt(index);
+      if (occ === 50) {
+        data[pixel] = 255;
+        data[pixel + 1] = 132;
+        data[pixel + 2] = 86;
+        data[pixel + 3] = 210;
+      }
       if (mowed.charCodeAt(index) === 49) {
         data[pixel] = 55;
         data[pixel + 1] = 224;
         data[pixel + 2] = 160;
         data[pixel + 3] = 105;
-      } else if (occ === 50) {
-        data[pixel] = 255;
-        data[pixel + 1] = 132;
-        data[pixel + 2] = 86;
-        data[pixel + 3] = 200;
       } else if (occ === 49) {
         data[pixel] = 79;
         data[pixel + 1] = 195;
@@ -434,9 +777,160 @@
 
     updateVision(state.vision || {});
     updateZones(state.zones || []);
+    renderNav(state.nav);
     updateMission(task, state);
 
     renderLog(state.log);
+  }
+
+  const NAV_LABELS = { planner: "规划节点", dock: "沿边回充节点" };
+  const NAV_STATE_LABELS = { RUNNING: "运行", PAUSE: "暂停", FAIL: "失败", NONE: "空闲" };
+  const ACTION_LABELS = {
+    nav_task_action: "导航任务",
+    autodock_action: "自动回充",
+    leave_dock_action: "离桩",
+    visual_egway_action: "视觉沿边",
+    egway_coverage_action: "沿边覆盖",
+  };
+  let navSignature = "";
+
+  let navModeTouched = false;
+
+  function syncNavMode(nav) {
+    if (!els.navModeToggle || !nav) return;
+    const enabled = nav.enabled !== false;
+    if (!navModeTouched) els.navModeToggle.checked = enabled;
+    els.navModeHint.textContent = enabled
+      ? "规划与控制由节点处理"
+      : "使用系统内置算法";
+    els.navModeHint.classList.toggle("is-off", !enabled);
+  }
+
+  function renderNav(nav) {
+    if (!els.navNodeList) return;
+    syncNavMode(nav);
+    if (!nav) {
+      if (navSignature === "off") return;
+      navSignature = "off";
+      els.navNodeList.textContent = "导航节点未启用";
+      els.navTopicList.textContent = "";
+      return;
+    }
+    const nodes = nav.nodes || [];
+    const topics = nav.topics || [];
+    const signature = JSON.stringify([
+      nodes.map((node) => [
+        node.name,
+        node.main_state_name,
+        node.sub_state_name,
+        (node.actions || []).map((action) => [action.name, action.state, action.last_result]),
+      ]),
+      topics.map((topic) => [topic.name, topic.messages, topic.last]),
+    ]);
+    if (signature === navSignature) return;
+    navSignature = signature;
+
+    els.navNodeList.textContent = "";
+    nodes.forEach((node) => {
+      const row = document.createElement("div");
+      row.className = "nav-node";
+      const head = document.createElement("div");
+      head.className = "nav-node-head";
+      const title = document.createElement("strong");
+      title.textContent =
+        (NAV_LABELS[node.name] || node.name) + " · " + String(node.heartbeat_id);
+      const state = document.createElement("span");
+      const mainState = node.main_state_name || "NONE";
+      state.className = "nav-state nav-state--" + mainState.toLowerCase();
+      state.textContent =
+        (NAV_STATE_LABELS[mainState] || mainState) +
+        (node.sub_state_name && node.sub_state_name !== "NONE" ? " / " + node.sub_state_name : "");
+      head.append(title, state);
+      row.append(head);
+      (node.actions || []).forEach((action) => {
+        const line = document.createElement("div");
+        line.className = "nav-action";
+        const label = ACTION_LABELS[action.name] || action.name;
+        line.textContent =
+          label +
+          " @" +
+          action.port +
+          " · " +
+          action.state +
+          (action.last_result ? " · " + action.last_result : "");
+        row.append(line);
+      });
+      els.navNodeList.append(row);
+    });
+
+    renderNavStatic(nav.static_config);
+
+    els.navTopicList.textContent = "";
+    const title = document.createElement("div");
+    title.className = "nav-topic-title";
+    title.textContent = "话题 " + (nav.topic_total || topics.length) + " 路";
+    els.navTopicList.append(title);
+    topics.slice(0, 18).forEach((topic) => {
+      const line = document.createElement("div");
+      line.className = "nav-topic";
+      const name = document.createElement("span");
+      name.className = "nav-topic-name";
+      name.textContent = topic.name;
+      const meta = document.createElement("em");
+      meta.textContent = topic.messages + " · " + topic.last;
+      line.append(name, meta);
+      els.navTopicList.append(line);
+    });
+  }
+
+  const STATIC_LABELS = {
+    nav_speed: "导航速度",
+    mow_speed: "弓字速度",
+    edge_speed: "沿边速度",
+    max_linear: "最大线速度",
+    max_angular: "最大角速度",
+    coverage_speed: "覆盖速度",
+    record_interval: "记录间距",
+    xy_goal_tolerance: "到点容差",
+    region_dilate_size: "区域膨胀",
+    ipa_robot_radius: "规划半径",
+  };
+  let navStaticSignature = "";
+
+  function renderNavStatic(staticConfig) {
+    if (!els.navStaticList) return;
+    const loaded = !!(staticConfig && staticConfig.loaded);
+    const params = (staticConfig && staticConfig.params) || {};
+    const signature = JSON.stringify([loaded, staticConfig && staticConfig.source, params]);
+    if (signature === navStaticSignature) return;
+    navStaticSignature = signature;
+
+    if (els.navStaticHint) {
+      els.navStaticHint.textContent = loaded
+        ? "已导入 " + (staticConfig.topic_count || 0) + " 话题 / " +
+          (staticConfig.service_count || 0) + " 服务"
+        : "未导入";
+      els.navStaticHint.classList.toggle("is-off", !loaded);
+    }
+    els.navStaticList.textContent = "";
+    if (!loaded) return;
+    const title = document.createElement("div");
+    title.className = "nav-topic-title";
+    title.textContent = "static_config 参数";
+    els.navStaticList.append(title);
+    Object.keys(params)
+      .filter((key) => STATIC_LABELS[key])
+      .forEach((key) => {
+        const line = document.createElement("div");
+        line.className = "nav-topic";
+        const name = document.createElement("span");
+        name.className = "nav-topic-name";
+        name.textContent = STATIC_LABELS[key];
+        const meta = document.createElement("em");
+        meta.textContent = String(params[key]);
+        line.append(name, meta);
+        els.navStaticList.append(line);
+      });
   }
 
   function updateVision(vision) {
@@ -652,6 +1146,11 @@
         geom,
         (state.world && state.world.obstacle_shapes) || []
       );
+      drawNoGo(geom, (state.world && state.world.no_go) || []);
+      drawEditLabels(geom, state.world && state.world.edits, state.world && state.world.dynamic);
+      drawPathEditPreview(geom);
+      drawRectDraft(geom);
+      drawDynamicPaths(geom, (state.world && state.world.dynamic) || []);
       drawObstacles(geom, state.obstacles || []);
       drawPaths(geom, state);
       drawTrail(geom);
@@ -716,6 +1215,50 @@
     ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
   }
 
+  function offsetPolygon(points, distance) {
+    // 顶点沿相邻两边外法线的角平分方向外移，用来把边界线画在可达区外侧。
+    const count = points.length;
+    let area = 0;
+    for (let index = 0; index < count; index += 1) {
+      const a = points[index];
+      const b = points[(index + 1) % count];
+      area += a[0] * b[1] - b[0] * a[1];
+    }
+    const sign = area >= 0 ? 1 : -1;
+    const normals = [];
+    for (let index = 0; index < count; index += 1) {
+      const a = points[index];
+      const b = points[(index + 1) % count];
+      const dx = b[0] - a[0];
+      const dy = b[1] - a[1];
+      const length = Math.hypot(dx, dy) || 1;
+      normals.push([(sign * dy) / length, (-sign * dx) / length]);
+    }
+    const outline = [];
+    for (let index = 0; index < count; index += 1) {
+      const prev = normals[(index - 1 + count) % count];
+      const next = normals[index];
+      let nx = prev[0] + next[0];
+      let ny = prev[1] + next[1];
+      const length = Math.hypot(nx, ny);
+      if (length < 1e-6) {
+        outline.push([
+          points[index][0] + next[0] * distance,
+          points[index][1] + next[1] * distance,
+        ]);
+        continue;
+      }
+      nx /= length;
+      ny /= length;
+      const cosHalf = Math.max(0.35, nx * next[0] + ny * next[1]);
+      outline.push([
+        points[index][0] + (nx * distance) / cosHalf,
+        points[index][1] + (ny * distance) / cosHalf,
+      ]);
+    }
+    return outline;
+  }
+
   function drawGroundBoundary(geom, polygon) {
     if (!polygon || polygon.length < 3) return;
     ctx.save();
@@ -729,7 +1272,22 @@
     ctx.closePath();
     ctx.fillStyle = palette.groundFill;
     ctx.fill();
-    ctx.lineWidth = 1.2;
+    ctx.restore();
+
+    // 边界线画在可达区外侧：沿场地多边形向外偏移半个栅格余量。
+    const outline = offsetPolygon(polygon, 0.12);
+    if (outline.length < 3) return;
+    ctx.save();
+    ctx.beginPath();
+    outline.forEach((point, index) => {
+      const x = geom.x(point[0]);
+      const y = geom.y(point[1]);
+      if (index === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.closePath();
+    ctx.lineJoin = "round";
+    ctx.lineWidth = 1.6;
     ctx.strokeStyle = palette.groundStroke;
     ctx.stroke();
     ctx.restore();
@@ -750,14 +1308,8 @@
   function drawZones(geom, zones) {
     ctx.save();
     zones.forEach((zone) => {
-      const x = geom.x(zone.x0);
-      const y = geom.y(zone.y1);
-      const width = (zone.x1 - zone.x0) * geom.scale;
-      const height = (zone.y1 - zone.y0) * geom.scale;
-      if (zone.current) {
-        ctx.fillStyle = "rgba(" + palette.green + ", 0.05)";
-        ctx.fillRect(x, y, width, height);
-      }
+      const outline = zone.outline || [];
+      // 区域按真实栅格轮廓绘制，不再用外接矩形，避免相邻区域"看起来重叠"。
       ctx.setLineDash([4, 5]);
       ctx.lineWidth = zone.current ? 1.8 : 1;
       ctx.strokeStyle = zone.current
@@ -765,10 +1317,34 @@
         : zone.selected
         ? "rgba(" + palette.cyan + ", 0.35)"
         : "rgba(" + palette.muted + ", 0.16)";
-      ctx.strokeRect(x, y, width, height);
+      if (outline.length >= 3) {
+        ctx.beginPath();
+        outline.forEach((point, index) => {
+          const px = geom.x(point[0]);
+          const py = geom.y(point[1]);
+          if (index === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        });
+        ctx.closePath();
+        if (zone.current) {
+          ctx.fillStyle = "rgba(" + palette.green + ", 0.05)";
+          ctx.fill();
+        }
+        ctx.stroke();
+      } else {
+        const x = geom.x(zone.x0);
+        const y = geom.y(zone.y1);
+        const width = (zone.x1 - zone.x0) * geom.scale;
+        const height = (zone.y1 - zone.y0) * geom.scale;
+        if (zone.current) {
+          ctx.fillStyle = "rgba(" + palette.green + ", 0.05)";
+          ctx.fillRect(x, y, width, height);
+        }
+        ctx.strokeRect(x, y, width, height);
+      }
       ctx.setLineDash([]);
-      const labelX = x + width / 2;
-      const labelY = y + height / 2;
+      const labelX = geom.x(zone.cx != null ? zone.cx : (zone.x0 + zone.x1) / 2);
+      const labelY = geom.y(zone.cy != null ? zone.cy : (zone.y0 + zone.y1) / 2);
       ctx.font = "600 " + Math.max(11, geom.scale * 0.18).toFixed(0) + "px 'Segoe UI', sans-serif";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
@@ -807,6 +1383,162 @@
       ctx.strokeStyle = palette.outlineHalo;
       ctx.stroke();
       ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.92)";
+      ctx.stroke();
+    });
+    ctx.restore();
+  }
+
+  function noGoRect(zone) {
+    if (zone.x0 != null) {
+      return {
+        x0: Math.min(zone.x0, zone.x1),
+        y0: Math.min(zone.y0, zone.y1),
+        x1: Math.max(zone.x0, zone.x1),
+        y1: Math.max(zone.y0, zone.y1),
+      };
+    }
+    return {
+      x0: zone.x - zone.r,
+      y0: zone.y - zone.r,
+      x1: zone.x + zone.r,
+      y1: zone.y + zone.r,
+    };
+  }
+
+  function strokeNoGoRect(geom, rect, dashed, alpha) {
+    const x = geom.x(rect.x0);
+    const y = geom.y(rect.y1);
+    const width = (rect.x1 - rect.x0) * geom.scale;
+    const height = (rect.y1 - rect.y0) * geom.scale;
+    ctx.beginPath();
+    ctx.rect(x, y, width, height);
+    ctx.fillStyle = "rgba(" + palette.red + ", " + (alpha || 0.1) + ")";
+    ctx.fill();
+    if (dashed) ctx.setLineDash([6, 4]);
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = "rgba(" + palette.red + ", 0.8)";
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // 斜线填充，和实体障碍区分
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, y, width, height);
+    ctx.clip();
+    ctx.strokeStyle = "rgba(" + palette.red + ", 0.22)";
+    ctx.lineWidth = 1;
+    for (let offset = -height; offset < width; offset += 9) {
+      ctx.beginPath();
+      ctx.moveTo(x + offset, y + height);
+      ctx.lineTo(x + offset + height, y);
+      ctx.stroke();
+    }
+    ctx.restore();
+    return { x: x + width / 2, y: y + height / 2 };
+  }
+
+  function drawNoGo(geom, zones) {
+    if (!zones || !zones.length) return;
+    ctx.save();
+    zones.forEach((zone) => {
+      const center = strokeNoGoRect(geom, noGoRect(zone), true, 0.1);
+      ctx.fillStyle = "rgba(" + palette.red + ", 0.85)";
+      ctx.font = "10px 'Segoe UI', sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText("禁区 #" + zone.id, center.x, center.y);
+    });
+    ctx.restore();
+  }
+
+  function drawEditLabels(geom, edits, dynamic) {
+    const items = [];
+    ((edits && edits.static) || []).forEach((item) => {
+      items.push({ text: "#" + item.id, x: item.x, y: item.y + item.r + 0.20 });
+    });
+    (dynamic || []).forEach((item) => {
+      items.push({ text: "#" + item.id, x: item.x, y: item.y + item.r + 0.20 });
+    });
+    if (!items.length) return;
+    ctx.save();
+    ctx.font = "600 10px 'Segoe UI', sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    items.forEach((item) => {
+      const x = geom.x(item.x);
+      const y = geom.y(item.y);
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = palette.outlineHalo;
+      ctx.strokeText(item.text, x, y);
+      ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
+      ctx.fillText(item.text, x, y);
+    });
+    ctx.restore();
+  }
+
+  function drawPathEditPreview(geom) {
+    if (!pathEditId) return;
+    const dynamic = (current && current.world && current.world.dynamic) || [];
+    const item = dynamic.find((entry) => entry.id === pathEditId);
+    if (!item) return;
+    const start = pathEditA || { x: item.ax, y: item.ay };
+    const end = pathEditA && hoverWorld ? hoverWorld : { x: item.bx, y: item.by };
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(geom.x(start.x), geom.y(start.y));
+    ctx.lineTo(geom.x(end.x), geom.y(end.y));
+    ctx.setLineDash([5, 5]);
+    ctx.lineWidth = 1.8;
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
+    ctx.stroke();
+    ctx.setLineDash([]);
+    [
+      { point: start, label: "A" },
+      { point: end, label: "B" },
+    ].forEach((entry) => {
+      const x = geom.x(entry.point.x);
+      const y = geom.y(entry.point.y);
+      ctx.beginPath();
+      ctx.arc(x, y, 4, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
+      ctx.fill();
+      ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
+      ctx.font = "600 10px 'Segoe UI', sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(entry.label, x, y - 8);
+    });
+    ctx.restore();
+  }
+
+  function drawRectDraft(geom) {
+    if (!rectDraft) return;
+    ctx.save();
+    const center = strokeNoGoRect(geom, rectDraft, false, 0.16);
+    const width = (rectDraft.x1 - rectDraft.x0).toFixed(2);
+    const height = (rectDraft.y1 - rectDraft.y0).toFixed(2);
+    ctx.fillStyle = "rgba(" + palette.red + ", 0.95)";
+    ctx.font = "11px 'Segoe UI', sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(width + " × " + height + " m", center.x, center.y);
+    ctx.restore();
+  }
+
+  function drawDynamicPaths(geom, items) {
+    if (!items.length) return;
+    ctx.save();
+    items.forEach((item) => {
+      if (item.ax == null) return;
+      ctx.beginPath();
+      ctx.moveTo(geom.x(item.ax), geom.y(item.ay));
+      ctx.lineTo(geom.x(item.bx), geom.y(item.by));
+      ctx.setLineDash([2, 6]);
+      ctx.lineWidth = 1.2;
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.42)";
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.arc(geom.x(item.x), geom.y(item.y), Math.max(3, item.r * geom.scale), 0, Math.PI * 2);
+      ctx.lineWidth = 1.6;
       ctx.strokeStyle = "rgba(255, 255, 255, 0.92)";
       ctx.stroke();
     });
@@ -1378,7 +2110,14 @@
   document.querySelectorAll("[data-module]").forEach((panel) => {
     modulePanels[panel.dataset.module] = panel;
   });
-  const moduleDefaults = { telemetry: true, manual: true, zones: true, events: true, params: true };
+  const moduleDefaults = {
+    telemetry: true,
+    manual: true,
+    zones: true,
+    events: true,
+    params: true,
+    nodes: true,
+  };
   let moduleState = Object.assign({}, moduleDefaults);
   try {
     const saved = JSON.parse(localStorage.getItem(MODULE_KEY) || "null");
@@ -1450,9 +2189,52 @@
   }
 
   Object.keys(modulePanels).forEach((key) => initDrag(modulePanels[key]));
+
+  // 底部面板页签：事件日志 / 导航节点 切换显示
+  const DOCK_TAB_KEY = "mowerDockTabV1";
+  let dockTab = "events";
+  try {
+    dockTab = localStorage.getItem(DOCK_TAB_KEY) || "events";
+  } catch (error) {
+    dockTab = "events";
+  }
+
+  function selectDockTab(name, persist) {
+    dockTab = name === "nodes" ? "nodes" : "events";
+    els.dockTabs.forEach((tab) => {
+      const active = tab.dataset.dockTab === dockTab;
+      tab.classList.toggle("is-active", active);
+      tab.setAttribute("aria-selected", String(active));
+    });
+    els.dockPanes.forEach((pane) => {
+      pane.classList.toggle("is-active", pane.dataset.dockPane === dockTab);
+    });
+    if (els.logCount) {
+      els.logCount.style.display = dockTab === "events" ? "" : "none";
+    }
+    if (persist !== false) {
+      try {
+        localStorage.setItem(DOCK_TAB_KEY, dockTab);
+      } catch (error) {
+        /* ignore */
+      }
+    }
+  }
+
+  els.dockTabs.forEach((tab) => {
+    tab.addEventListener("click", () => selectDockTab(tab.dataset.dockTab));
+  });
+  selectDockTab(dockTab, false);
   document.querySelectorAll("[data-module-toggle]").forEach((checkbox) => {
     checkbox.addEventListener("change", () => {
-      moduleState[checkbox.dataset.moduleToggle] = checkbox.checked;
+      const key = checkbox.dataset.moduleToggle;
+      moduleState[key] = checkbox.checked;
+      if (key === "nodes") {
+        moduleState.events = true;
+        const eventsToggle = document.querySelector('[data-module-toggle="events"]');
+        if (eventsToggle) eventsToggle.checked = true;
+        selectDockTab(checkbox.checked ? "nodes" : "events");
+      }
       localStorage.setItem(MODULE_KEY, JSON.stringify(moduleState));
       applyModuleState();
     });
@@ -1617,6 +2399,7 @@
     if (!lastGeometry) return;
     const point = canvasPoint(event);
     const worldPoint = lastGeometry.toWorld(point.x, point.y);
+    hoverWorld = worldPoint;
     els.mapCursor.textContent =
       "X " + worldPoint.x.toFixed(2) + " m · Y " + worldPoint.y.toFixed(2) + " m";
     els.mapCursor.style.display = "block";
@@ -1629,6 +2412,26 @@
   canvas.addEventListener("pointerdown", (event) => {
     if (event.button !== 0) return;
     const point = canvasPoint(event);
+    if (pathEditId && lastGeometry) {
+      commitPathEdit(lastGeometry.toWorld(point.x, point.y));
+      return;
+    }
+    if (editKind && lastGeometry) {
+      const worldPoint = lastGeometry.toWorld(point.x, point.y);
+      if (editKind === "no_go") {
+        rectStart = worldPoint;
+        rectDraft = {
+          x0: worldPoint.x,
+          y0: worldPoint.y,
+          x1: worldPoint.x,
+          y1: worldPoint.y,
+        };
+        canvas.setPointerCapture(event.pointerId);
+        return;
+      }
+      placeEdit(worldPoint);
+      return;
+    }
     panState = {
       screenX: point.x,
       screenY: point.y,
@@ -1642,6 +2445,17 @@
 
   canvas.addEventListener("pointermove", (event) => {
     updateMapCursor(event);
+    if (rectStart && rectDraft && lastGeometry) {
+      const point = canvasPoint(event);
+      const worldPoint = lastGeometry.toWorld(point.x, point.y);
+      rectDraft = {
+        x0: Math.min(rectStart.x, worldPoint.x),
+        y0: Math.min(rectStart.y, worldPoint.y),
+        x1: Math.max(rectStart.x, worldPoint.x),
+        y1: Math.max(rectStart.y, worldPoint.y),
+      };
+      return;
+    }
     if (!panState) return;
     const point = canvasPoint(event);
     viewCenterX = panState.centerX - (point.x - panState.screenX) / panState.scale;
@@ -1649,6 +2463,13 @@
   });
 
   function finishPan(event) {
+    if (rectStart) {
+      commitRect();
+      if (event && canvas.hasPointerCapture(event.pointerId)) {
+        canvas.releasePointerCapture(event.pointerId);
+      }
+      return;
+    }
     if (!panState) return;
     panState = null;
     canvas.classList.remove("is-panning");
@@ -1658,8 +2479,22 @@
   }
 
   canvas.addEventListener("pointerup", finishPan);
-  canvas.addEventListener("pointercancel", finishPan);
+  canvas.addEventListener("pointercancel", (event) => {
+    if (rectStart) {
+      rectStart = null;
+      rectDraft = null;
+      if (event && canvas.hasPointerCapture(event.pointerId)) {
+        canvas.releasePointerCapture(event.pointerId);
+      }
+      return;
+    }
+    finishPan(event);
+  });
   canvas.addEventListener("pointerleave", (event) => {
+    if (rectStart) {
+      updateMapCursor(event);
+      return;
+    }
     if (!panState) els.mapCursor.style.display = "none";
     else updateMapCursor(event);
   });
@@ -1689,6 +2524,62 @@
   });
 
   // ------------------------------------------------------------- 启动
+  if (els.editButtons.length) {
+    els.editButtons.forEach((button) => {
+      button.addEventListener("click", () => setEditKind(button.dataset.editKind));
+    });
+  }
+  if (els.editRadius) {
+    els.editRadius.addEventListener("input", updateEditHint);
+  }
+  if (els.editClearBtn) {
+    els.editClearBtn.addEventListener("click", async () => {
+      try {
+        const state = await request("/api/map/edit", { action: "clear" });
+        ingest(state);
+        if (els.editMapMessage) els.editMapMessage.textContent = "已清空当前地图的编辑对象";
+      } catch (error) {
+        if (els.editMapMessage) els.editMapMessage.textContent = "清空失败：" + error.message;
+      }
+    });
+  }
+  if (els.navStaticBtn) {
+    els.navStaticBtn.addEventListener("click", async () => {
+      els.navStaticBtn.disabled = true;
+      try {
+        const summary = await request("/api/nav/config", {});
+        navStaticSignature = "";
+        if (els.navStaticHint) {
+          els.navStaticHint.textContent = summary.loaded
+            ? "已导入 " + (summary.source || "")
+            : "未找到 static_config";
+        }
+        const state = await request("/api/state", null);
+        ingest(state);
+      } catch (error) {
+        if (els.navStaticHint) els.navStaticHint.textContent = "导入失败：" + error.message;
+      } finally {
+        els.navStaticBtn.disabled = false;
+      }
+    });
+  }
+  if (els.navModeToggle) {
+    els.navModeToggle.addEventListener("change", async () => {
+      navModeTouched = true;
+      const enabled = els.navModeToggle.checked;
+      if (els.navModeHint) {
+        els.navModeHint.textContent = enabled ? "规划与控制由节点处理" : "使用系统内置算法";
+      }
+      try {
+        const state = await request("/api/nav/mode", { enabled });
+        ingest(state);
+      } catch (error) {
+        els.navModeHint.textContent = "切换失败：" + error.message;
+      } finally {
+        navModeTouched = false;
+      }
+    });
+  }
   if (els.themeSelect) {
     els.themeSelect.addEventListener("change", () => {
       applyTheme(els.themeSelect.value);

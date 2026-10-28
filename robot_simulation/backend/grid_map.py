@@ -12,6 +12,9 @@ OCCUPIED = 2
 INFLATE_CELLS = 2
 MOW_INFLATE_CELLS = 2
 LARGE_OBSTACLE_EXTENT = 0.85
+LARGE_OBSTACLE_AREA = 5.0
+MAX_OBSTACLE_CELLS = 1200
+MAX_OBSTACLE_EXTENT = 4.0
 SMALL_OBSTACLE_RADIUS = 0.45
 MIN_ZONE_AREA = 20.0
 REGULAR_SOLIDITY = 0.90
@@ -40,6 +43,7 @@ class GridMap(object):
 
     def _reset_arrays(self):
         self.data_version = getattr(self, "data_version", 0) + 1
+        self._obstacle_baseline = None
         self.data = bytearray(self.cols * self.rows)
         self.mowed = bytearray(self.cols * self.rows)
         self.blocked = bytearray(self.cols * self.rows)
@@ -59,6 +63,76 @@ class GridMap(object):
         for zone_id in self.zone_mowed:
             self.zone_mowed[zone_id] = 0
         self.version += 1
+
+    def capture_obstacle_baseline(self):
+        """记录建图完成时的障碍层，供每次新割草任务回到干净起点。"""
+        self._obstacle_baseline = (
+            bytearray(self.data),
+            bytearray(self.blocked),
+            bytearray(self.mow_blocked),
+        )
+        return True
+
+    def restore_obstacle_baseline(self):
+        """把障碍层恢复到建图完成时的状态：清掉上次割草涂抹的障碍，保留边界建图。"""
+        baseline = getattr(self, "_obstacle_baseline", None)
+        if baseline is None:
+            return False
+        self.data = bytearray(baseline[0])
+        self.blocked = bytearray(baseline[1])
+        self.mow_blocked = bytearray(baseline[2])
+        self.data_version += 1
+        self.version += 1
+        return True
+
+    def apply_no_go(self, zones, margin=0.08):
+        """把禁区写入导航/割草膨胀层：机器人不进入、刀盘不切割，但不算实体障碍。
+
+        禁区为矩形（x0/y0/x1/y1）；仍兼容旧的圆形（x/y/r）描述。
+        margin 用于额外膨胀（B 模式弓字线会用更大的值，避免贴边卡住）。
+        """
+        margin = max(0.0, float(margin))
+        marked = 0
+        for zone in zones or []:
+            if "x0" in zone:
+                x0 = min(float(zone["x0"]), float(zone["x1"]))
+                x1 = max(float(zone["x0"]), float(zone["x1"]))
+                y0 = min(float(zone["y0"]), float(zone["y1"]))
+                y1 = max(float(zone["y0"]), float(zone["y1"]))
+                col0, row0 = self.cell_of(x0 - margin - 0.1, y0 - margin - 0.1)
+                col1, row1 = self.cell_of(x1 + margin + 0.1, y1 + margin + 0.1)
+                for row in range(row0, row1 + 1):
+                    for col in range(col0, col1 + 1):
+                        x, y = self.center_of(col, row)
+                        if not (
+                            x0 - margin <= x <= x1 + margin
+                            and y0 - margin <= y <= y1 + margin
+                        ):
+                            continue
+                        index = self.index(col, row)
+                        if not self.blocked[index]:
+                            self.blocked[index] = 1
+                            marked += 1
+                        self.mow_blocked[index] = 1
+                continue
+            radius = float(zone.get("r", 1.0)) + margin
+            cx = float(zone["x"])
+            cy = float(zone["y"])
+            col0, row0 = self.cell_of(cx - radius - 0.1, cy - radius - 0.1)
+            col1, row1 = self.cell_of(cx + radius + 0.1, cy + radius + 0.1)
+            for row in range(row0, row1 + 1):
+                for col in range(col0, col1 + 1):
+                    x, y = self.center_of(col, row)
+                    if math.hypot(x - cx, y - cy) > radius:
+                        continue
+                    index = self.index(col, row)
+                    if not self.blocked[index]:
+                        self.blocked[index] = 1
+                        marked += 1
+                    self.mow_blocked[index] = 1
+        if marked:
+            self.version += 1
+        return marked
 
     # ----------------------------------------------------------- 坐标
     def index(self, col, row):
@@ -290,6 +364,7 @@ class GridMap(object):
                     "cx": round(cx, 2),
                     "cy": round(cy, 2),
                     "free": len(cells),
+                    "outline": self.zone_outline(cells),
                     "cells": cells,
                 }
             )
@@ -308,6 +383,76 @@ class GridMap(object):
         self.covered_free = sum(self.zone_totals.values())
         self.version += 1
         return self.zones
+
+    def zone_outline(self, cells):
+        """把区域栅格集合转成闭合折线（沿栅格外沿），供界面绘制真实区域形状。"""
+        if not cells:
+            return []
+        members = set(cells)
+        edges = {}
+        for index in members:
+            col = index % self.cols
+            row = index // self.cols
+            x0 = col * self.cell
+            y0 = row * self.cell
+            x1 = x0 + self.cell
+            y1 = y0 + self.cell
+            if index - self.cols not in members:  # 下边 (x0,y0) -> (x1,y0)
+                edges.setdefault((round(x0, 2), round(y0, 2)), []).append(
+                    (round(x1, 2), round(y0, 2))
+                )
+            if index + 1 not in members or col + 1 >= self.cols:  # 右边
+                edges.setdefault((round(x1, 2), round(y0, 2)), []).append(
+                    (round(x1, 2), round(y1, 2))
+                )
+            if index + self.cols not in members:  # 上边
+                edges.setdefault((round(x1, 2), round(y1, 2)), []).append(
+                    (round(x0, 2), round(y1, 2))
+                )
+            if index - 1 not in members or col == 0:  # 左边
+                edges.setdefault((round(x0, 2), round(y1, 2)), []).append(
+                    (round(x0, 2), round(y0, 2))
+                )
+        loops = []
+        remaining = sum(len(v) for v in edges.values())
+        guard = remaining + 8
+        while edges and guard > 0:
+            guard -= 1
+            start = next(iter(edges))
+            loop = [start]
+            current = start
+            closed = False
+            while guard > 0:
+                guard -= 1
+                options = edges.get(current)
+                if not options:
+                    break
+                nxt = options.pop()
+                if not options:
+                    edges.pop(current, None)
+                if nxt == start:
+                    closed = True
+                    break
+                loop.append(nxt)
+                current = nxt
+            if closed and len(loop) >= 4:
+                loops.append(loop)
+        if not loops:
+            return []
+        loops.sort(key=lambda loop: abs(_polygon_area(loop)), reverse=True)
+        loop = loops[0]
+        simplified = []
+        count = len(loop)
+        for i in range(count):
+            prev = loop[(i - 1) % count]
+            cur = loop[i]
+            nxt = loop[(i + 1) % count]
+            cross = (cur[0] - prev[0]) * (nxt[1] - cur[1]) - (cur[1] - prev[1]) * (
+                nxt[0] - cur[0]
+            )
+            if abs(cross) > 1e-9:
+                simplified.append((round(cur[0], 2), round(cur[1], 2)))
+        return simplified if len(simplified) >= 3 else []
 
     def _free_components(self):
         visited = set()
@@ -457,9 +602,6 @@ class GridMap(object):
                 for zone in self.zones:
                     if zone["id"] == zone_id:
                         return zone
-        for zone in self.zones:
-            if zone["x0"] <= x <= zone["x1"] and zone["y0"] <= y <= zone["y1"]:
-                return zone
         return None
 
     def cell_in_zone(self, col, row, zone_id):
@@ -665,10 +807,10 @@ class GridMap(object):
                                 continue
                             visited.add(nindex)
                             queue.append((nc, nr))
-                    if len(cells) > 400:
+                    if len(cells) > MAX_OBSTACLE_CELLS:
                         break
 
-                if len(cells) < 6 or len(cells) > 400:
+                if len(cells) < 6 or len(cells) > MAX_OBSTACLE_CELLS:
                     continue
                 xs = []
                 ys = []
@@ -676,7 +818,10 @@ class GridMap(object):
                     x, y = self.center_of(c, r)
                     xs.append(x)
                     ys.append(y)
-                if max(xs) - min(xs) > 1.6 or max(ys) - min(ys) > 1.6:
+                if (
+                    max(xs) - min(xs) > MAX_OBSTACLE_EXTENT
+                    or max(ys) - min(ys) > MAX_OBSTACLE_EXTENT
+                ):
                     continue
                 # 只使用视觉建图得到的占据栅格，不读取场地真值。
                 min_x, max_x = min(xs), max(xs)
@@ -696,12 +841,10 @@ class GridMap(object):
                         if math.hypot(fx - cx, fy - cy) < 0.35:
                             cx, cy = fx, fy
                             radius = max(fr, radius - 0.06)
-                radius = max(0.20, min(radius, 1.40))
-                kind = (
-                    "large"
-                    if extent >= LARGE_OBSTACLE_EXTENT or len(cells) >= 90
-                    else "small"
-                )
+                radius = max(0.20, min(radius, 2.00))
+                # 按拟合圆估算面积：小于 5 m² 的一律视为小型障碍物（绕障 + 花瓣探明）。
+                area = math.pi * radius * radius
+                kind = "large" if area >= LARGE_OBSTACLE_AREA else "small"
                 circles.append(
                     {
                         "x": round(cx, 2),

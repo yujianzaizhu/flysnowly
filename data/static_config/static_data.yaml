@@ -1,0 +1,4 @@
+service:
+  settings:
+    test_service: '20000'
+test_port: 1000

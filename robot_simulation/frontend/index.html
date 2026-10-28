@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>1.0.4 机器人控制台 · Mower Console</title>
+  <title>1.0.5 机器人控制台 · Mower Console</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='26' fill='%230b1020' stroke='%2337e0a0' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='9' fill='%2337e0a0'/%3E%3C/svg%3E" />
   <script>
     try {
@@ -19,7 +19,7 @@
   <header class="topbar">
     <div class="brand">
       <span class="brand-mark" aria-hidden="true"></span>
-      <span class="brand-title">1.0.4 机器人控制台</span>
+      <span class="brand-title">1.0.5 机器人控制台</span>
       <span class="brand-sub">Vision Mower Console</span>
     </div>
     <div class="status-chips">
@@ -39,8 +39,9 @@
           <label><input type="checkbox" data-module-toggle="telemetry" checked /> 遥测数据</label>
           <label><input type="checkbox" data-module-toggle="manual" checked /> 手动控制</label>
           <label><input type="checkbox" data-module-toggle="zones" checked /> 区域覆盖</label>
-          <label><input type="checkbox" data-module-toggle="events" checked /> 事件日志</label>
+          <label><input type="checkbox" data-module-toggle="events" checked /> 底部面板</label>
           <label><input type="checkbox" data-module-toggle="params" checked /> 参数设置</label>
+          <label><input type="checkbox" data-module-toggle="nodes" checked /> 导航节点</label>
           <button id="collapseAllBtn" type="button">全部折叠</button>
           <button id="expandAllBtn" type="button">全部展开</button>
           <button id="resetLayoutBtn" type="button">重置布局</button>
@@ -149,7 +150,24 @@
         <div class="param-pane" data-param-pane="map">
           <div class="param-grid">
             <label>最小区块面积 (m²)<input type="number" step="1" min="8" max="100" data-config="min_zone_area" data-type="float" /></label>
-            <label>大型阈值 (m)<input type="number" step="0.01" min="0.40" max="2.00" data-config="large_obstacle_extent" data-type="float" /></label>
+            <label>大型障碍阈值 (m²)<input type="number" step="0.5" min="1.0" max="20.0" data-config="large_obstacle_area" data-type="float" /></label>
+          </div>
+          <div class="param-sub">地图编辑 · Map Edit</div>
+          <div class="map-edit-row">
+            <button id="editStaticBtn" class="task-btn task-btn--ghost" type="button" data-edit-kind="static">添加静态障碍</button>
+            <button id="editDynamicBtn" class="task-btn task-btn--ghost" type="button" data-edit-kind="dynamic">添加动态障碍</button>
+            <button id="editNoGoBtn" class="task-btn task-btn--ghost" type="button" data-edit-kind="no_go">添加禁区</button>
+          </div>
+          <div class="param-grid">
+            <label>编辑半径 (m)<input id="editRadius" type="number" step="0.05" min="0.10" max="4.00" value="0.35" /></label>
+            <label>动态行程 (m)<input id="editSpan" type="number" step="0.1" min="0.4" max="6.00" value="1.6" /></label>
+          </div>
+          <p id="editMapMessage" class="hint param-message">
+            点“添加…”后在地图上点击放置障碍物；禁区按住左键拖出矩形框选。静态/动态障碍是实体（视觉可探测），禁区只禁止进入与切割。
+          </p>
+          <div id="mapEditList" class="edit-list"></div>
+          <div class="map-edit-actions">
+            <button id="editClearBtn" class="task-btn task-btn--ghost" type="button">清空编辑</button>
           </div>
           <div class="map-import-block">
             <button id="importFileBtn" class="task-btn task-btn--primary" type="button">选择文件</button>
@@ -258,13 +276,31 @@
     </div>
   </main>
 
-  <section class="log-dock" data-module="events" data-drag-panel="events" aria-label="事件日志">
+  <section class="log-dock" data-module="events" data-drag-panel="events" aria-label="事件日志与导航节点">
     <div class="log-dock-head">
-      <span class="log-dock-title">事件日志 <span>Events</span></span>
+      <div class="dock-tabs" role="tablist" aria-label="底部面板">
+        <button class="dock-tab is-active" type="button" role="tab" data-dock-tab="events">事件日志 <span>Events</span></button>
+        <button class="dock-tab" type="button" role="tab" data-dock-tab="nodes">导航节点 <span>Nav Nodes</span></button>
+      </div>
       <span id="logCount" class="log-dock-count">0 条</span>
       <button id="logToggleBtn" class="log-toggle" type="button" aria-expanded="true">收起</button>
     </div>
-    <ul id="log" class="log-list"></ul>
+    <div class="dock-pane is-active" data-dock-pane="events">
+      <ul id="log" class="log-list"></ul>
+    </div>
+    <div class="dock-pane" data-dock-pane="nodes">
+      <div class="nav-mode-row">
+        <label class="nav-mode"><input id="navModeToggle" type="checkbox" checked /> 节点仿真</label>
+        <span id="navModeHint" class="nav-mode-hint">规划与控制由节点处理</span>
+        <button id="navStaticBtn" class="task-btn task-btn--ghost" type="button">导入 static_config</button>
+        <span id="navStaticHint" class="nav-mode-hint">未导入</span>
+      </div>
+      <div class="nav-columns">
+        <div id="navNodeList" class="nav-node-list"></div>
+        <div id="navStaticList" class="nav-topic-list nav-topic-list--col"></div>
+        <div id="navTopicList" class="nav-topic-list nav-topic-list--col"></div>
+      </div>
+    </div>
   </section>
 
   <script src="app.js"></script>

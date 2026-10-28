@@ -1,0 +1,7 @@
+model_file: /app/fibot/config/bin/yolop_416x416_0208.bin
+degree: 25
+plane_height: 0.2
+rec_distance: 1.4
+threshold: 0.7
+docking_switch: false
+debug: false

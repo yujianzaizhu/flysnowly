@@ -1,0 +1,23 @@
+camera_type: sc2310
+width: 800
+height: 450
+fps: 10
+target_gain: 768
+ros_image_encoding_format: bgr8
+frame_id: camera_frame
+gdc_file: /app/fibot/config/bin/gdc_800_450_sc2310.bin
+internal_param:
+  k0: 384.48239508
+  k1: 0
+  k2: 388.53038888
+  k3: 0
+  k4: 384.64957242
+  k5: 237.25047694
+  k6: 0
+  k7: 0
+  k8: 1
+  d0: 0
+  d1: 0
+  d2: 0
+  d3: 0
+  d4: 0

@@ -1,0 +1,45 @@
+fps: 20
+static_tf:
+# qr optical_link
+  - - 0
+    - 0
+    - 0
+    - -1.5708
+    - 0
+    - -1.5708
+    - camera_link
+    - optical_link
+# x3m camera_link
+  - - 0.35
+    - 0.04
+    - 0.22
+    - 0
+    - 0
+    - 0
+    - base_link1
+    - camera_link
+# rk3576 camera_link
+  - - 0
+    - 0
+    - 0
+    - 0
+    - 0
+    - 0
+    - base_link1
+    - depth_camera
+# get from emmc
+frame_camera:
+  - base_link1
+  - camera_link
+frame_robot:
+  - base_link1
+  - robot_left_front_link
+  - robot_left_rear_link
+  - robot_right_front_link
+  - robot_right_rear_link
+#frame_imu:
+#  - base_link1
+#  - imu_link
+#frame_rtk:
+#  - base_link1
+#  - rtk_link

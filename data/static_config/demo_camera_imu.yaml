@@ -1,0 +1,44 @@
+# 请按本机数据修改 csv.path
+version: 1
+
+csv:
+  path: "/home/zhuguodong/ros2_ws/AHRS/20260429/camera_imu_data/camera_imu_data/camera_imu_odom_1.csv"
+  time_column: 0
+  time_unit: s
+
+columns:
+  camera_accl: [2, 3, 4]
+  camera_gyro: [5, 6, 7]
+  imu226_accl: [22, 23, 24]
+  imu226_gyro: [25, 26, 27]
+  imu226_euler_deg: [28, 29, 30]
+  odom_linear_x: 17
+
+preprocess:
+  camera:
+    rotate_x_deg: 10.0
+    R_rfu_to_rdf: [1, 0, 0, 0, 0, 1, 0, -1, 0]
+  imu226:
+    R_flu_to_rfu: [0, -1, 0, 1, 0, 0, 0, 0, 1]
+
+mahony:
+  tau: 4.0
+  gyro_bias:
+    start_row: 0
+    end_row: 8999
+  dt:
+    min: 1.0e-15
+    max: 0.5
+
+iir_butter:
+  b: [8.9848614639706172e-07, 3.5939445855882469e-06, 5.3909168783823701e-06, 3.5939445855882469e-06, 8.9848614639706172e-07]
+  a: [1.0, -3.8358255406473485, 5.5208191366222294, -3.5335352194630158, 8.48555999266477512e-01]
+
+# 静止窗口 IMU 静态判定（方案B：仅看稳定性，不依赖固定 9.81）
+bias_static_check:
+  min_samples: 50
+  gyro_mean_max: 0.02        # rad/s
+  gyro_std_max: 0.005        # rad/s
+  acc_norm_std_max: 0.08     # m/s^2
+  debug: true
+  debug_interval_sec: 1.0    # FAIL 日志节流间隔（秒）

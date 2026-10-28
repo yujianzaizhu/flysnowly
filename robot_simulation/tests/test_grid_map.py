@@ -10,7 +10,7 @@ sys.path.insert(0, BACKEND_DIR)
 
 import planner  # noqa: E402
 import world  # noqa: E402
-from grid_map import GridMap, OCCUPIED  # noqa: E402
+from grid_map import GridMap, OCCUPIED, UNKNOWN  # noqa: E402
 
 
 def zone_cell(grid, zone):
@@ -76,6 +76,33 @@ class MappingTest(unittest.TestCase):
         zones = grid.partition_zones()
         self.assertEqual(len(zones), 1)
 
+    def test_obstacle_baseline_restores_mapping_state(self):
+        grid = GridMap()
+        self.assertTrue(grid.build_free_area((world.START["x"], world.START["y"])))
+        zones = grid.partition_zones()
+        self.assertTrue(zones)
+        zone = max(zones, key=lambda item: item["free"])
+        cx, cy = zone["cx"], zone["cy"]
+        col, row = grid.cell_of(cx, cy)
+        index = grid.index(col, row)
+        grid.stamp_obstacle(cx, cy, 0.30)
+        self.assertEqual(grid.data[index], OCCUPIED)
+        self.assertTrue(grid.capture_obstacle_baseline())
+        # 割草期间出现新的障碍涂抹
+        other = grid.index(col + 12, row + 12)
+        grid.data[other] = OCCUPIED
+        grid.mow_blocked[other] = 1
+        self.assertTrue(grid.restore_obstacle_baseline())
+        self.assertEqual(grid.data[other], UNKNOWN)
+        self.assertFalse(grid.mow_blocked[other])
+        # 建图阶段已知的障碍与区域轮廓保留
+        self.assertEqual(grid.data[index], OCCUPIED)
+        self.assertEqual(len(grid.zones), len(zones))
+        self.assertEqual(
+            [tuple(point) for point in grid.zones[0]["outline"]],
+            [tuple(point) for point in zone["outline"]],
+        )
+
     def test_mowing_counts_zone_coverage(self):
         grid = GridMap()
         self.assertTrue(grid.build_free_area((4.9, 6.2)))
@@ -118,18 +145,25 @@ class MappingTest(unittest.TestCase):
             )
         world.select_map(1)
 
-    def test_obstacle_kind_is_estimated_from_visual_cells(self):
+    def test_obstacle_kind_is_estimated_by_area(self):
         grid = GridMap()
-        for row in range(30, 40):
-            for col in range(30, 40):
+        # 2.6 m × 2.6 m 的占据块：拟合面积 > 5 m² → 大型
+        for row in range(30, 56):
+            for col in range(30, 56):
                 grid.mark_occupied(col, row)
-        for row in range(60, 63):
-            for col in range(60, 63):
+        # 0.3 m × 0.3 m：面积远小于 5 m² → 小型
+        for row in range(70, 73):
+            for col in range(70, 73):
                 grid.mark_occupied(col, row)
         circles = grid.obstacle_circles(None)
-        kinds = {circle["kind"] for circle in circles}
-        self.assertIn("large", kinds)
-        self.assertIn("small", kinds)
+        kinds = {(circle["kind"], round(math.pi * circle["r"] ** 2, 1)) for circle in circles}
+        self.assertIn("large", {kind for kind, _ in kinds})
+        self.assertIn("small", {kind for kind, _ in kinds})
+        for kind, area in kinds:
+            if kind == "large":
+                self.assertGreaterEqual(area, 5.0)
+            else:
+                self.assertLess(area, 5.0)
 
     def test_zones_cover_all_free_cells_and_are_large(self):
         for map_id in range(1, 6):

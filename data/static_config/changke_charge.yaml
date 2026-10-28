@@ -1,0 +1,129 @@
+modelname: "changke_charge"
+#根据表现调节参数
+use_all_small_marker: false #使用特征码回去
+use_samll_ar_code: false #使用小特征码
+use_circle_marker: false #使用圆形标记
+use_big_ar_code: true #使用大二维码
+use_chargedirect: true #使用直线充
+use_chargeplane: false #使用充电板平面
+use_chargehead: true #使用充电板头部（一般不开启，除非没有大二维码和小特征码）
+use_erode: true #是否对充电导轨腐蚀膨胀
+distance_min_use_charge_step1: 0.6
+distance_max_use_charge_step1: 2.0
+distance_min_use_charge_step2: 0.0
+distance_max_use_charge_step2: 0.01
+distance_min_use_direct: 0.3
+distance_max_use_direct: 1.0
+distance_min_use_board: 0.6
+distance_max_use_board: 1.0
+distance_max_use_mark_circle: 0.4
+distance_max_use_mark_small_arcode: 0.4
+distance_min_use_big_ar: 0
+distance_max_use_big_ar: 0.6
+#根据你的分割模型设置索引,一般不用修改
+label_index_head: 4
+label_index_direct: 0 
+label_index_board: 3
+label_index_bigAR: 5
+label_index_smallAR: 2 
+label_index_circle: 1
+#根据你的充电版结构设置参数,一般不用修改
+#object_pose可以使用posematrix或者x,y,z,roll,pitch,yaw表示，但使用欧拉角的时候，都是旋转RPY顺序 
+charge_board_plane:
+  object_name: "charge_board_plane"
+  object_idx: 5
+  cornerpoints:
+    - [-0.16, 0.22, 0.0]
+    - [-0.16, -0.22, 0.0]
+    - [0.42, -0.22, 0.0]
+    - [0.42, 0.22, 0.0]
+
+charge_board_direct:
+  object_name: "charge_board_direct"
+  object_idx: 6
+  cornerpoints:
+    - [-0.10, 0.0, 0.0]
+    - [0.385, 0.0, 0.0]
+
+charge_board_head:
+  object_name: "charge_board_head"
+  object_idx: 7
+  object_pose:
+    x: 0.385
+    y: 0
+    z: 0.0
+    roll: 0
+    pitch: 0
+    yaw: 0
+
+ar_code_big:
+  object_name: "ar_code_big"
+  object_idx: 8
+  object_pose:
+    posematrix:
+      - [0.0, 0.0, -1.0, 0.385]
+      - [1.0, 0.0, 0.0, 0.0]
+      - [0.0, -1.0, 0.0, 0.19]
+      - [0.0, 0.0, 0.0, 1.0]
+  width: 0.11
+  ids: 20
+  size: [6, 6]
+  cornerpoints:
+    - [0.385, 0, 0.19]
+
+# 真值系统
+record_save_path: "/userdata/luojinhong_0419/changke_record.txt"
+
+AR_models:
+#前面：远距离用大的
+  - object_idx: 8
+    object_pose:
+      posematrix:
+        - [0.0, 0.0, -1.0, 0.285]
+        - [-1.0, 0.0, 0.0, 0.0]
+        - [0.0, 1.0, 0.0, 0.43]
+        - [0.0, 0.0, 0.0, 1.0]
+    width: 0.16
+    ids: 1
+    size: [4, 4]
+    cornerpoints:
+      - [0.285, 0, 0.43]
+#前面：近距离用小的
+  - object_idx: 9
+    object_pose:
+      posematrix:
+        - [0.0, 0.0, -1.0, 0.285]
+        - [-1.0, 0.0, 0.0, 0.0]
+        - [0.0, 1.0, 0.0, 0.38]
+        - [0.0, 0.0, 0.0, 1.0]
+    width: 0.10
+    ids: 4
+    size: [4, 4]
+    cornerpoints:
+      - [0.285, 0, 0.38]
+# 左边
+  - object_idx: 10
+    object_pose:
+      posematrix:
+        - [-1.0, 0.0, 0.0, 0.385]
+        - [0.0, 0.0, 1.0, 0.10]
+        - [0.0, 1.0, 0.0, 0.43]
+        - [0.0, 0.0, 0.0, 1.0]
+    width: 0.16
+    ids: 3
+    size: [4, 4]
+    cornerpoints:
+      - [0.385, 0.10, 0.43]
+# 右边
+  - object_idx: 11
+    object_pose:
+      posematrix:
+        - [1.0, 0.0, 0.0, 0.385]
+        - [0.0, 0.0, -1.0, -0.10]
+        - [0.0, 1.0, 0.0, 0.43]
+        - [0.0, 0.0, 0.0, 1.0]
+    width: 0.16
+    ids: 2
+    size: [4, 4]
+    cornerpoints:
+      - [0.385, -0.10, 0.43]

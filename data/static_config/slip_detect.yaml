@@ -1,0 +1,9 @@
+odom_used: true
+rtk_used: false
+imu_used: true
+vo_used: false
+debug: false
+slip_used: true
+speed: 0.1
+flow_threshold: 5.0
+num_point: 50

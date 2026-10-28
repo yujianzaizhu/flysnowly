@@ -1,0 +1,13 @@
+platform_type: rk3576_changke
+ble_name: FIBOCOM
+liner_ratio: 0.4
+angular_ratio: 0.5
+all_switch: false
+ble_test: false
+wifi_test: false
+usb_test: false
+uart_test: false
+need_rtk: true
+need_charging: true
+is_usb_role_host: false
+is_safety_regulations: false

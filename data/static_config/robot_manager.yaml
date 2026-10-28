@@ -1,0 +1,73 @@
+#  10006   # bow coverage
+#  10007   # random coverage
+#  10009   # edgeway coverage
+#  10010   # random bow coverage
+#  10012   # multiple coverage
+
+# temp to set default function
+#task_function_id: 10007
+
+# temp to set default: [true, manual] [false, auto]
+#manual_or_auto_mapping: false
+
+# temp to set default params  # move to dynamic_config
+#task_time_duration: 172800
+#task_time_duration_area_a: 3600
+#task_time_duration_area_b: 3600
+#electronic_fence_radius: 1000
+
+rtk_detect_disable: false
+rtk_pps_time_sync: false
+rtk_exception_stop: false
+allow_direct_to_charge_point: true
+allow_not_in_charge_station: false
+check_battery_cover_opened: true
+allow_less_system_time: true
+disable_continue_mower: false
+disable_map_function: false
+disable_safety_exception: false
+allow_suntime_limit: false
+
+motor_error_duration: 180
+motor_error_count: 3
+
+fill_light_detect_time: 5
+mapping_timeout: 900
+mapping_ignore_detection_dock_time: 60
+edgeway_ignore_detection_dock_time: 30
+collision_signal_detect_time: 3
+
+screw_mower_switch: false
+screw_mower_current: 1000.0
+screw_mower_time: 5
+
+safety_detect_duration: 0
+safety_time_duration: 10
+flip_detect_angle: 30.0
+exception_shutdown_time: 1200
+exception_shutdown_switch: true
+low_battery_shutdown: 5
+
+health_exception_duration: 10
+simplify_navigation: false
+
+outside_grass_detect_frame: 38 # 25
+outside_grass_confidence: 96.0
+continue_mowing_battery_percent: 80.0
+low_battery_percent: 20.0
+mapping_low_battery_percent: 20.0
+#task_time_edgeway: 600
+task_edgeway_laps: 2
+unit_area_mowing_time: 20
+mapping_velocity_rate: 0.8 # mapping_velocity = edstate_vis_cov_egway_straight_vel * rate
+
+# production testing mode
+test_time_duration: 180
+test_time_edgeway: 59
+#test_edgeway_laps: 2
+
+test_time_collision: 10
+
+fps_save_robot_info: 0.5
+fps_pub_manager_info: 5.0
+xml_folder_path: /app/fibot/config/xml/task_tree_xml

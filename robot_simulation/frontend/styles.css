@@ -590,11 +590,91 @@ body {
   border-color: rgba(var(--cyan-rgb), 0.55);
 }
 
+/* 底部面板页签：事件日志 / 导航节点 */
+.dock-tabs {
+  display: flex;
+  gap: 6px;
+}
+
+.dock-tab {
+  padding: 4px 12px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: rgba(var(--muted-rgb), 0.85);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.dock-tab span {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 1px;
+  text-transform: none;
+  color: rgba(var(--muted-rgb), 0.55);
+  margin-left: 5px;
+}
+
+.dock-tab:hover {
+  color: var(--text);
+}
+
+.dock-tab.is-active {
+  color: var(--cyan);
+  border-color: rgba(var(--cyan-rgb), 0.35);
+  background: rgba(var(--cyan-rgb), 0.1);
+}
+
+.dock-pane {
+  display: none;
+  min-height: 0;
+}
+
+.dock-pane.is-active {
+  display: block;
+}
+
+.dock-pane[data-dock-pane="nodes"] {
+  max-height: 300px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* 导航节点内容按列排布，宽屏下一屏看全 */
+.nav-columns {
+  display: grid;
+  grid-template-columns: minmax(200px, 1fr) minmax(150px, 0.78fr) minmax(210px, 1.1fr);
+  gap: 12px;
+  align-items: start;
+  margin-top: 8px;
+}
+
+.nav-columns > * {
+  min-width: 0;
+}
+
+.nav-columns .nav-topic-list--col {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+@media (max-width: 620px) {
+  .nav-columns {
+    grid-template-columns: 1fr;
+  }
+}
+
 .log-dock .log-list {
   max-height: 148px;
 }
 
-.log-dock.is-collapsed .log-list {
+.log-dock.is-collapsed .dock-pane {
   display: none;
 }
 
@@ -1045,6 +1125,240 @@ body {
   .legend { display: none; }
   .mission-row--status { font-size: 10.5px; }
   .speed-group { margin-left: 0; }
+}
+
+/* ------------------------------------------------------------- 导航节点 */
+.map-edit-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.map-edit-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.edit-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+  max-height: 132px;
+  overflow-y: auto;
+}
+
+.edit-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 11px;
+  color: var(--text);
+  background: rgba(var(--well-rgb), 0.35);
+}
+
+.edit-item strong {
+  font-weight: 600;
+}
+
+.edit-item em {
+  font-style: normal;
+  color: rgba(var(--muted-rgb), 0.85);
+  font-variant-numeric: tabular-nums;
+}
+
+.edit-item button {
+  margin-left: auto;
+  padding: 2px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--red);
+  font: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+
+.edit-item button:hover {
+  background: rgba(255, 93, 108, 0.14);
+}
+
+.edit-item button:disabled,
+.task-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.edit-item button.edit-path {
+  margin-left: auto;
+  color: var(--cyan);
+  border-color: rgba(var(--cyan-rgb), 0.45);
+}
+
+.edit-item button.edit-path + button {
+  margin-left: 0;
+}
+
+.task-btn.is-active {
+  color: var(--cyan);
+  border-color: rgba(var(--cyan-rgb), 0.6);
+  background: rgba(var(--cyan-rgb), 0.16);
+}
+
+.nav-mode-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(var(--green-rgb), 0.08);
+}
+
+.nav-mode-row .task-btn {
+  margin-left: auto;
+  padding: 4px 10px;
+  font-size: 10px;
+}
+
+.nav-mode-row .nav-mode-hint:last-child {
+  text-align: right;
+}
+
+.nav-mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.nav-mode input {
+  accent-color: var(--green);
+}
+
+.nav-mode-hint {
+  font-size: 9.5px;
+  color: rgba(var(--muted-rgb), 0.9);
+  text-align: right;
+}
+
+.nav-mode-hint.is-off {
+  color: var(--amber);
+}
+
+.nav-static-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 9px 0 6px;
+}
+
+.nav-static-row .task-btn {
+  flex: 0 0 auto;
+  padding: 5px 9px;
+  font-size: 10px;
+}
+
+.nav-node-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.nav-node {
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(var(--panel-soft-rgb), 0.55);
+}
+
+.nav-node-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text);
+}
+
+.nav-node-head strong {
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+.nav-state {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 9.5px;
+  border: 1px solid var(--line-strong);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.nav-state--running { color: var(--green); border-color: rgba(var(--green-rgb), 0.55); }
+.nav-state--pause { color: var(--amber); border-color: rgba(var(--amber-rgb), 0.55); }
+.nav-state--fail { color: var(--red); border-color: rgba(var(--red-rgb), 0.55); }
+
+.nav-action {
+  margin-top: 2px;
+  font-size: 9.5px;
+  color: rgba(var(--muted-rgb), 0.85);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.nav-topic-list {
+  margin-top: 8px;
+  padding-top: 7px;
+  border-top: 1px dashed var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 9.5px;
+  color: rgba(var(--muted-rgb), 0.8);
+}
+
+.nav-topic-title {
+  font-size: 9.5px;
+  letter-spacing: 0.6px;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.nav-topic {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.nav-topic-name {
+  color: var(--cyan);
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav-topic em {
+  font-style: normal;
+  color: rgba(var(--muted-rgb), 0.85);
+  white-space: nowrap;
+  flex: 0 0 auto;
+  max-width: 64%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
 }
 
 /* ------------------------------------------------------------- 模块菜单 / 可拖动面板 */

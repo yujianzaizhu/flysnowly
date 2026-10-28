@@ -1,0 +1,16 @@
+vin_vps_mode: 0
+vin_configs:
+  isp_en: 1
+vps_configs:
+  vps_en: 1
+  scale_en: 1
+  crop_en: 0
+  crop_roi:
+    x: 0
+    y: 0
+    width: 800
+    height: 450
+  rotate_en: 0
+  gdc_en: 1
+  frame_rate: true
+config_print: false

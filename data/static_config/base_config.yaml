@@ -1,0 +1,52 @@
+%YAML:1.0
+
+############################### 导航交互相关 ############################################
+# 模式选择   使用传感器（IMU1：底盘IMU； IMU2：相机IMU）
+# local_wio_mode  ODOM+IMU1
+# local_vio_mode  CAM+IMU2
+# local_viio_mode CAM+IMU1+IMU2
+# local_vwio_mode CAM+IMU1+IMU2+ODOM
+# local_ekf_mode CAM+IMU1+IMU2+ODOM
+# world_ekf_mode CAM+IMU1+IMU2+ODOM+RTK
+# world_ba_mode CAM+IMU1+IMU2+ODOM+RTK
+
+#输出到导航端的定位模式
+output_nav_pose_choose: world_ekf_mode
+# output_nav_pose_choose: local_wio_mode
+
+# 是否为调试模式 0：正常发版使用  1：调试模式，会记录所有传感器topic数据
+is_debug_mode: 0
+
+# 是否发布真实的Z轴高度数据 0:不发布 1：发布 -->
+is_pub_real_z: 0
+
+# 用来重定位的方式
+# bit0:充电桩重定位
+# bit1:二维码重定位
+# bit2:地图重定位
+# bit3:\
+# bit4:\
+# bit5:\
+# bit6:\
+# bit7:使用RTK重定位
+
+location_map_state_choose: 0X81 #
+
+#（BA模式），需要启动哪些节点
+BaMode.rtk_wio_thread: 0 #rtk融合wio的线程
+BaMode.rtk_vio_thread: 0 #rtk融合vio的线程
+BaMode.sys_thread: 1 #数据同步线程
+BaMode.tag_remap_thread: 1 #数据同步线程
+
+#EKF模式,是否进行模式切换(全局模式/局部模式)
+# 0: 自动根据建图时状态进行选择模式，(退桩时RTK为状态4，则为全局模式，否则为局部模式）
+# 1: 强制为全局模式 (mode = 1 )
+# 2: 强制为局部定位模式 (mode = 2)
+EkfDebug.ekf_map_mode_choose : 0
+
+#EKF模式,加噪声相关
+EkfDebug.rtk_jump: 0 #是否使能rtk跳帧
+EkfDebug.rtk_ignore_num: 200 #rtk跳帧的数量200 （20秒跳一次）
+
+LogDebug.is_csv_log: 0 #日志是否输出至csv
+LogDebug.log_frq: 2   #非csv模式，日志中的log频率

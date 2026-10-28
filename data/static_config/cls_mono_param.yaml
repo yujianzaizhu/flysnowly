@@ -1,0 +1,127 @@
+#模型
+weights_path: /app/fibot/config/bin/detect_all.bin
+camera_img_h: 450
+camera_img_w: 800
+num_classes: 12
+objectThresh: 0.5
+
+#外参
+frame_id: camera_link
+rgb_cam_frame: camera_link
+robot_frame_id: base_link1 #用于发碰撞点
+
+plane_height: 0.20  #相机高度
+angle: 25 #相机角度
+
+robot_width: 0.4  #车宽
+robot_center: 0.35  #车前到中心
+robot_length: 0.5  #车长
+
+forward_speed: 0.4 #前进运动状态判断
+backward_speed: 0.15 #后退运动状态判断
+rotate_speed: 0.4 #旋转运动状态判断
+
+sendGrassResultRos: true #图像话题发布
+sendPointResult: true #点云话题发布
+sendStatus: true #检测状态话题（脏污、二维码等）发布
+
+#高草
+id: 0
+highgrass_use: true
+highgrass_mid_thresh: 0.7
+highgrass_right_thresh: 0.5
+highgrass_count_limit: 2
+
+#喷头
+id: 1
+sprinkler_use: true
+sprinkler_thresh: 0.5
+sprinkler_count_limit: 1
+
+#二维码
+id: 2
+qrcode_use: true
+cls_qrcode_detect: true
+qrcode_thresh: 0.7
+qrcode_count_limit: 3
+fiducial_len: 0.11  #二维码大小
+distance_close: 0  #距离区间
+distance_far: 1  #距离区间
+yaw_angle: 90 #二维码可视角度
+
+#脏污
+id: 3
+obsured_use: true
+obsured_thresh: 0.5
+obsured_count_limit: 30
+obsured_pixels_count: 10000
+obsured_count_AI_limit: 5
+obsured_count_black_limit: 10
+obsured_black_thresh: 5 #0-255
+
+#充电座
+id: 4
+dock_use: false
+dock_thresh: 0.8
+dock_count_limit: 3
+dock_edge_rec_distance: 0.5
+
+#落叶
+id: 5
+leaf_use: true
+leaf_thresh: 0.5
+leaf_count_limit: 1 #5
+
+#电线
+id: 6
+dock_use: true
+dock_thresh: 0.5
+dock_count_limit: 1
+
+#刺猬
+id: 7
+hedgehog_use: true
+hedgehog_thresh: 0.5
+hedgehog_count_limit: 1
+
+#网
+id: 8
+net_use: true
+net_thresh: 0.5
+net_count_limit: 2
+
+#网球
+id: 9
+tennis_use: true
+tennis_thresh: 0.5
+tennis_count_limit: 1
+
+#石板路
+id: 10
+flagging_use: false
+flagging_thresh: 0.5
+flagging_count_limit: 1
+
+#边界线
+id: 11
+line_use: true
+line_thresh: 0.5
+line_count_limit: 1
+
+#木棍
+id: 12
+branch_use: true
+branch_thresh: 0.5
+branch_count_limit: 1
+
+#阴影
+id: 12
+shadow_use: false
+shadow_mean_thresh: 100
+shadow_stddev_thresh: 50
+shadow_count_limit: 3
+
+
+
+
+

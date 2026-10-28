@@ -1,0 +1,2 @@
+robot_nav_file: rk3576_robot_nav_params_ins
+robot_costmap_file: rk3576_local_costmap_params_ins

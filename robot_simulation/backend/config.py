@@ -36,8 +36,8 @@ class Settings(object):
         self.mow_speed = 0.48
         self.edge_speed = 0.50
         self.inner_corner_advance = 0.16
-        # 障碍物分类（来自视觉建图，不使用真值）
-        self.large_obstacle_extent = 0.85
+        # 障碍物分类（来自视觉建图，不使用真值）：大于该面积视为大型障碍物
+        self.large_obstacle_area = 5.0
         self.small_obstacle_radius = 0.45
         # 弓字重规划 / 断点
         self.max_zone_plan_passes = 30
@@ -70,7 +70,7 @@ _RANGES = {
     "mow_speed": (0.10, 2.00),
     "edge_speed": (0.15, 1.20),
     "inner_corner_advance": (0.04, 0.40),
-    "large_obstacle_extent": (0.40, 2.00),
+    "large_obstacle_area": (1.0, 20.0),
     "small_obstacle_radius": (0.10, 1.00),
     "max_zone_plan_passes": (1, 50),
     "min_zone_area": (8.0, 100.0),
@@ -138,7 +138,7 @@ def apply():
     tasks.DEFAULT_MOWING_MODE = settings.mowing_mode
     tasks.MAX_ZONE_PLAN_PASSES = int(settings.max_zone_plan_passes)
 
-    grid_map.LARGE_OBSTACLE_EXTENT = float(settings.large_obstacle_extent)
+    grid_map.LARGE_OBSTACLE_AREA = float(settings.large_obstacle_area)
     grid_map.SMALL_OBSTACLE_RADIUS = float(settings.small_obstacle_radius)
     grid_map.MIN_ZONE_AREA = float(settings.min_zone_area)
 

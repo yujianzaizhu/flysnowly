@@ -1,0 +1,74 @@
+debug_image_height: 240
+#可修改
+is_ofilmcamera: true
+stereo_use_online_calibrator:  false
+#保存路径
+pub_fps: 10
+save_fps: 10
+stereo_save_debugimage: false
+stereo_save_path_debugimage: /userdata/stereo/ #外接U盘路径
+stereo_save_pointcloud: false
+stereo_save_path_pointcloud: /userdata/stereo/
+stereo_save_image_check: false
+stereo_save_path_check: /userdata/stereo/
+stereo_save_image_stereo: false
+stereo_save_path_stereo: /userdata/stereo/
+
+#采样与截断
+stereo_sample_step_u: 4 #用于显示点云的采样
+stereo_sample_step_v: 3
+stereo_max_z: 2.0
+
+#去噪参数
+stereo_remove_speckle: true
+stereo_speckle_max_area: 50
+stereo_removespeckle_method: 1 # 0.普通, 1.洪水
+stereo_removespeckle_tolerance: 0.05 #当前查询视差百分比
+stereo_removespeckle_min_disp: 3.0
+#
+crop_image_at_night: false
+#
+remove_dark_area_at_night: true
+remove_dark_area_fill_half: true
+remove_dark_area_threshold: 40
+remove_dark_area_erosion_size: 1
+
+#模型640*384
+# stereo_model_weight: /app/fibot/config/rknn/model21hy.crypt.cut.rknn
+# stereo_rknn_input_width: 640 # 输入图像宽度
+# stereo_rknn_input_height: 384 # 输入图像高度
+
+#模型320*192
+stereo_model_weight: /app/fibot/config/rknn/model15hy.crypt.cut.rknn
+stereo_rknn_input_width: 320 # 输入图像宽度
+stereo_rknn_input_height: 192 # 输入图像高度
+
+model_type: 5
+allowed_time_difference: 0.025 # 允许的时间差
+stereo_input_is_rect: true # 输入是否矫正后图像
+stereo_frame_id: depth_camera
+stereo_camera_info: camera_info
+stereo_left_image: leftir_image
+stereo_right_image: rightir_image
+stereo_pub_pointcloud: origincloud
+# stereo_pub_pointcloud: nograsscloud
+stereo_pub_debug_image: ai_stereo_debug_image
+stereo_pub_depth_image: ai_stereo_depth
+stereo_debug_flag_image: false
+stereo_debug_flag_pointcloud: false
+
+
+#外参
+stereo_depthcam_struct_installroll: 0
+stereo_depthcam_struct_installpitch: 0
+stereo_depthcam_struct_installyaw: 0
+stereo_depthcam_struct_installheight: 0.01
+stereo_depthcam_struct_installX: 0
+stereo_depthcam_struct_installY: 0
+
+#测试图像路径
+#相机之间的内参不一样，出来的深度就不一样，有条件可以记录和读取内参
+testing_image_flag: false
+# testing_image_path: /userdata/testing/20250609/outdoor1/
+testing_image_path: /userdata/testing/20250606/part1/
+# testing_image_path: /userdata/testing/cliff/

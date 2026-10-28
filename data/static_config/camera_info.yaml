@@ -1,0 +1,7 @@
+camera_json_name: sc2310.yaml
+read_file_tag_parameters: false
+camera_mpp_config: mpp_config.yaml
+#depth_mode=10 出左右原图（未压缩灰度图）640x480@15fps+左目rgb校正后640x480（yuv-nv12）@10fps+depth640x480@10fps
+#depth_mode=0  出左右校正后的640x480（yuv-nv12）@20fps+depth640x480@10fps
+#depth_mode=2  出左右原图640x480（yuv-nv12）@20fps+depth640x480@10fps
+depth_mode: 0

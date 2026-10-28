@@ -138,6 +138,23 @@ DOCK = {"x": 0.0, "y": 0.0, "r": DOCK_RADIUS}
 START = {"x": 0.0, "y": 0.0, "theta": 0.0}
 IMPORTED_MAPS = {}
 NEXT_IMPORTED_ID = 101
+# 地图编辑（参数-地图）：静态障碍 / 动态障碍 / 禁区，按地图 id 保存
+EDIT_STATE = {}
+EDIT_KINDS = ("static", "dynamic", "no_go")
+NEXT_EDIT_ID = 1
+BASE_SHAPES = []
+DYNAMIC = []
+NO_GO = []
+DYNAMIC_SPEED = 0.15
+# 面积阈值：小于该面积的障碍物按“小型”处理
+LARGE_OBSTACLE_AREA = 5.0
+STATIC_SHAPES = []
+STATIC_OUTLINES = []
+STATIC_PARTS = []
+STATIC_POLYGONS = []
+STATIC_SEGMENTS = []
+WORLD_VERSION = 0
+_WORLD_CACHE = {}
 
 
 def clamp(value, low, high):
@@ -153,6 +170,7 @@ def select_map(map_id):
     global MAP_ID, MAP_NAME, WIDTH, HEIGHT, COLS, ROWS, ACTIVE_SCALE
     global POLYGON, POLYGON_SEGMENTS, OBSTACLE_SEGMENTS
     global OBSTACLE_SHAPES, OBSTACLE_OUTLINES, OBSTACLES, OBSTACLE_POLYGONS, DOCK, START
+    global BASE_SHAPES, DYNAMIC, NO_GO
     definition = MAPS[int(map_id)]
     MAP_ID = definition["id"]
     MAP_NAME = definition["name"]
@@ -166,27 +184,26 @@ def select_map(map_id):
     POLYGON = [(x * scale, y * scale) for x, y in definition["polygon"]]
     POLYGON_SEGMENTS = _segments(POLYGON)
     raw_shapes = definition.get("obstacles", [])
-    OBSTACLE_SHAPES = []
+    BASE_SHAPES = []
     for shape in raw_shapes:
         item = {"kind": shape["kind"]}
         item["parts"] = [
             (x * scale, y * scale, radius) for x, y, radius in shape.get("parts", [])
         ]
         if "outline" in shape:
-            item["outline"] = [(x * scale, y * scale) for x, y in shape["outline"]]
-        OBSTACLE_SHAPES.append(item)
-    OBSTACLE_OUTLINES = [obstacle_outline(shape) for shape in OBSTACLE_SHAPES]
-    OBSTACLES = [part for shape in OBSTACLE_SHAPES for part in shape["parts"]]
-    OBSTACLE_POLYGONS = [
-        shape["outline"]
-        for shape in OBSTACLE_SHAPES
-        if len(shape.get("outline", [])) >= 3
-    ]
-    OBSTACLE_SEGMENTS = [
-        segment
-        for polygon in OBSTACLE_POLYGONS
-        for segment in _segments(polygon)
-    ]
+            item["outline"] = [(x * scale, y * scale) for x, y in shape.get("outline")]
+        BASE_SHAPES.append(item)
+    bucket = _edit_bucket(MAP_ID)
+    DYNAMIC = []
+    for item in bucket["dynamic"]:
+        entry = dict(item)
+        entry["x"] = entry["ax"]
+        entry["y"] = entry["ay"]
+        entry["t"] = 0.0
+        DYNAMIC.append(entry)
+    NO_GO = [dict(item) for item in bucket["no_go"]]
+    _rebuild_static_geometry()
+    _mark_world_dirty()
     DOCK = {
         "x": definition["dock"]["x"] * scale,
         "y": definition["dock"]["y"] * scale,
@@ -196,6 +213,287 @@ def select_map(map_id):
         "x": definition["start"]["x"] * scale,
         "y": definition["start"]["y"] * scale,
         "theta": definition["start"]["theta"],
+    }
+
+
+def _edit_bucket(map_id=None):
+    map_id = MAP_ID if map_id is None else int(map_id)
+    bucket = EDIT_STATE.get(map_id)
+    if bucket is None:
+        bucket = {"static": [], "dynamic": [], "no_go": []}
+        EDIT_STATE[map_id] = bucket
+    return bucket
+
+
+def _next_edit_id():
+    global NEXT_EDIT_ID
+    value = NEXT_EDIT_ID
+    NEXT_EDIT_ID += 1
+    return value
+
+
+def _mark_world_dirty():
+    global WORLD_VERSION
+    WORLD_VERSION += 1
+
+
+def _rebuild_static_geometry():
+    """重建静态障碍几何（地图定义 + 静态编辑），并刷新动态障碍占据。"""
+    global STATIC_SHAPES, STATIC_OUTLINES, STATIC_PARTS
+    global STATIC_POLYGONS, STATIC_SEGMENTS
+    bucket = _edit_bucket()
+    shapes = [dict(shape) for shape in BASE_SHAPES]
+    for item in bucket["static"]:
+        area = math.pi * item["r"] * item["r"]
+        shapes.append(
+            {
+                "kind": "large" if area >= LARGE_OBSTACLE_AREA else "small",
+                "parts": [(item["x"], item["y"], item["r"])],
+                "edit": "static",
+                "id": item["id"],
+            }
+        )
+    STATIC_SHAPES = shapes
+    STATIC_OUTLINES = [obstacle_outline(shape) for shape in shapes]
+    STATIC_PARTS = [part for shape in shapes for part in shape["parts"]]
+    STATIC_POLYGONS = [
+        shape["outline"] for shape in shapes if len(shape.get("outline", [])) >= 3
+    ]
+    STATIC_SEGMENTS = [
+        segment for polygon in STATIC_POLYGONS for segment in _segments(polygon)
+    ]
+    _refresh_dynamic_geometry()
+
+
+def _refresh_dynamic_geometry():
+    """只刷新动态障碍物的圆形占据；静态轮廓与线段不重算（性能关键）。"""
+    global OBSTACLE_SHAPES, OBSTACLE_OUTLINES, OBSTACLES
+    global OBSTACLE_POLYGONS, OBSTACLE_SEGMENTS
+    OBSTACLE_SHAPES = STATIC_SHAPES
+    OBSTACLE_OUTLINES = STATIC_OUTLINES
+    OBSTACLE_POLYGONS = STATIC_POLYGONS
+    OBSTACLE_SEGMENTS = STATIC_SEGMENTS
+    if DYNAMIC:
+        OBSTACLES = STATIC_PARTS + [
+            (item["x"], item["y"], item["r"]) for item in DYNAMIC
+        ]
+    else:
+        OBSTACLES = STATIC_PARTS
+
+
+def _inside_field(x, y, margin=0.35):
+    if not point_in_polygon(x, y):
+        return False
+    return boundary_distance(x, y) >= margin
+
+
+def add_static_obstacle(x, y, radius=0.35):
+    x, y = float(x), float(y)
+    if not _inside_field(x, y):
+        raise ValueError("请把障碍物放在场地内部")
+    radius = clamp(float(radius), 0.12, 1.50)
+    item = {
+        "id": _next_edit_id(),
+        "x": round(x, 2),
+        "y": round(y, 2),
+        "r": round(radius, 2),
+    }
+    _edit_bucket()["static"].append(item)
+    _rebuild_static_geometry()
+    _mark_world_dirty()
+    return item
+
+
+def add_dynamic_obstacle(x, y, radius=0.30, span=1.6, heading=0.0):
+    x, y = float(x), float(y)
+    if not _inside_field(x, y):
+        raise ValueError("请把障碍物放在场地内部")
+    radius = clamp(float(radius), 0.12, 1.00)
+    span = clamp(float(span), 0.4, 6.0)
+    heading = float(heading)
+    half = span / 2.0
+    dx, dy = math.cos(heading) * half, math.sin(heading) * half
+    ax, ay = _clamp_inside(x - dx, y - dy)
+    bx, by = _clamp_inside(x + dx, y + dy)
+    item = {
+        "id": _next_edit_id(),
+        "x": round(x, 2),
+        "y": round(y, 2),
+        "r": round(radius, 2),
+        "ax": round(ax, 2),
+        "ay": round(ay, 2),
+        "bx": round(bx, 2),
+        "by": round(by, 2),
+        "speed": DYNAMIC_SPEED,
+    }
+    _edit_bucket()["dynamic"].append(item)
+    entry = dict(item)
+    entry["t"] = 0.0
+    DYNAMIC.append(entry)
+    _refresh_dynamic_geometry()
+    _mark_world_dirty()
+    return item
+
+
+def _clamp_inside(x, y, margin=0.45):
+    """把巡逻端点收进场地内，避免动态障碍物跑到墙外。"""
+    if point_in_polygon(x, y) and boundary_distance(x, y) >= margin:
+        return x, y
+    cx, cy = WIDTH / 2.0, HEIGHT / 2.0
+    for step in range(1, 21):
+        k = step / 20.0
+        px = x + (cx - x) * k
+        py = y + (cy - y) * k
+        if point_in_polygon(px, py) and boundary_distance(px, py) >= margin:
+            return px, py
+    return cx, cy
+
+
+def add_no_go_zone(x0, y0, x1, y1=None, height=None):
+    """矩形禁区：用两个对角点（或起点 + 宽高）描述，机器人不进入、刀盘不切割。"""
+    if y1 is None:
+        raise ValueError("禁区需要两个对角点")
+    x0, y0 = float(x0), float(y0)
+    x1, y1 = float(x1), float(y1)
+    if x1 < x0:
+        x0, x1 = x1, x0
+    if y1 < y0:
+        y0, y1 = y1, y0
+    x0 = clamp(x0, 0.0, WIDTH)
+    x1 = clamp(x1, 0.0, WIDTH)
+    y0 = clamp(y0, 0.0, HEIGHT)
+    y1 = clamp(y1, 0.0, HEIGHT)
+    if x1 - x0 < 0.30 or y1 - y0 < 0.30:
+        raise ValueError("禁区矩形太小，请拖出至少 0.3 m × 0.3 m 的区域")
+    center_x = (x0 + x1) / 2.0
+    center_y = (y0 + y1) / 2.0
+    if not point_in_polygon(center_x, center_y):
+        raise ValueError("请把禁区放在场地内部")
+    item = {
+        "id": _next_edit_id(),
+        "x0": round(x0, 2),
+        "y0": round(y0, 2),
+        "x1": round(x1, 2),
+        "y1": round(y1, 2),
+        "x": round(center_x, 2),
+        "y": round(center_y, 2),
+    }
+    _edit_bucket()["no_go"].append(item)
+    NO_GO.append(dict(item))
+    _mark_world_dirty()
+    return item
+
+
+def in_no_go(x, y, margin=0.0):
+    """判断点是否落在任一禁区矩形内（margin>0 时向外扩张）。"""
+    for zone in NO_GO:
+        if zone.get("x0") is None:
+            cx = zone.get("x", 0.0)
+            cy = zone.get("y", 0.0)
+            if math.hypot(x - cx, y - cy) <= float(zone.get("r", 0.0)) + margin:
+                return True
+            continue
+        x0 = min(zone["x0"], zone["x1"]) - margin
+        x1 = max(zone["x0"], zone["x1"]) + margin
+        y0 = min(zone["y0"], zone["y1"]) - margin
+        y1 = max(zone["y0"], zone["y1"]) + margin
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            return True
+    return False
+
+
+def update_dynamic_path(item_id, ax, ay, bx, by):
+    """编辑动态障碍物的巡逻路径端点（A → B 往返）。"""
+    item_id = int(item_id)
+    bucket = _edit_bucket()
+    target = None
+    for entry in bucket["dynamic"]:
+        if int(entry["id"]) == item_id:
+            target = entry
+            break
+    if target is None:
+        raise ValueError("没有找到该动态障碍物")
+    ax, ay = _clamp_inside(float(ax), float(ay))
+    bx, by = _clamp_inside(float(bx), float(by))
+    if math.hypot(bx - ax, by - ay) < 0.40:
+        raise ValueError("动态障碍物路径太短，至少 0.4 m")
+    target["ax"] = round(ax, 2)
+    target["ay"] = round(ay, 2)
+    target["bx"] = round(bx, 2)
+    target["by"] = round(by, 2)
+    for entry in DYNAMIC:
+        if int(entry["id"]) == item_id:
+            entry["ax"] = target["ax"]
+            entry["ay"] = target["ay"]
+            entry["bx"] = target["bx"]
+            entry["by"] = target["by"]
+            entry["x"] = target["ax"]
+            entry["y"] = target["ay"]
+            entry["t"] = 0.0
+            break
+    _refresh_dynamic_geometry()
+    _mark_world_dirty()
+    return dict(target)
+
+
+def remove_edit(kind, item_id):
+    if kind not in EDIT_KINDS:
+        raise ValueError("未知的编辑类型")
+    item_id = int(item_id)
+    bucket = _edit_bucket()
+    keep = [item for item in bucket[kind] if int(item["id"]) != item_id]
+    if len(keep) == len(bucket[kind]):
+        raise ValueError("没有找到要删除的对象")
+    bucket[kind] = keep
+    if kind == "static":
+        _rebuild_static_geometry()
+    elif kind == "dynamic":
+        DYNAMIC[:] = [item for item in DYNAMIC if int(item["id"]) != item_id]
+        _refresh_dynamic_geometry()
+    else:
+        NO_GO[:] = [item for item in NO_GO if int(item["id"]) != item_id]
+    _mark_world_dirty()
+    return item_id
+
+
+def clear_edits(kind=None):
+    kinds = EDIT_KINDS if kind is None else (kind,)
+    if kind is not None and kind not in EDIT_KINDS:
+        raise ValueError("未知的编辑类型")
+    bucket = _edit_bucket()
+    for entry in kinds:
+        bucket[entry] = []
+    if "static" in kinds or "dynamic" in kinds:
+        DYNAMIC[:] = []
+        _rebuild_static_geometry()
+    if "no_go" in kinds:
+        NO_GO[:] = []
+    _mark_world_dirty()
+
+
+def update_dynamic(dt):
+    """推进动态障碍物（两点往返巡逻）。"""
+    moved = False
+    for item in DYNAMIC:
+        length = math.hypot(item["bx"] - item["ax"], item["by"] - item["ay"])
+        if length < 0.05:
+            continue
+        item["t"] = (item.get("t", 0.0) + item["speed"] * dt / length) % 2.0
+        phase = item["t"]
+        ratio = phase if phase <= 1.0 else 2.0 - phase
+        item["x"] = item["ax"] + (item["bx"] - item["ax"]) * ratio
+        item["y"] = item["ay"] + (item["by"] - item["ay"]) * ratio
+        moved = True
+    if moved:
+        _refresh_dynamic_geometry()
+
+
+def edit_dict():
+    bucket = _edit_bucket()
+    return {
+        "static": [dict(item) for item in bucket["static"]],
+        "dynamic": [dict(item) for item in bucket["dynamic"]],
+        "no_go": [dict(item) for item in bucket["no_go"]],
     }
 
 
@@ -429,6 +727,34 @@ def obstacle_outline(shape, steps=48):
 
 
 def world_dict():
+    cache = _WORLD_CACHE
+    if cache.get("version") != WORLD_VERSION:
+        cache = _build_world_static()
+        cache["version"] = WORLD_VERSION
+        _WORLD_CACHE.clear()
+        _WORLD_CACHE.update(cache)
+    result = dict(cache)
+    result.pop("version", None)
+    result["obstacles"] = OBSTACLES
+    result["dynamic"] = [
+        {
+            "id": item["id"],
+            "x": round(item.get("x", 0.0), 2),
+            "y": round(item.get("y", 0.0), 2),
+            "r": item["r"],
+            "ax": item["ax"],
+            "ay": item["ay"],
+            "bx": item["bx"],
+            "by": item["by"],
+        }
+        for item in DYNAMIC
+    ]
+    result["no_go"] = [dict(item) for item in NO_GO]
+    result["edits"] = edit_dict()
+    return result
+
+
+def _build_world_static():
     shapes = [
         dict(shape, outline=OBSTACLE_OUTLINES[index])
         for index, shape in enumerate(OBSTACLE_SHAPES)

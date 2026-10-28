@@ -45,7 +45,7 @@ MOWING_PARAMS = {
     "mow_speed": 0.48,
     "edge_speed": 0.50,
     "inner_corner_advance": 0.16,
-    "large_obstacle_extent": 0.85,
+    "large_obstacle_area": 5.0,
     "small_obstacle_radius": 0.45,
     "max_zone_plan_passes": 30,
     "min_zone_area": 20.0,

@@ -1,0 +1,38 @@
+
+Bag_package_storage_path: /userdata/fibot/bag
+Default_number_of_rolls: 16
+Default_Roll_Size: 100
+Default_Roll_Time: 10
+Topic_Group: Topic_Group_215
+Topic_Group_215:
+  - rtk_agrica
+  - odom_data
+  - imu_data
+  - base_pose
+  - local_fuse_pose_3d
+  - tf_dynamic
+  - nograsscloud 
+  - obstaclecloud
+  - grid_costmap 
+  - static_costmap
+  - follow_task_path
+  - nav_task_path
+  - plan
+  - trajectory_path_test
+  - whole_map
+  - area_map
+  - cmd_vel
+  - perception_debug_image
+Topic_Group_835:
+  - grass_seg_image
+  - grass_cls_image
+  - docking_rgb
+  - grass_seg_obstacle_cloud2
+  - grid_costmap
+  - grid_update
+  - cmd_vel
+  - tf_dynamic
+  - global_plan
+  - global_pose
+  - odom_data
+  - imu_data

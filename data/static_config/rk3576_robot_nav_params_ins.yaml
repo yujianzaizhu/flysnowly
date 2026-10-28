@@ -1,0 +1,138 @@
+# tf name settings
+global_world_frame: world
+global_robot_frame: base_footprint
+world_frame: world
+robot_frame: base_link1
+wio_local_frame: world
+wio_link_frame: wio_link_local
+dock_frame: world_dock
+camera_frame: camera_link
+robot_outline_r_f_frame: robot_right_front_link
+robot_outline_l_f_frame: robot_left_front_link
+robot_outline_l_b_frame: robot_left_back_link
+robot_outline_r_b_frame: robot_right_back_link
+
+# Robot dimensions
+robot_long: 0.42
+robot_wide: 0.13
+robot_rear: 0.10
+
+# Additional offsets for edge following
+eg_long_add_dis: 0.02
+eg_wide_add_dis: 0.01
+eg_cov_long_add_dis: 0.02
+eg_cov_wide_add_dis: 0.01
+eg_bow_long_add_dis: 0.05
+eg_bow_wide_add_dis: 0.03
+eg_random_long_add_dis: 0.05
+eg_random_wide_add_dis: 0.03
+
+# Straight line trigger
+straight_coll_dis: 0.22
+
+# Bow-shaped line related parameters
+obstacle_distance: 0.2
+no_obstacle_distance: 0.2
+used_coverage_change_angle: 0
+used_gravity_angle: 0
+coverage_min_gravity_angle: 0.14
+coverage_gravity_decay: 0.01
+coverage_change_gravity_angle: 20.0
+state_change_gravity_angle: 0
+used_side_dock_recharge: 0
+
+# Docking and recharging related parameters
+dock_max_observe_distance: 1.3
+dock_min_observe_distance: 0.9
+start_dock_recharge_distance: 1.4
+
+# Cross Area parameters
+cross_max_observe_distance: 1.1
+cross_min_observe_distance: 0.8
+cross_mark_size: 0.15
+
+# Bow-shaped line angle related parameters
+used_fake_bow_start_angle: 0
+used_random_fake_bow_start_angle: 0
+fake_bow_start_angle: 0.0
+fake_bow_add_angle: 0.0
+demonstration_count: 2
+bow_random_angle: -45.0
+dock_retry_count: 3
+
+# Costmap observation rate
+state_leavedock_observation_rate: 0.1
+state_random_observation_rate: 0.8
+state_bow_observation_rate: 0.8
+state_vis_egway_observation_rate: 0.50
+state_vis_cov_observation_rate: 0.50
+state_docking_observation_rate: 0.1
+
+# Linear speed related
+state_leavedock_back_vel: 0.20
+
+state_random_straight_vel: 0.40
+state_random_back_vel: 0.30
+state_random_egway_max_linear_speed : 0.25
+state_random_egway_min_linear_speed : 0.25
+state_random_egway_max_angular_speed : 1.00
+state_random_egway_min_angular_speed : 0.50
+
+state_bow_straight_vel: 0.40
+state_bow_back_vel: 0.30
+state_bow_egway_max_linear_speed : 0.25
+state_bow_egway_min_linear_speed : 0.25
+state_bow_egway_max_angular_speed : 1.00
+state_bow_egway_min_angular_speed : 0.50
+
+state_vis_egway_straight_vel: 0.25
+state_vis_egway_back_vel: 0.30
+state_vis_egway_max_linear_speed : 0.25
+state_vis_egway_min_linear_speed : 0.25
+state_vis_egway_max_angular_speed : 1.20
+state_vis_egway_min_angular_speed : 0.75
+state_vis_egway_rotating_max_angular_speed : 0.40
+state_vis_egway_rotating_min_angular_speed : 0.20
+
+state_vis_cov_egway_straight_vel: 0.25
+state_vis_cov_egway_back_vel: 0.30
+state_vis_cov_egway_max_linear_speed : 0.15
+state_vis_cov_egway_min_linear_speed : 0.15
+state_vis_cov_egway_max_angular_speed : 1.00
+state_vis_cov_egway_min_angular_speed : 0.75
+state_vis_cov_egway_rotating_max_angular_speed : 0.40
+state_vis_cov_egway_rotating_min_angular_speed : 0.20
+
+egway_sim_steps: 75
+coverage_sim_steps: 10
+motor_max_rpm: 50
+linear_rpm: 100
+angular_rpm: 20
+
+# Edge-following island parameters
+island_traj_length_record: 30.0
+island_angle_traj_length_record: 0.5
+visual_boundary_traj_record: 999.0
+
+# Mixed mode parameters
+used_motor_current_status: 1
+dense_grass_th: 70
+sparse_grass_th: 40
+grass_trigger_detect_period: 60000
+
+# Recovery behavior parameters 
+max_times_escape: 60
+
+# Pure controller parameters
+dock_pure_Lfc: 0.05
+dock_pure_straight: 0.4
+follow_pure_Lfc: 0.05
+follow_pure_straight: 0.4
+
+# Random related parameters
+random_egway_long_distance: 1.0
+random_egway_short_distance: 0.3
+prohibided_angles_to_rotate:
+  - 170
+  - 180
+

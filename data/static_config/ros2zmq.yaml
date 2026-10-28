@@ -1,0 +1,12 @@
+all_switch: true
+imu_data: false
+odom_data: false
+depth_info: false
+depth_image: false
+leftir_info: false
+leftir_image: false
+rightir_info: false
+rightir_image: false
+rgb_info: false
+rgb_image: false
+clock: false

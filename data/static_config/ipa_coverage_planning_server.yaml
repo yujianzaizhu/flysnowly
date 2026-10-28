@@ -1,0 +1,16 @@
+env_pack: /app/fibot/maps
+# 机器人半径 ，它表示机器人的物理尺寸
+robot_radius: 0.30
+# 覆盖半径默认40cm，范围-20至+20
+coverage_radius: -25
+read_yaml_file_pack_path: /userdata/fibot/config/map
+# 沿边路径缩小半径
+shrink_distance: 0.10
+# ride mowing edge param
+ride_mowing_edge_distance: -0.05
+# 设定地图旋转角度参数
+rotation_theta: 0.0
+target_frame: world
+source_frame: base_link1
+save_yaml_file_pack_path: /userdata/fibot/config/map/path
+yaml_file_pack_path: /userdata/fibot/config/map

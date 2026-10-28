@@ -17,6 +17,26 @@ import server  # noqa: E402
 import world  # noqa: E402
 
 
+def _find_real_map_dir():
+    """真实地图目录：优先仓库 data/map，其次旧的 home 路径。"""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates = (
+        os.path.normpath(os.path.join(here, os.pardir, "data", "map", "map_1")),
+        os.path.normpath(os.path.join(here, os.pardir, "data", "map")),
+        "/home/fibocom/heyufei/data/map/map",
+    )
+    for path in candidates:
+        if os.path.isdir(path) and (
+            os.path.isfile(os.path.join(path, "default.pgm"))
+            or os.path.isfile(os.path.join(path, "grid_map.pgm"))
+        ):
+            return path
+    return None
+
+
+REAL_MAP_DIR = _find_real_map_dir()
+
+
 class ServerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -75,6 +95,70 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(state["mowing_mode"], "A")
         for key in ("overall_coverage", "distance", "duration"):
             self.assertIn(key, state["task"])
+
+    def test_nav_snapshot_endpoint(self):
+        status, body = self.get("/api/nav")
+        self.assertEqual(status, 200)
+        nav = json.loads(body)
+        names = {node["name"] for node in nav["nodes"]}
+        self.assertEqual(names, {"planner", "dock", "region_manager", "trajectory_map"})
+        ports = {service["name"]: service["port"] for service in nav["services"]}
+        self.assertEqual(ports["nav_task_action"], 25009)
+        self.assertEqual(ports["autodock_action"], 25001)
+        self.assertEqual(ports["map_load"], 20020)
+        self.assertEqual(ports["record_path"], 20015)
+        self.assertEqual(ports["get_grid_map"], 20017)
+        self.assertIn("static_config", nav)
+        topics = {topic["name"] for topic in nav["topics"]}
+        self.assertIn("cmd_vel", topics)
+        self.assertIn("nav_status", topics)
+
+    def test_nav_mode_toggle_endpoint(self):
+        _, state = self.post("/api/nav/mode", {"enabled": False})
+        self.assertFalse(state["nav"]["enabled"])
+        _, state = self.post("/api/nav/mode", {"enabled": True})
+        self.assertTrue(state["nav"]["enabled"])
+
+    def test_nav_action_endpoint_drives_sim(self):
+        self.post("/api/map", {"map": 3})
+        with self.httpd.simulator.lock:
+            manager = self.httpd.manager
+            manager.grid.build_free_area(
+                (manager.robot.pose[0], manager.robot.pose[1])
+            )
+            zones = manager.grid.partition_zones()
+        order = [zones[0]["id"]]
+        _, state = self.post(
+            "/api/nav/action",
+            {
+                "node": "planner",
+                "action": "nav_task_action",
+                "cmd": 1,
+                "goal": {"mode": 30, "path_name": ",".join(str(z) for z in order)},
+            },
+        )
+        self.assertEqual(state["task"]["type"], "mow")
+        self.assertEqual(state["task"]["zone_order"], order)
+        planner = [n for n in state["nav"]["nodes"] if n["name"] == "planner"][0]
+        self.assertEqual(planner["actions"][0]["state"], "running")
+        nav_topics = {topic["name"] for topic in state["nav"]["topics"]}
+        self.assertIn("nav_task_path", nav_topics)
+
+    def test_nav_action_autodock_triggers_charge(self):
+        _, state = self.post(
+            "/api/nav/action",
+            {
+                "node": "dock",
+                "action": "autodock_action",
+                "cmd": 1,
+                "goal": {"docking_waypoint": "dock"},
+            },
+        )
+        self.assertIn(state["task"]["phase"], ("charge_go", "to_dock"))
+        self.assertEqual(state["task"]["charge_reason"], "manual")
+        nav_topics = {topic["name"] for topic in state["nav"]["topics"]}
+        self.assertIn("recharge_start_pose", nav_topics)
+        self.assertIn("global_plan", nav_topics)
 
     def test_start_mapping(self):
         _, state = self.post("/api/task", {"task": "map"})
@@ -135,6 +219,115 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(state["task"]["charge_reason"], "manual")
         self.assertIn(state["task"]["phase"], ("charge_go", "charging", "charge_return"))
 
+    def test_map_edit_endpoint(self):
+        status, state = self.post(
+            "/api/map/edit", {"action": "add_static", "x": 5.0, "y": 4.0, "r": 0.4}
+        )
+        self.assertEqual(status, 200)
+        edits = state["world"]["edits"]
+        self.assertEqual(len(edits["static"]), 1)
+        shape = state["world"]["obstacle_shapes"][-1]
+        self.assertEqual(shape.get("edit"), "static")
+
+        status, state = self.post(
+            "/api/map/edit", {"action": "add_dynamic", "x": 4.0, "y": 4.0, "r": 0.3, "span": 1.8}
+        )
+        self.assertEqual(len(state["world"]["edits"]["dynamic"]), 1)
+        self.assertEqual(len(state["world"]["dynamic"]), 1)
+
+        status, state = self.post(
+            "/api/map/edit",
+            {"action": "add_no_go", "x0": 3.0, "y0": 2.5, "x1": 5.0, "y1": 4.0},
+        )
+        self.assertEqual(len(state["world"]["edits"]["no_go"]), 1)
+        zone = state["world"]["edits"]["no_go"][0]
+        self.assertEqual(zone["x1"], 5.0)
+        grid = self.httpd.simulator.manager.grid
+        col, row = grid.cell_of(4.0, 3.2)
+        self.assertTrue(grid.cell_blocked_mow(col, row))
+        outside_col, outside_row = grid.cell_of(6.5, 3.2)
+        self.assertFalse(grid.cell_blocked_mow(outside_col, outside_row))
+
+        static_id = state["world"]["edits"]["static"][0]["id"]
+        status, state = self.post(
+            "/api/map/edit", {"action": "delete", "kind": "static", "id": static_id}
+        )
+        self.assertEqual(state["world"]["edits"]["static"], [])
+
+        status, state = self.post("/api/map/edit", {"action": "clear"})
+        for kind in ("static", "dynamic", "no_go"):
+            self.assertEqual(state["world"]["edits"][kind], [])
+        self.assertEqual(state["world"]["dynamic"], [])
+
+    def test_map_edit_requires_zones_and_idle_task(self):
+        # 未建图时不允许编辑
+        with self.httpd.simulator.lock:
+            manager = self.httpd.simulator.manager
+            manager.grid.zones = []
+        request = urllib.request.Request(
+            self.base + "/api/map/edit",
+            data=json.dumps(
+                {"action": "add_static", "x": 5.0, "y": 4.0, "r": 0.4}
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(request, timeout=5)
+        self.assertEqual(ctx.exception.code, 400)
+
+        # 建图完成后可以编辑
+        with self.httpd.simulator.lock:
+            manager.grid.build_free_area((manager.robot.pose[0], manager.robot.pose[1]))
+            manager.grid.partition_zones()
+        status, state = self.post(
+            "/api/map/edit", {"action": "add_static", "x": 5.0, "y": 4.0, "r": 0.4}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(state["world"]["edits"]["static"]), 1)
+
+        # 任务进行中不允许编辑
+        with self.httpd.simulator.lock:
+            manager = self.httpd.simulator.manager
+            manager.task = {"type": "mow", "zones": [1], "mode": "A"}
+            manager.phase = "zone_stripes"
+        request = urllib.request.Request(
+            self.base + "/api/map/edit",
+            data=json.dumps(
+                {"action": "add_no_go", "x0": 3.0, "y0": 2.5, "x1": 5.0, "y1": 4.0}
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(request, timeout=5)
+        self.assertEqual(ctx.exception.code, 400)
+        with self.httpd.simulator.lock:
+            manager.task = None
+            manager.phase = "idle"
+
+    def test_dynamic_path_can_be_edited(self):
+        status, state = self.post(
+            "/api/map/edit", {"action": "add_dynamic", "x": 4.0, "y": 4.0, "r": 0.3, "span": 1.5}
+        )
+        item = state["world"]["edits"]["dynamic"][0]
+        status, state = self.post(
+            "/api/map/edit",
+            {
+                "action": "update_dynamic",
+                "id": item["id"],
+                "ax": 3.0,
+                "ay": 3.0,
+                "bx": 6.0,
+                "by": 3.0,
+            },
+        )
+        self.assertEqual(status, 200)
+        updated = state["world"]["edits"]["dynamic"][0]
+        self.assertEqual(updated["ax"], 3.0)
+        self.assertEqual(updated["bx"], 6.0)
+        self.post("/api/map/edit", {"action": "clear"})
+
     def test_map_switch(self):
         _, state = self.post("/api/map", {"map": 3})
         self.assertEqual(state["map_id"], 3)
@@ -145,13 +338,11 @@ class ServerTest(unittest.TestCase):
             state["map"]["cols"] * state["map"]["rows"],
         )
 
-    @unittest.skipUnless(
-        os.path.isdir("/home/fibocom/heyufei/data/map/map"), "真实地图目录不存在"
-    )
+    @unittest.skipUnless(REAL_MAP_DIR, "真实地图目录不存在")
     def test_import_real_map_endpoint(self):
         _, state = self.post(
             "/api/map/import",
-            {"path": "/home/fibocom/heyufei/data/map/map"},
+            {"path": REAL_MAP_DIR},
         )
         self.assertTrue(state["world"]["imported"])
         self.assertGreater(state["world"]["import_meta"]["free_area_m2"], 10.0)

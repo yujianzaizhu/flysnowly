@@ -1,0 +1,4 @@
+collection_time: 5
+no_load_current_threshold: 600
+dense_grass_current_threshold: 900
+lateral_movement_current_threshold: 200

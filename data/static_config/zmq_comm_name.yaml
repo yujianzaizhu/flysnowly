@@ -1,0 +1,799 @@
+# topic 10xxx
+topic:
+  topic_tf_static:
+    - tf_static
+    - 10001
+  topic_tf_dynamic:
+    - tf_dynamic
+    - 10001
+  topic_sensor_imu_data:
+    - imu_data
+    - 10001
+  topic_sensor_imu_state:
+    - imu_state
+    - 10001
+  topic_sensor_odom_data:
+    - odom_data
+    - 10001
+  topic_sensor_odom_charge_state:
+    - odom_charge_state
+    - 10001
+  topic_sensor_odom_wheel_state:
+    - odom_wheel_state
+    - 10001
+  topic_sensor_odom_collision:
+    - odom_collision
+    - 10001
+  topic_sensor_odom_health:
+    - odom_health
+    - 10001
+  topic_sensor_odom_chassis_info:
+    - odom_chassis_info
+    - 10001
+  topic_sensor_odom_hardware_signal:
+    - odom_hardware_signal
+    - 10001
+  topic_sensor_odom_motor_current_status:
+    - odom_motor_current_status
+    - 10001
+  topic_odom_pass_through_up:
+    - odom_pass_through_up
+    - 10001
+  topic_odom_pass_through_down:
+    - odom_pass_through_down
+    - 10001
+
+  topic_sensor_rtk_agrica:
+    - rtk_agrica
+    - 10001
+  topic_sensor_rtk_status:
+    - rtk_status
+    - 10001
+  topic_sensor_rtk_gngga:
+    - rtk_gngga
+    - 10001
+  topic_sensor_rtk_pvtsln:
+    - rtk_pvtsln
+    - 10001
+  topic_sensor_rtk_snr:
+    - rtk_snr
+    - 10001
+  topic_sensor_rtk_sysrts:
+    - rtk_sysrts
+    - 10001
+  topic_sensor_rtk_gngst:
+    - rtk_gngst
+    - 10001
+  topic_sensor_rtk_gngsa:
+    - rtk_gngsa
+    - 10001
+  topic_sensor_rtk_gnrmc:
+    - rtk_gnrmc
+    - 10001
+  topic_sensor_rtk_gnepe:
+    - rtk_gnepe
+    - 10001
+  topic_sensor_serial_forward_base_state:
+    - base_state
+    - 10001
+  topic_sensor_serial_forward_base_pack_loss:
+    - base_pack_loss
+    - 10001
+  topic_sensor_serial_forward_base_rtk_config:
+    - base_rtk_config
+    - 10001
+  topic_sensor_serial_forward_base_mcu_reset:
+    - base_mcu_reset
+    - 10001
+  topic_autotest_heartbeat:
+    - autotest_heartbeat
+    - 10003
+  topic_service_autotest_heartbeat:
+    - autotest_service_heartbeat
+    - 10003
+  topic_autotest_device_info:
+    - autotest_device_info
+    - 10003
+  topic_autotest_test_progress_to_platform:
+    - autotest_test_progress
+    - 10003
+  topic_autotest_progress:
+    - autotest_progress
+    - 10001
+  topic_ota_heartbest:
+    - ota_heartbest
+    - 10001
+  topic_ota_download_progress:
+    - ota_download_progress
+    - 10001
+  topic_ota_all_progress:
+    - ota_all_progress
+    - 10001
+  topic_wifi_status:
+    - wifi_status
+    - 10001
+  topic_sensor_serial_forward_reset_loss_cal:
+    - reset_loss_cal
+    - 10001
+  topic_sensor_camera_info:
+    - camera_info
+    - 10001
+  topic_localization_pose:
+    - combined
+    - 10001
+  topic_localization_fusionvel:
+    - fusion_vel
+    - 10001
+  topic_localization_vins_estimator_vo:
+    - vins_estimator_vo
+    - 10001
+  topic_localization_gps:
+    - gps
+    - 10001
+  topic_localization_gps_status:
+    - gps_status
+    - 10001
+  topic_localization_slip_status:
+    - slip_status
+    - 10001
+  topic_perception_seg_runmode:
+    - run_mode
+    - 10001
+  topic_perception_vector_marker:
+    - vector_marker
+    - 10001
+  topic_perception_dock_pose_frame:
+    - dock_pose_frame
+    - 10001
+  topic_perception_charge_pose_frame:
+    - charge_pose_frame
+    - 10001
+  topic_perception_grass_seg_obstacle_cloud2:
+    - grass_seg_obstacle_cloud2
+    - 10001
+  topic_perception_detect_obsured:
+    - detect_obsured
+    - 10001
+  topic_perception_flagging_data:
+    - flagging_data
+    - 10001
+  topic_perception_outside_grass:
+    - outside_grass
+    - 10001
+  topic_perception_outside_grass_area:
+    - outside_grass_area
+    - 10001
+  topic_perception_detect_obstacle_cloud2:
+    - detect_obstacle_cloud2
+    - 10001
+  topic_perception_magnetic_obstacle_cloud2:
+    - magnetic_obstacle_cloud2
+    - 10001
+  topic_nav_fiducial_vertices:
+    - fiducial_vertices
+    - 10001
+  topic_nav_fiducial_transforms:
+    - fiducial_transforms
+    - 10001
+  topic_nav_voxel_occ_map:
+    - voxel_occ_map
+    - 10001
+  topic_nav_map_vis:
+    - map_vis
+    - 10001
+  topic_nav_safety_map:
+    - safety_map
+    - 10001
+  topic_nav_local_goal:
+    - local_goal
+    - 10001
+  topic_nav_robot_footprint:
+    - robot_footprint
+    - 10001
+  topic_nav_obstacle_label:
+    - obstacle_label
+    - 10001
+  topic_nav_rolling_window:
+    - rolling_window
+    - 10001
+  topic_nav_dwa_path:
+    - dwa_path
+    - 10001
+  topic_nav_status:
+    - nav_status
+    - 10001
+  topic_nav_task_action_result:
+    - nav_task_action_result
+    - 10001
+  topic_nav_fake_bow_coverage_action_result:
+    - fake_bow_coverage_action_result
+    - 10001
+  topic_nav_leave_dock_action_result:
+    - leave_dock_action_result
+    - 10001
+  topic_nav_random_coverage_action_result:
+    - random_coverage_action_result
+    - 10001
+  topic_nav_random_bow_coverage_action_result:
+    - random_bow_coverage_action_result
+    - 10001
+  topic_nav_crossing_action_result:
+    - crossing_action_result
+    - 10001
+  topic_nav_autodock_action_result:
+    - autodock_action_result
+    - 10001
+  topic_nav_egway_coverage_action_result:
+    - egway_coverage_action_result
+    - 10001
+  topic_nav_visual_egway_action_result:
+    - visual_egway_action_result
+    - 10001
+  topic_nav_to_charge_point_action_result:
+    - to_charge_point_action_result
+    - 10001
+  topic_nav_navigation_action_result:
+    - navigation_action_result
+    - 10001
+  topic_nav_random_area_bow_coverage_action_result:
+    - random_area_bow_coverage_action_result
+    - 10001    
+  topic_costmap_2d_voxel_grid:
+    - voxel_grid
+    - 10001
+  topic_costmap_2d_clearing_endpoints:
+    - clearing_endpoints
+    - 10001
+  topic_costmap_2d_costmap:
+    - grid_costmap
+    - 10001
+  topic_costmap_2d_costmap_updates:
+    - grid_update
+    - 10001
+  topic_static_costmap_2d_costmap:
+    - static_costmap
+    - 10001
+  topic_static_costmap_2d_costmap_updates:
+    - static_costmap_update
+    - 10001
+  topic_costmap_2d_footprint:
+    - footprint
+    - 10001
+  topic_robot_message_cmd_vel:
+    - cmd_vel
+    - 10001
+  topic_robot_message_global_plan:
+    - global_plan
+    - 10001
+  topic_robot_message_egway_poses:
+    - egway_poses
+    - 10001
+  topic_robot_message_global_pose:
+    - global_pose
+    - 10001
+  topic_robot_message_recharge_start_pose:
+    - recharge_start_pose
+    - 10001
+  topic_robot_config:
+    - robot_config
+    - 10001
+  topic_robot_ctrl:
+    - robot_ctrl
+    - 10001
+  topic_robot_status:
+    - robot_status
+    - 10001
+  topic_error_codes_sub:
+    - error_codes_sub
+    - 10001
+  topic_error_codes_pub:
+    - error_codes_pub
+    - 10001
+  topic_bridge_status:
+    - bridge_status
+    - 10001
+  topic_behavior_tree_status:
+    - behavior_tree_status
+    - 10001
+  topic_manager_info:
+    - manager_info
+    - 10001
+  topic_tree_control:
+    - tree_control
+    - 10001
+  topic_manager_mower_control:
+    - manager_mower_control
+    - 10001
+  topic_manager_set_screen:
+    - manager_set_screen
+    - 10001
+  topic_manager_screw_mower:
+    - manager_screw_mower
+    - 10001
+  topic_manager_rtk_led_status:
+    - manager_rtk_led_status
+    - 10001
+  topic_manager_algorithm_switch:
+    - manager_algorithm_switch
+    - 10001
+  topic_health_manage_info:
+    - health_manage_info
+    - 10001
+  topic_process_error_code:
+    - process_error_code
+    - 10001
+  topic_process_heart_beat:
+    - process_heart_beat
+    - 10001
+  topic_process_exception_code:
+    - process_exception_code
+    - 10001
+# 双目 topic
+  topic_localization_fuse_pose_3d:
+    - fuse_pose_3d
+    - 10001
+  topic_localization_rtk_points:
+    - rtk_points
+    - 10001
+  topic_localization_rtk_wio_path:
+    - rtk_wio_path
+    - 10001
+  topic_localization_rtk_wio_pos:
+    - rtk_wio_pos
+    - 10001
+  topic_localization_rtk_vio_path:
+    - rtk_vio_path
+    - 10001
+  topic_localization_rtk_vio_pos:
+    - rtk_vio_pos
+    - 10001
+  topic_localization_local_ba_path:
+    - local_ba_path
+    - 10001
+  topic_localization_local_ba_pos:
+    - local_ba_pos
+    - 10001
+  topic_localization_pub_vio_pos:
+    - pub_vio_pos
+    - 10001
+  topic_localization_car_model:
+    - car_model
+    - 10001
+  topic_localization_base_tag_pose:
+    - base_tag_pose
+    - 10001
+  topic_localization_tag_marker:
+    - tag_marker
+    - 10001
+  topic_localization_loc_ekf_pos:
+    - loc_ekf_pos
+    - 10001
+  topic_localization_world_t_odom:
+    - world_t_odom
+    - 10001
+  topic_localization_loc_wio_pose:
+    - loc_wio_pose
+    - 10001
+  topic_localization_loc_wio_pose_ght:
+    - loc_wio_pose_ght
+    - 10001
+  topic_localization_loc_viio_pose:
+    - loc_viio_pose
+    - 10001
+  topic_localization_camera_pose_visual:
+    - camera_pose_visual
+    - 10001
+  topic_localization_odometry_rect:
+    - odometry_rect
+    - 10001
+  topic_localization_path_rect:
+    - path_rect
+    - 10001
+  topic_localization_pose_graph:
+    - pose_graph
+    - 10001
+  topic_localization_pose_graph_path:
+    - pose_graph_path
+    - 10001
+  topic_localization_base_path:
+    - base_path
+    - 10001
+  topic_localization_imu_propagate:
+    - imu_propagate
+    - 10001
+  topic_localization_path:
+    - path
+    - 10001
+  topic_localization_odometry:
+    - odometry
+    - 10001
+  topic_localization_key_poses:
+    - key_poses
+    - 10001
+  topic_localization_camera_pose:
+    - camera_pose
+    - 10001
+  topic_localization_camera_pose2:
+    - camera_pose2
+    - 10001
+  topic_localization_keyframe_pose:
+    - keyframe_pose
+    - 10001
+  topic_localization_keyframe_point:
+    - keyframe_point
+    - 10001
+  topic_localization_extrinsic:
+    - extrinsic
+    - 10001
+  topic_localization_base_pose:
+    - base_pose
+    - 10001
+  topic_localization_mono_point_cloud:
+    - mono_point_cloud
+    - 10001
+  # topic_localization_mono_img_track:
+  #   - mono_img_track
+  #   - 10001
+  topic_nav_local_plan:
+    - local_plan
+    - 10001
+  topic_nav_coverage_path:
+    - coverage_path
+    - 10001
+  topic_nav_room_exploration_result:
+    - exploration_result
+    - 10001
+  topic_nav_nav_status:
+    - nav_status
+    - 10001
+  topic_nav_path_to_pose:
+    - path_to_pose
+    - 10001
+  topic_nav_nav_task_path:
+    - nav_task_path
+    - 10001
+  topic_nav_follow_task_path:
+    - follow_task_path
+    - 10001
+  topic_nav_task_plan_path:
+    - task_plan_path
+    - 10001
+  topic_nav_current_path_index:
+    - current_path_index
+    - 10001
+  topic_nav_goal:
+    - goal
+    - 10001
+  topic_nav_plan:
+    - plan
+    - 10001
+  topic_nav_potential:
+    - potential
+    - 10001
+  topic_nav_map_info:
+    - map_info
+    - 10001
+  topic_nav_area_map:
+    - area_map
+    - 10001
+  topic_nav_area_edge_map:
+    - area_edge_map
+    - 10001
+  topic_nav_whole_map:
+    - whole_map
+    - 10001
+  topic_nav_map_change:
+    - map_change
+    - 10001
+  topic_nav_trajectory_map_change:
+    - trajectory_map_change
+    - 10001
+  topic_nav_charge_pose:
+    - charge_pose
+    - 10001
+  topic_nav_path_connected_flag:
+    - path_connected_flag
+    - 10001
+  topic_nav_perception_mode_cmd:
+    - perception_mode_cmd
+    - 10001
+  topic_nav_robot_pose_test:
+    - robot_pose_test
+    - 10001
+  topic_nav_is_edgeway:
+    - is_edgeway
+    - 10001
+  topic_nav_get_area_info:
+    - get_area_info
+    - 10001
+  topic_nav_area_channge_info:
+    - area_channge_info
+    - 10001
+  topic_nav_trajectory_pose_test:
+    - trajectory_pose_test
+    - 10001
+  topic_nav_trajectory_path_test:
+    - trajectory_path_test
+    - 10001
+  topic_nav_mapping_path_info:
+    - mapping_path_info
+    - 10001
+  topic_nav_egway_poses:
+    - egway_poses
+    - 10001
+  topic_localization_point_cloud:
+    - point_cloud
+    - 10001
+  topic_localization_margin_cloud:
+    - margin_cloud
+    - 10001
+  topic_nav_cost_cloud:
+    - cost_cloud
+    - 10001
+  topic_nav_trajectory_cloud:
+    - trajectory_cloud
+    - 10001
+  topic_nav_virtual_obstacle_cloud:
+    - virtual_obstacle
+    - 10001
+  topic_perception_origin_cloud:
+    - origincloud
+    - 10001
+  topic_perception_obstacle_cloud:
+    - obstaclecloud
+    - 10001
+  topic_perception_cliff_cloud:
+    - cliffcloud
+    - 10001
+  topic_perception_ground_cloud:
+    - groundcloud
+    - 10001
+  topic_perception_noground_cloud:
+    - nogroundcloud
+    - 10001
+  topic_perception_nograss_cloud:
+    - nograsscloud
+    - 10001
+  topic_perception_labeled_cloud:
+    - labeledcloud
+    - 10001
+  topic_rgb_camera_info:
+    - rgb_camera_info
+    - 10001
+  topic_depth_camera_info:
+    - depth_camera_info
+    - 10001
+  topic_leftir_camera_info:
+    - camera_info
+    - 10001
+  topic_rightir_camera_info:
+    - rightir_camera_info
+    - 10001
+  topic_camera_imu_data:
+    - camera_imu_data
+    - 10001
+# service 20xxx
+service:
+  service_test:
+    - test_service
+    - 20001
+  service_odom_cmd:
+    - odom_cmd_service
+    - 20002
+  service_nav_enable_detections:
+    - enable_detections_service
+    - 20003
+  service_mcu_update:
+    - mcu_updata_service
+    - 20004
+  service_wifi:
+    - wifi_service
+    - 20005
+  service_send_task:
+    - send_task_service
+    - 20006
+  service_ota_protocol:
+    - ota_protocol_service
+    - 20007
+  service_bridge:
+    - bridge_service
+    - 20008
+  service_send_business:
+    - send_business_service
+    - 20009
+  service_play_voice:
+    - play_voice_service
+    - 20010
+# 双目 service
+  service_nav_coverage_check:
+    - coverage_check
+    - 20011
+  service_nav_room_exploration:
+    - room_exploration
+    - 20012
+  service_nav_ipaCoverPath:
+    - ipaCoverPath
+    - 20013
+  service_nav_ipaBoundPath:
+    - ipaBoundPath
+    - 20014
+  service_nav_record_path:
+    - record_path
+    - 20015
+  service_nav_follow_plan:
+    - follow_plan
+    - 20016
+  service_nav_get_grid_map:
+    - get_grid_map
+    - 20017
+  service_nav_get_map_info:
+    - get_map_info
+    - 20018
+  service_nav_get_sub_map_info:
+    - get_sub_map_info
+    - 20019
+  service_nav_map_load:
+    - map_load
+    - 20020
+  service_control_screen:
+    - control_screen_service
+    - 20021
+  service_mcu_rtk_update:
+    - mcu_rtk_update_service
+    - 20022
+  service_sensor_rtk_control:
+    - rtk_control_service
+    - 20023
+  service_ota_instruction:
+    - ota_instruction_service
+    - 20024
+  service_upload_image:
+    - upload_image
+    - 20025
+  service_nav_ipaOverlapPath:
+    - ipaOverlapPath
+    - 20026
+  service_nav_task_trajectory:
+    - task_trajectory
+    - 20027
+  service_system_info:
+    - system_info
+    - 20028
+# action 25xxx
+action:
+  action_nav_autodock:
+    - autodock_action
+    - 25001
+  action_nav_leave_dock:
+    - leave_dock_action
+    - 25002
+  action_nav_fake_bow_coverage:
+    - fake_bow_coverage_action
+    - 25003
+  action_nav_random_coverage:
+    - random_coverage_action
+    - 25004
+  action_nav_visual_egway:
+    - visual_egway_action
+    - 25005
+  action_nav_egway_coverage:
+    - egway_coverage_action
+    - 25006
+  action_nav_random_bow_coverage:
+    - random_bow_coverage_action
+    - 25007
+  action_nav_crossing:
+    - crossing_action
+    - 25008
+  action_nav_task:
+    - nav_task_action
+    - 25009
+  action_nav_to_charge_point:
+    - to_charge_point_action
+    - 25010
+  action_nav_navigation:
+    - navigation_action
+    - 25011
+  action_nav_random_area_bow_coverage:
+    - random_area_bow_coverage_action
+    - 25012
+
+# bigdata 30xxx
+bigdata:
+  # big image
+  # 30xxx
+  bigdata_sensor_image_raw:
+    - image_raw
+    - 30001
+  bigdata_nav_fiducial_images:
+    - fiducial_images
+    - 30002
+  bigdata_nav_dwa_path_map_image:
+    - dwa_path_map_image
+    - 30003
+  bigdata_perception_seg_image:
+    - grass_seg_image
+    - 30004
+  bigdata_perception_seg_mask_image:
+    - seg_mask_image
+    - 30005
+  bigdata_perception_docking_rgb:
+    - docking_rgb
+    - 30006
+  bigdata_perception_docking_depth:
+    - docking_depth
+    - 30007
+  bigdata_perception_cls_image:
+    - grass_cls_image
+    - 30008
+  bigdata_localization_mono_img_track:
+    - mono_img_track
+    - 30009
+
+  # todo todo
+  bigdata_perception_vo_original_pointcloud:
+    - vo_original_pointcloud
+    - 10001
+  bigdata_perception_vo_ground_pointcloud:
+    - vo_ground_pointcloud
+    - 10001
+  bigdata_perception_vo_not_ground_pointcloud:
+    - vo_not_ground_pointcloud
+    - 10001
+
+# 双目 bigdata
+  # big image
+  # 30xxx
+  bigdata_depth_image:
+    - depth_image
+    - 30051
+  bigdata_rgb_image: #与单目保持一致
+    - image_raw
+    - 30052
+  bigdata_leftir_image:
+    - leftir_image
+    - 30053
+  bigdata_rightir_image:
+    - rightir_image
+    - 30054
+  bigdata_localization_match_image:
+    - match_image
+    - 30055
+  bigdata_localization_image_track:
+    - image_track
+    - 30056
+  bigdata_perception_debug_image:
+    - perception_debug_image
+    - 30057
+  bigdata_ai_stereo_debug_image:
+    - ai_stereo_debug_image
+    - 30058
+  bigdata_ai_stereo_depth:
+    - ai_stereo_depth
+    - 30059
+
+# bigdata
+  # big point cloud2
+  # 31xxx
+  bigdata_nav_costmap_depth_camera:
+    - depth_camera_grass_seg_point_cloud
+    - 31001
+  bigdata_perception_seg_pointcloud:
+    - grass_seg_point_cloud
+    - 31002
+  bigdata_perception_docking_pointcloud:
+    - docking_pointcloud
+    - 31003
+  bigdata_nav_edge_points:
+    - edge_point
+    - 31004
+  bigdata_nav_low_obs_points:
+    - low_obs_points
+    - 31005
+
+# 双目 bigdata
+  # big point cloud2
+  # 31xxx
+  bigdata_ai_stereo_pointcloud:
+    - ai_stereo_pointcloud
+    - 31051

@@ -89,6 +89,105 @@ class MappingTaskTest(unittest.TestCase):
         self.assertEqual(robot.collisions, 0)
 
 
+    def test_mapping_clears_map_edits(self):
+        robot, grid, manager = make_system()
+        world.add_static_obstacle(5.0, 4.5, 0.4)
+        world.add_no_go_zone(3.0, 3.0, 5.0, 4.0)
+        self.assertTrue(world.edit_dict()["static"])
+        manager.start_mapping()
+        self.assertEqual(world.edit_dict()["static"], [])
+        self.assertEqual(world.edit_dict()["no_go"], [])
+        self.assertEqual(world.NO_GO, [])
+
+    def test_no_go_ring_bypass_generates_counter_clockwise_route(self):
+        robot, grid, manager = make_system()
+        manager.task = {"type": "mow", "zones": [1], "mode": "A"}
+        manager.zone_id = 1
+        manager.mowing_mode = "A"
+        manager.phase = "zone_edge"
+        robot.pose = [2.0, 4.0, 0.0]
+        manager.edge_points = [(2.0, 4.0), (3.0, 4.2), (4.0, 4.4), (6.5, 4.0), (7.5, 4.0)]
+        manager.edge_index = 0
+        world.add_no_go_zone(3.0, 3.0, 5.0, 5.0)
+        try:
+            zone = manager._no_go_at(3.6, 3.6, 0.0)
+            self.assertIsNotNone(zone)
+            self.assertTrue(manager._begin_no_go_ring(zone, "zone_edge"))
+            self.assertEqual(manager.phase, "no_go_ring")
+            points = manager.no_go_ring_points
+            self.assertGreaterEqual(len(points), 4)
+            # 路径在禁区外，且绕行方向为逆时针（正面积）
+            for point in points:
+                self.assertFalse(
+                    world.in_no_go(point[0], point[1]),
+                    "绕行路径不应落在禁区内",
+                )
+            area = 0.0
+            for index in range(len(points)):
+                x1, y1 = points[index]
+                x2, y2 = points[(index + 1) % len(points)]
+                area += x1 * y2 - x2 * y1
+            self.assertGreater(area, 0.0)
+            manager.edges = None
+            manager.phase = "no_go_ring"
+            manager.no_go_ring_resume = "zone_edge"
+            manager._finish_no_go_ring()
+            self.assertEqual(manager.edge_index, 3)
+            self.assertEqual(manager.phase, "zone_edge")
+        finally:
+            world.clear_edits()
+
+    def test_no_go_guard_blocks_forward_motion(self):
+        robot, grid, manager = make_system()
+        manager.task = {"type": "mow", "zones": [1], "mode": "A"}
+        manager.phase = "zone_stripes"
+        x, y, theta = manager._pose()
+        world.add_no_go_zone(
+            x + 0.18, y - 0.6, x + 1.6, y + 0.6
+        )
+        try:
+            v, w = manager._guard_no_go((0.6, 0.2))
+            self.assertAlmostEqual(v, 0.0)
+            self.assertNotEqual(w, 0.0)
+            # 朝远离禁区的方向行驶不受影响
+            v2, w2 = manager._guard_no_go((-0.6, 0.2))
+            self.assertAlmostEqual(v2, -0.6)
+            self.assertAlmostEqual(w2, 0.2)
+        finally:
+            world.clear_edits()
+
+    def test_finished_mapping_never_restarts_from_stale_breakpoint(self):
+        robot, grid, manager = make_system()
+        map_field(robot, grid, manager)
+        self.assertEqual(manager.phase, "done")
+        self.assertTrue(manager.mapping_done)
+        manager.breakpoint = {
+            "pose": manager._pose(),
+            "phase": "map_follow",
+            "zone_id": None,
+            "zone_index": 0,
+            "map_path": [],
+            "map_path_dist": 0.0,
+        }
+        manager._restore_breakpoint()
+        self.assertNotIn(manager.phase, ("map_follow", "map_seek", "map_escape"))
+        self.assertIsNone(manager.breakpoint)
+        advance(manager, 90.0)
+        self.assertEqual(manager.phase, "done")
+        messages = [entry["message"] for entry in robot.events]
+        self.assertEqual(messages.count("开始自动建图：从当前位置逆时针巡边"), 1)
+
+    def test_control_redirects_mapping_phase_after_finish(self):
+        robot, grid, manager = make_system()
+        map_field(robot, grid, manager)
+        manager.phase = "map_follow"
+        manager.map_path = [(robot.pose[0], robot.pose[1])]
+        manager._control(DT, 0.0)
+        self.assertNotEqual(manager.phase, "map_follow")
+        advance(manager, 60.0)
+        self.assertEqual(manager.phase, "done")
+
+
 class MowingTaskTest(unittest.TestCase):
     def setUp(self):
         config.configure(
@@ -115,6 +214,36 @@ class MowingTaskTest(unittest.TestCase):
         self.assertTrue(any("边缘已完成" in message for message in messages))
         self.assertTrue(any("规划弓字线段" in message for message in messages))
         self.assertTrue(any("规划弓字线段" in message for message in messages))
+
+    def test_b_mode_uses_larger_no_go_margin(self):
+        robot, grid, manager = make_system()
+        map_field(robot, grid, manager)
+        world.add_no_go_zone(4.0, 4.0, 5.0, 5.0)
+        try:
+            manager.start_mowing([1], mode="B")
+            near_col, near_row = grid.cell_of(3.70, 4.5)
+            self.assertTrue(grid.cell_blocked_mow(near_col, near_row))
+            self.assertFalse(world.in_no_go(3.70, 4.5, 0.0), "0.3 m 外应仍在禁区之外")
+        finally:
+            world.clear_edits()
+
+    def test_mow_start_restores_obstacle_baseline(self):
+        robot, grid, manager = make_system(1)
+        map_field(robot, grid, manager)
+        zone = max(grid.zones, key=lambda item: item["free"])
+        cx, cy = zone["cx"], zone["cy"]
+        col, row = grid.cell_of(cx, cy)
+        outline_before = [tuple(point) for point in zone["outline"]]
+        # 上次割草涂抹出来的假障碍（建图完成时并不存在）
+        smear = grid.index(col + 8, row + 8)
+        grid.data[smear] = 2
+        grid.mow_blocked[smear] = 1
+        manager.start_mowing([zone["id"]])
+        self.assertEqual(grid.data[smear], 0)
+        self.assertFalse(grid.mow_blocked[smear])
+        self.assertEqual([tuple(point) for point in grid.zones[0]["outline"]], outline_before)
+        messages = [entry["message"] for entry in robot.events]
+        self.assertTrue(any("重置区域内障碍涂抹" in message for message in messages))
 
     def test_auto_recharge_resumes_mowing(self):
         robot, grid, manager = make_system(3)

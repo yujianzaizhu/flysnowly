@@ -365,14 +365,17 @@ def _clearance_map(width, height, mask):
     return distance
 
 
-def _choose_pose(mask, width, height):
+def _choose_pose(mask, width, height, cell_m=None):
+    """选取充电桩与起点：按仿真米制留出足够间隙，避免出生在墙边。"""
+    cell_m = float(cell_m or world.CELL)
+    margin = 0.55  # 充电桩/机器人所需最小离墙距离（m）
     center_col = width / 2.0
     center_row = height / 2.0
     free = [index for index in range(width * height) if mask[index]]
     if not free:
         raise MapImportError("自由区域为空")
     distance = _clearance_map(width, height, mask)
-    clearance = max(3, int(round(0.32 / world.CELL)) + 1)
+    clearance = max(3, int(round(margin / cell_m)) + 1)
     candidates = [index for index in free if distance[index] >= clearance]
     pool = candidates or free
     dock_index = min(
@@ -384,7 +387,8 @@ def _choose_pose(mask, width, height):
     dock_row = dock_index // width
 
     start_index = None
-    start_distance = min(20, max(6, int(min(width, height) * 0.12)))
+    start_distance = max(4, int(round(1.0 / cell_m)))  # 起点默认离桩约 1 m
+    start_distance = min(start_distance, max(4, min(width, height) // 3))
     for distance_cells in (
         start_distance,
         max(6, start_distance - 4),
@@ -402,7 +406,7 @@ def _choose_pose(mask, width, height):
             col, row = dock_col + dc, dock_row + dr
             if 0 <= col < width and 0 <= row < height:
                 index = row * width + col
-                if mask[index] and distance[index] >= max(2, clearance - 1):
+                if mask[index] and distance[index] >= max(3, clearance - 1):
                     start_index = index
                     break
         if start_index is not None:
@@ -415,7 +419,7 @@ def _choose_pose(mask, width, height):
     return dock_col, dock_row, start_index % width, start_index // width, theta
 
 
-def build_map(source, name=None, max_extent=24.0):
+def build_map(source, name=None, max_extent=40.0):
     """解析真实地图并返回 world.register_map 可用的定义。"""
     source = os.path.abspath(os.path.expanduser(str(source)))
     map_file, root, map_info, path_info = _metadata(source)
@@ -447,18 +451,19 @@ def build_map(source, name=None, max_extent=24.0):
     if converted[0][0] < 0:
         outer = list(reversed(outer))
     holes = [points for area, points in converted[1:] if abs(area) >= MIN_HOLE_AREA]
-    dock_col, dock_row, start_col, start_row, theta = _choose_pose(
-        component, width, height
-    )
     natural_width = width * world.CELL
     natural_height = height * world.CELL
     try:
         max_extent = float(max_extent)
     except (TypeError, ValueError):
-        max_extent = 24.0
+        max_extent = 40.0
     if max_extent <= 0.0:
-        max_extent = 24.0
+        max_extent = 40.0
     scale = min(1.0, max_extent / max(natural_width, natural_height))
+    # 栅格边长按缩放后的米制计算，保证充电桩/起点离墙间隙够机器人用。
+    dock_col, dock_row, start_col, start_row, theta = _choose_pose(
+        component, width, height, cell_m=max(1e-6, world.CELL * scale)
+    )
 
     def point(value):
         return (

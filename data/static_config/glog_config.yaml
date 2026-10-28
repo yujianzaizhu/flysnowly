@@ -1,0 +1,8 @@
+log_dir: /userdata/fibot/log/
+filename_extension: .txt
+filename_head: LOG
+max_log_size: 10
+max_logfile_num: 10
+stderr_threshold: ERROR
+log_to_stdout: false
+also_log_to_stderr: false

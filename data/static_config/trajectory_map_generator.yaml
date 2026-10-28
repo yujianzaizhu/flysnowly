@@ -1,0 +1,9 @@
+home_dir: /userdata/fibot/config/map
+record_frame: world
+base_link_frame: base_link1
+max_size: 100000
+ring_size: 1
+distance_interval: 0.05
+display_trajectory: false
+manul_mapping: true
+version: 1

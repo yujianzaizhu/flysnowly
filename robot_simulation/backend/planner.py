@@ -124,7 +124,8 @@ def edge_route_grid(grid, zone, start_xy, clearance=None):
             continue
         x, y = grid.center_of(col, row)
         ok = True
-        if world.boundary_distance(x, y) < world.ROBOT_RADIUS + 0.05:
+        # 地图边界：巡边带离外墙至少 车体半径 + 0.10 m（与区域边界内缩一起考虑）
+        if world.boundary_distance(x, y) < world.ROBOT_RADIUS + 0.10:
             ok = False
         if ok:
             for polygon in world.OBSTACLE_POLYGONS:

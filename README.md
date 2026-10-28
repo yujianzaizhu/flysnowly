@@ -1,240 +1,250 @@
-<!-- 
-  <<< Author notes: Header of the course >>> 
-  Include a 1280×640 image, course title in sentence case, and a concise description in emphasis.
-  In your repository settings: enable template repository, add your 1280×640 social image, auto delete head branches.
-  Add your open source license, GitHub uses Creative Commons Attribution 4.0 International.
--->
+# 视觉割草机器人控制台
 
-# Introduction to GitHub
+四轮后驱割草机器人仿真系统：以 **100° FOV / 1 m 视觉深度传感器**为主要感知，完成自动建图、自动分区、自动割草（沿边 + 弓字全覆盖 + 绕障）、自动回充与断点续作，并通过浏览器界面实时展示地图、覆盖情况、视觉视场和任务状态。
 
-_Get started using GitHub in less than an hour._
+后端零第三方依赖，要求 Python 3.8+。
 
-<!-- 
-  <<< Author notes: Start of the course >>> 
-  Include start button, a note about Actions minutes,
-  and tell the learner why they should take the course.
-  Each step should be wrapped in <details>/<summary>, with an `id` set.
-  The start <details> should have `open` as well.
-  Do not use quotes on the <details> tag attributes.
--->
+## 快速开始
 
-<!--step0
+```bash
+cd robot
+./run.sh                 # 默认 http://127.0.0.1:8000/
+# 或指定地址与端口
+HOST=0.0.0.0 PORT=9000 ./run.sh
+# 也可以直接运行
+python3 backend/server.py --host 127.0.0.1 --port 8000
+```
 
-People use GitHub to build some of the most advanced technologies in the world. Whether you’re visualizing data or building a new game, there’s a whole community and set of tools on GitHub that can help you do it even better. GitHub Skills’ “Introduction to GitHub” course guides you through everything you need to start contributing in less than an hour.
+打开 <http://127.0.0.1:8000/>：
 
-- **Who is this for**: New developers, new GitHub users, and students.
-- **What you'll learn**: We'll introduce repositories, branches, commits, and pull requests.
-- **What you'll build**: We'll make a short Markdown file you can use as your [profile README](https://docs.github.com/account-and-profile/setting-up-and-managing-your-github-profile/customizing-your-profile/managing-your-profile-readme).
-- **Prerequisites**: None. This course is a great introduction for your first day on GitHub.
-- **How long**: This course is four steps long and takes less than one hour to complete.
+1. 在顶部 **地图** 下拉框选择 1–5 号场地（切换会重建机器人与地图）。
+2. 点击 **自动建图**，机器人驶向边界并逆时针巡边；完成后自动分区并返回充电桩。
+3. 在 **割草区域** 输入顺序（留空时自动使用全部区域，如 `1,2,4,5`），点击 **开始割草**。
+4. 需要中途补电时点击 **立即回充**；充好电后点击 **继续任务**，机器人会先回到断点再继续。
+5. 仿真速度支持 1x / 2x / 4x / 8x / 16x / 32x，便于快速演示完整任务。
+6. 在 **参数 → 地图** 页签点击“选择文件”或“选择目录”导入真实 PGM 地图；导入后立即切换为新增的模拟场地。
 
-## How to start this course
+## 五张不规则场地
 
-1. Above these instructions, right-click **Use this template** and open the link in a new tab.
-   ![Use this template](https://user-images.githubusercontent.com/1221423/169618716-fb17528d-f332-4fc5-a11a-eaa23562665e.png)
-2. In the new tab, follow the prompts to create a new repository.
-   - For owner, choose your personal account or an organization to host the repository.
-   - We recommend creating a public repository—private repositories will [use Actions minutes](https://docs.github.com/en/billing/managing-billing-for-github-actions/about-billing-for-github-actions).
-   ![Create a new repository](https://user-images.githubusercontent.com/1221423/169618722-406dc508-add4-4074-83f0-c7a7ad87f6f3.png)
-3. After your new repository is created, wait about 20 seconds, then refresh the page. Follow the step-by-step instructions in the new repository's README.
+| # | 名称 | 尺寸 (m) | 特点 |
+| --- | --- | --- | --- |
+| 1 | L 形庭院 | 17.7 × 12.0 | L 形外墙，含充电桩前方孤岛障碍 |
+| 2 | 阶梯花园 | 19.1 × 12.7 | 三级阶梯边界 |
+| 3 | U 形回廊 | 18.4 × 12.0 | U 形窄回廊，考验沿边与分区 |
+| 4 | 斜角草坪 | 19.1 × 12.0 | 一条斜边，生成三角形区域 |
+| 5 | 双庭院 | 19.1 × 12.0 | H 形双庭院，中间窄通道 |
 
-endstep0-->
+场地面积在原始布局基础扩大为 **2 倍**（宽高约 ×1.414，障碍物中心随地图缩放、尺寸保持不变）。每张地图有独立的充电桩、起点和不规则障碍物。建图完成后自动分区，默认最小区域面积 **20 m²**，过小碎片会合并到相邻区域（5 张地图当前共约 7 个区域：1/1/2/1/2）；规则区域保持为一整块，不规则区域沿自由区轮廓巡边。
 
-<!-- 
-  <<< Author notes: Step 1 >>> 
-  Choose 3-5 steps for your course.
-  The first step is always the hardest, so pick something easy!
-  Link to docs.github.com for further explanations.
-  Encourage users to open new tabs for steps!
--->
+### 导入真实 PGM 地图
 
-<details id=1 open>
-<summary><h2>Step 1: Create a branch</h2></summary>
+“参数 → 地图”页签提供两种真实地图导入方式（界面不再提供服务端路径输入和最大边长设置）：
 
-_Welcome to "Introduction to GitHub"! :wave:_
+- **选择文件**：支持 `.pgm`（必需），以及 `default.json`、`map_info.json`、`.yaml/.yml`（可选）；`default.json` 会自动放到 `path/default.json`。
+- **选择目录**：自动保留目录内的 `path/` 结构，适合直接选择包含 `grid_map.pgm` 和 `path/default.json` 的地图目录。
 
-**What is GitHub?**: GitHub is a collaboration platform that uses [Git](https://docs.github.com/get-started/quickstart/github-glossary#git) for versioning. GitHub is a popular place to share and contribute to [open-source](https://docs.github.com/get-started/quickstart/github-glossary#open-source) software.
-<br>:tv: [Video: What is GitHub?](https://www.youtube.com/watch?v=w3jLJU7DT5E)
+浏览器选择文件时使用 `POST /api/map/upload` 上传，服务端只接受 `.pgm/.json/.yaml/.yml`，单文件最大 16 MB，单次总量最大 24 MB；未指定时地图按默认 24 m 最大边长等比缩放。服务端仍保留 `POST /api/map/import`（服务端路径导入）供脚本/测试使用。
 
-**What is a repository?**: A [repository](https://docs.github.com/get-started/quickstart/github-glossary#repository) is a project containing files and folders. A repository tracks versions of files and folders.
-<br>:tv: [Video: Exploring a repository](https://www.youtube.com/watch?v=R8OAwrcMlRw)
+- 解析 `default.json` 的 `resolution`，读取 P5/P2 PGM，提取最大连通自由区的外轮廓和内部障碍孔洞。
+- 地图会等比缩放到 `max_extent`（默认 24 m，避免真实几十米场地在仿真中过大），并自动生成充电桩/起点。
+- 导入地图会加入地图下拉框（编号从 101 开始）；同一来源重复导入会覆盖原编号。界面会把真实障碍轮廓画成实线，视觉聚类结果仍以虚线显示。
+- 地图下拉框旁提供“删除地图”按钮，仅删除导入地图；删除当前地图后自动切回 1 号内置场地。内置地图不可删除。
 
-**What is a branch?**: A [branch](https://docs.github.com/en/get-started/quickstart/github-glossary#branch) is a parallel version of your repository. By default, your repository has one branch named `main` and it is considered to be the definitive branch. You can create additional branches off of `main` in your repository. You can use branches to have different versions of a project at one time.
+### 地图缩放与坐标
 
-On additional branches, you can make edits without impacting the `main` version. Branches allow you to separate your work from the `main` branch. In other words, everyone's work is safe while you contribute.
-<br>:tv: [Video: Branches](https://www.youtube.com/watch?v=xgQmu81G1yY)
+- 充电桩默认半径 0.70 m（可通过 `dock_radius` 参数调整），机器人起点会优先选择离场地边界更远的自由栅格。
+- 地图支持鼠标滚轮缩放、左键拖动平移、双击复位，也可使用地图左上角的 `＋ / － / ⤢` 按钮。
+- 鼠标在地图上移动时显示当前世界坐标（单位 m），便于核对导入地图形状和路径位置。
 
-**What is a profile README?**: A [profile README](https://docs.github.com/account-and-profile/setting-up-and-managing-your-github-profile/customizing-your-profile/managing-your-profile-readme) is essentially an "About me" section on your GitHub profile where you can share information about yourself with the community on GitHub.com. GitHub shows your profile README at the top of your profile page.
+## 功能说明
 
-### :keyboard: Activity: Your first branch
+### 视觉传感器
 
-1. Open a new browser tab, and navigate to this same repository. Then, work on the steps in your second tab while you read the instructions in this tab.
-2. Navigate to the **Code** tab.
-3. Click on the **main** branch drop-down.<br>
-   <img alt="image showing my-first-branch entry" src="/images/my-first-branch.png"/>
-4. In the field, enter a name for your branch: `my-first-branch`.
-5. Click **Create branch: my-first-branch** to create your branch.
-6. Move on to Step 2!<br>
-   **Note**: If you made a public repository, and want to confirm you correctly set up your first branch, wait about 20 seconds then refresh this page (the one you're following instructions from). [GitHub Actions](https://docs.github.com/en/actions) will automatically close this step and open the next one.
+- 100° 视场角（±50°），41 束深度射线，量程 1 m。
+- 每束光线同时用于避障/沿边控制和占据栅格建图。
+- 界面中的蓝色扇面即实时视觉视场，颜色随距离变化。
 
-</details>
+### 自动建图
 
-<!-- 
-  <<< Author notes: Step 2 >>>
-  Start this step by acknowledging the previous step.
-  Define terms and link to docs.github.com.
--->
+- 从当前位置出发，向前行驶直到视觉发现外墙。
+- 以 **墙体在右侧** 的沿边控制逆时针绕场一周，视觉持续写入栅格地图（空闲/占据）。
+- **孤岛识别**：巡边中若形成面积小于 8 m² 且闭环内部存在已探明占据栅格的闭环，才判定为障碍物孤岛；外凸半岛/顶部尖角造成的路径自接近不会误触发脱离，沿边会继续直到真正的外墙闭环。已识别孤岛会记录并在后续搜索中避开。
+- 当闭环面积达到 12 m² 以上才判定建图完成，自动执行自由区漫游与分区，返回充电桩并停靠充电。
+- 建图过程中电量低于 **30%**：保存断点 → 回充 → 电量高于 **80%** → 返回断点并对齐航向继续巡边。
+- 巡边被障碍物/狭窄角卡住时，优先沿最近约 1 m 的历史轨迹倒车脱困，再重新寻找外墙；历史脱困失败才使用远离碰撞方向的脱离策略。
 
-<details id=2>
-<summary><h2>Step 2: Commit a file</h2></summary>
+### 运行性能
 
-_You created a branch! :tada:_
+- 视觉写入栅格改为按 0.1 m 栅格采样，避免同一栅格被 0.05 m 间隔重复写入。
+- 预计算外墙/障碍物线段用于射线检测；区域安全巡边带使用多源 BFS 距离变换，并缓存同一区域的沿边路线。
+- 障碍物聚类、边界建图进度按占据数据版本缓存，界面状态刷新只重新编码变化的数据。
+- 障碍物轮廓在世界切换时预计算，避免每次 `/api/state` 重复计算。
 
-Creating a branch allows you to edit your project without changing the `main` branch. Now that you have a branch, it’s time to create a file and make your first commit!
+### 自动分区
 
-**What is a commit?**: A [commit](https://docs.github.com/pull-requests/committing-changes-to-your-project/creating-and-editing-commits/about-commits) is a set of changes to the files and folders in your project. A commit exists in a branch.
+- 建图完成后先按探明自由区做 **连通域分区**，不再以整张地图的包围盒做 BSP 切分。
+- 连通域形状较规则（凸包实心度 ≥ 0.90）时整体作为一个区域；哑铃形/狭窄连接的区域才沿最远点测地线切成两个区域。
+- 所有区域面积不低于 **20 m²**；小于该面积的碎片合并到最近的连通区域。
+- 每个区域的 `free`、包围盒和覆盖率会显示在控制台；区域编号按质心从上到下、从左到右排列。
 
-### :keyboard: Activity: Your first commit
+### 自动割草（A / B 两种模式）
 
-The following steps will guide you through the process of committing a change on GitHub. Committing a change requires first adding a new file to your new branch. 
+- 启动时确认区域顺序（留空则使用全部区域），按顺序前往各区域。
+- **A 模式（默认，先沿边）**：每个区域流程：
+  1. 沿区域边缘一周；
+  2. 弓字覆盖；
+  3. 纵向补割；
+  4. 环形补割。
+- **B 模式（先弓字）**：每个区域流程：
+  1. 先规划弓字覆盖；
+  2. 遇到**大型障碍物**：不绕障，直接掉头并重新规划剩余弓字；
+  3. 遇到**小型障碍物**：绕障后继续弓字；
+  4. 弓字和纵向补割完成后，再沿区域边缘割草一次。
+- 控制台顶部可以选择 A/B 模式；模式会随任务保存，回充续作后保持。
+- A 模式详细流程：
+  1. **沿区域边缘一周**：规则区域使用内缩矩形；不规则区域沿**实际自由区/区域边界**生成巡边路径；区域内部障碍物由后续环形补割按障碍物实体边界处理。路径中心保持约一个车体半径的墙体安全间距，同时让 0.44 m 刀盘覆盖到边界最后一小条草。沿边采用当前路径段上的 0.30 m 纯跟踪预瞄；外凸半岛/墙体命中不会被误判为场内障碍物，避免跳过整段边缘。
+  2. **弓字覆盖**：按 0.30 m 行距对区域内尚未割草的连通部分生成蛇形线段，逐段巡迹；只规划可割草且未割过的连续段。
+  3. **纵向补割**：横向弓字结束后若覆盖率仍不足，生成纵向弓字补割。
+  4. **环形补割**：对区域内已发现且未绕行过的障碍物绕行一周，覆盖障碍物周围区域。
+- **弓字顺序优化**：所有弓字段按“当前位置 + 航向 + 就近端点”重排；障碍物把一条弓字切成两段时，先完成当前一侧，再前往另一侧，减少来回穿越。
+- **漏扫补扫与覆盖率保护**：区域主流程完成后检查未割草连通块；面积约 0.2–9 m² 的漏扫块会生成补扫弓字（或沿长轴直扫）。若覆盖率仍明显低于实际可达目标，会再规划一次剩余连通域，不会因连续碰撞或局部不可达直接结束区域。
+- **内外直角差异化补扫**：逆时针沿边时，外凸直角由预瞄自然转过，不再执行前进-后退；内凹直角则沿入射方向多前进 `inner_corner_advance`（默认 0.16 m）到尖角后再后退转向，覆盖内直角尖尖处的小块漏扫。沿边速度由 `edge_speed`（默认 0.50 m/s）单独控制，沿边超时按实际路径长度动态计算，回充后不会因旧的 90 s 固定超时直接跳过剩余沿边。
+- **区域边界约束**：沿边采用逆时针方向，绕障也按逆时针；绕障路径只使用区域内的连续弧段，触到区域边界时结束绕行并沿区域边缘继续，不会绕到其他区域。
+- **沿边绕障续接**：沿边遇到已探明或未聚类的小障碍时，先逆时针绕行；绕完或到达区域边界后，重新选择障碍后的边缘点继续沿边。B 模式的最终沿边不会再因为边缘附近的障碍命中而整段跳过。
+- **后退脱困**：沿边/弓字/绕障/前往区域时若持续 4 s 没有有效位移，机器人会沿最近约 1 m 的历史轨迹倒车脱困，再恢复原阶段；同一区域最多尝试 3 次，避免长时间困在障碍物间。
+- **不可达目标处理**：导航前若目标点被新探明障碍覆盖，会改去当前位置连通域内最近的可达点；弓字段起点被覆盖时自动沿弓字寻找第一个可通行入口，若该端被堵则从线段另一端进入，只有两端都不可达才丢弃该段。若区域沿边入口全部不可达但区域内部仍有可达点，会从该内部点开始清扫剩余可达弓字线；只有整个区域都没有可达入口时才跳过该区域。导航中目标栅格被障碍覆盖会立即重规划，而不是继续顶住或直接结束区域。
+- **高速显示优化**：仿真速度 ≥4x 时前端状态轮询提升到 50 ms，并同步缩短位姿插值窗口，减少高速下的跳跃/卡帧。
+- **A 模式沿边绕障续接**：沿边被障碍物中断并完成绕障后，会选择机器人附近、避开障碍且直线/ A* 可达的边缘点继续大沿边；不会直接跳到弓字阶段。
+- **贴边绕障**：绕障半径根据视觉占据栅格沿视线方向的实际外边界自适应，不再固定走理想圆；默认安全余量约 0.34 m（含栅格膨胀约 0.1 m），较上一版缩小，可通过窄通道。
+- **视觉盲区花瓣绕障**：小型障碍物绕行中若连续失去视觉接触，机器人会停下并向障碍物方向旋转探明，再继续绕行。
+- 巡迹遇障：**只使用视觉建图得到的占据栅格**聚类障碍物，不读取场地真值；拟合出包围圆并估计 `large/small` 类型后，沿实际观测轮廓外扩安全余量绕行。大型/小型均有不规则多瓣形状；大型用于 B 模式掉头，小型用于绕障与花瓣探明。
+- **界面真实边界**：控制台同时绘制场地障碍物的真实轮廓（**白色实线**，外侧加深色描边以便在浅色主题下也清晰）和机器人视觉聚类得到的大小障碍估计（橙/黄色虚线），便于对比感知结果。
+- **不二次绕障**：成功绕过（或确认无法绕行）的障碍物会加入已绕行记录；再次遇到同一障碍物时跳过环形动作，直接重新规划路径。该记录在回充/断点续作后仍保留。
+- 若环形绕障过程中发生碰撞或受阻，机器人会记录该障碍物并退出绕行，避免反复撞击。
+- 覆盖率 = 已割草空闲栅格 / 区域空闲栅格；受车体半径与割草宽度限制，障碍物周围和墙边会保留少量未覆盖。典型覆盖率 85%–96%。
+- 一个区域完成后自动前往下一个区域；全部完成后返回充电桩。
 
-1. On the **Code** tab, make sure you're on your new branch `my-first-branch`.
-2. Select the **Add file** drop-down and click **Create new file**.<br>
-   ![create new file option](/images/create-new-file.png)
-3. In the **Name your file...** field, enter `PROFILE.md`.
-4. In the **Edit new file** area, copy the following content to your file:
-   ```
-   Welcome to my GitHub profile!
-   ```
-   <img alt="profile.md file screenshot" src="/images/my-profile-file.png"/>
-5. For commits, you can enter a short commit message that describes what changes you made. This message helps others know what's included in your commit. GitHub offers a simple default message, but let's change it slightly for practice. First, enter `Add PROFILE.md` in the first text-entry field below **Commit new file**. Then, if you want to confirm what your screen should look like, expand the dropdown below.
-   <details>
-   <summary> Expand to see the screenshot.</summary>
-   <img alt="screenshot of adding a new file with a commit message" src="/images/commit-full-screen.png" />
-   </details>
-6. In this lesson, we'll ignore the other fields and click **Commit new file**.
-7. Move on to Step 3! <br>
-   **Note**: Like before, you can wait about 20 seconds, then refresh this page (the one you're following instructions from) and [GitHub Actions](https://docs.github.com/en/actions) will automatically close this step and open the next one.
+### 自动 / 手动回充与断点续作
 
-</details>
+- 割草中电量低于 30%：自动保存任务（相位、区域、边缘进度、弓字区域、已绕障碍、断点位姿、沿边已用时间）→ 返回充电桩 → 充到 80% → 返回断点 → 恢复任务。
+- 默认耗电速率为改造前的 **60%**，可通过参数 `battery_drain_factor`（默认 0.6）调整。
+- 机器人原地待机（线速度、角速度均为 0）时，耗电按正常行驶功耗的 **10%** 计（`IDLE_DRAIN_SCALE = 0.1`），停靠充电桩仍按 8 %/s 充电。
+- “停止任务”是暂停语义；暂停/回充时间不计入沿边 90 s 超时，继续任务不会因暂停过久而直接结束沿边。
+- 控制台点击 **立即回充**：保存任务和割草记录，返回充电桩；**不会**自动恢复，必须点击 **继续任务**。
+- 续作前机器人先驶回保存的断点；建图任务还会原地对齐到断点航向，保证继续逆时针巡边。
+- 断点保存在当前任务内，切换地图或复位会清除。
 
-<!-- 
-  <<< Author notes: Step 3 >>> 
-  Just a historic note: the previous version of this step forced the learner
-  to write a pull request description,
-  checked that `main` was the receiving branch,
-  and that the file was named correctly.
--->
+### 四轮后驱模型
 
-<details id=3>
-<summary><h2>Step 3: Open a pull request</h2></summary>
+- 后轴左右轮差速驱动，前轮随动；运动学按后轴差速模型计算。
+- 界面显示左右后轮线速度、线/角速度、航向与里程。
+- 车体半径 0.18 m，割草宽度 0.44 m，视觉量程 1 m。
 
-_Nice work making that commit :sparkles:_
+## 操作
 
-Now that you’ve created a commit, it’s time to share your proposed change through a pull request!
+| 操作 | 说明 |
+| --- | --- |
+| 地图下拉 | 切换 1–5 号场地，重建机器人与地图 |
+| 自动建图 | 启动建图任务 |
+| 区域顺序 + 开始割草 | 按给定顺序执行割草任务；留空自动使用全部区域 |
+| 立即回充 | 保存任务并返回充电桩，等待“继续任务” |
+| 继续任务 | 从充电桩返回断点并恢复任务 |
+| 停止任务 | 放弃当前任务 |
+| 1x / 2x / 4x / 8x / 16x / 32x | 仿真速度 |
+| WASD / 方向键 / 界面方向键 | 手动驾驶（会中止当前自动任务） |
+| 空格 / 急停 | 立即停车（会中止当前任务） |
+| R / 复位 | 复位小车、地图与任务 |
 
-**What is a pull request?**: Collaboration happens on a pull request. The pull request shows the changes in your branch to other people. This pull request is going to keep the changes you just made on your branch and propose applying them to the `main` branch.
-<br>:tv: [Video: Introduction to pull requests](https://youtu.be/kJr-PIfLDl4)
+## 系统组成
 
-### :keyboard: Activity: Create a pull request
+```
+robot/
+├── backend/
+│   ├── world.py         # 五张不规则场地、多边形几何、障碍物、100°/1m 视觉射线
+│   ├── grid_map.py      # 占据栅格、自由区漫游、递归分区、覆盖记录、障碍聚类/A* 规划
+│   ├── planner.py       # 区域边缘（矩形/自由区轮廓）、弓字线段、环形绕障路径
+│   ├── robot_car.py     # 四轮后驱运动学、视觉、电量与充电
+│   ├── tasks.py         # 建图/分区/割草/回充/断点续作状态机
+│   ├── map_import.py    # 真实 PGM 地图解析、轮廓提取与模拟场地转换
+│   └── server.py        # HTTP 服务、仿真线程、地图切换、仿真速度
+├── frontend/
+│   ├── index.html       # 控制台页面
+│   ├── styles.css       # 深色控制台样式
+│   └── app.js           # 地图位图、Canvas 渲染、任务与手动控制
+├── tests/
+│   ├── test_robot_car.py
+│   ├── test_grid_map.py
+│   ├── test_tasks.py
+│   └── test_server.py
+├── run.sh
+└── README.md
+```
 
-You may have noticed after your commit that a message displayed indicating your recent push to your branch and providing a button that says **Compare & pull request**.
+### HTTP 接口
 
-![screenshot of message and button](/images/compare-and-pull-request.png)
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/state` | 位姿、速度、电量、视觉、任务、区域覆盖率、栅格地图（0/1/2 ASCII 网格）、规划路径、射线、当前地图 |
+| GET | `/api/world` | 场地/区域/障碍物/充电桩静态定义 |
+| GET | `/api/health` | 服务健康检查 |
+| POST | `/api/task` | `{"task":"map"}` 或 `{"task":"mow","zones":[1,2,4,5],"mode":"A"}`（mode 可为 A/B） |
+| POST | `/api/stop` | 停止任务 |
+| POST | `/api/charge` | 保存任务并立即回充 |
+| POST | `/api/resume` | 从充电桩继续之前的任务 |
+| POST | `/api/command` | 手动指令：`forward` / `backward` / `left` / `right` / `stop` |
+| POST | `/api/speed` | `{"speed": 1|2|4|8|16|32}` |
+| POST | `/api/map` | `{"map": 1..5}` 切换场地并重建系统 |
+| POST | `/api/map/import` | `{"path":"...","max_extent":24}` 从服务端路径导入真实 PGM 地图并切换（界面已不提供入口，供脚本/测试使用） |
+| POST | `/api/map/upload` | `{"files":[{"path":"map/grid_map.pgm","data":"<base64>"}],"max_extent":24}` 上传并导入地图 |
+| POST | `/api/map/delete` | `{"map":101}` 删除导入地图；删除当前地图后切回 1 号内置场地 |
+| POST | `/api/reset` | 复位小车、地图与任务 |
 
- If you want, feel free to click **Compare & pull request**, and then skip to step 6 below. If you don't click the button, the instructions below walk you through manually setting up the pull request.
+## 参数设置（外部参数入口）
 
-1. Click on the **Pull requests** tab in your repository.
-2. Click **New pull request**.
-3. In the **base:** dropdown, make sure **main** is selected.
-4. Select the **compare:** dropdown, and click `my-first-branch`. <br>
-   <img alt="screenshot showing both branch selections" src="/images/pull-request-branches.png"/>
-5. Click **Create pull request**.
-6. Enter a title for your pull request: `Add my first file`.
-7. The next field helps you provide a description of the changes you made. Feel free to add a description of what you’ve accomplished so far. As a reminder, you have: created a branch, created a file and made a commit! <br>
-   <img alt="screenshot showing pull request" src="/images/Pull-request-description.png"/>
-8. Click **Create pull request**.
-9. Move on to Step 4! <br>
-   **Note**: Like before, you can wait about 20 seconds, then refresh this page (the one you're following instructions from) and [GitHub Actions](https://docs.github.com/en/actions) will automatically close this step and open the next one. As a perk, you may see evidence of GitHub Actions running on the tab with the pull request opened! The image below shows a line you might see on your pull request after the Action finishes running.<br>
-   <img alt="screenshot of an example of an actions line" src="/images/Actions-to-step-4.png"/>
+测试与二次开发统一使用 [tests/params.py](tests/params.py)：
 
-</details>
+```python
+from tests import params
 
-<!-- 
-  <<< Author notes: Step 4 >>> 
-  Just a historic note: The previous version of this step required responding
-  to a pull request review before merging. The previous version also handled
-  if users accidentally closed without merging.
--->
+params.ROBOT_PARAMS.update({"robot_radius": 0.22, "vision_range": 1.4, "vision_rays": 61})
+params.BATTERY_PARAMS.update({"battery_low": 25.0, "battery_resume": 75.0})
+params.MOWING_PARAMS.update({"mowing_mode": "B", "lane_spacing": 0.28, "ring_margin": 0.50})
+params.apply_params()          # 立即应用到 world / robot_car / planner / tasks / grid_map
+params.reset_params()          # 恢复默认值
+```
 
-<details id=4>
-<summary><h2>Step 4: Merge your pull request</h2></summary>
+可配置项包括车体半径/割草宽度/轮距、最大速度、视觉 FOV/量程/射线数、低电与恢复阈值、充电速率、耗电系数、A/B 模式、边缘内缩、沿边速度、内直角前移、弓字间距、绕障余量、最小区块面积、大小障碍物分类阈值等。生产环境也可以通过 `backend/config.py` 的 `configure(...)` 使用同一套配置。
 
-_Nicely done friend! :sunglasses:_
+## 界面模块
 
-You successfully created a pull request. You can now merge your pull request.
+- 顶栏“主题”下拉框提供 **深色 / 浅色 / 暖色** 三种配色，选择保存在浏览器 localStorage；面板、按钮、地图画布（背景、网格、区域、路径、障碍）都会跟随切换。
+- 顶部“模块”菜单可显示/隐藏遥测、手动控制、区域覆盖、事件日志、参数设置。
+- 各非核心面板标题左侧有 `⋮⋮` 拖动手柄，可自由拖动位置；布局与显示状态保存在浏览器 localStorage。
+- **参数**面板为参数主界面，内部分为三个子页签，页签选择会记忆到 localStorage：
+  - **机器人实体**：车体半径、割草宽度、最大速度、充电桩半径、弓字间距、边缘内缩、沿边速度、内直角前移、绕障余量，以及“电源”分组（低电回充、恢复电量、耗电系数）。
+  - **传感器**：视觉 FOV、视觉量程、视觉射线数（对应“参数 / 传感器 / 视觉”三级结构）。
+  - **地图**：最小区块面积、大型障碍阈值，以及真实 PGM 地图的选择文件/选择目录导入入口。
+- **事件日志**固定在界面最下方，标题栏显示条数，右侧按钮可在“收起/展开”之间切换；同样受“模块”菜单的事件日志开关控制。
+- 任务栏中显示边界建图、总覆盖（两位小数）、总路程（整数 m）、任务时长（整数 mm:ss）；运行里程和运行时长也按整数显示。
 
-**What is a _merge_**: A [merge](https://docs.github.com/en/get-started/quickstart/github-glossary#merge) adds the changes in your pull request and branch into the `main` branch.
-<br>:tv: [Video: Understanding the GitHub flow](https://www.youtube.com/watch?v=PBI2Rz-ZOxU)
+## 测试
 
-As noted in the previous step, you may have seen evidence of an action running which automatically progresses your instructions to the next step. You'll have to wait for it to finish before you can merge your pull request. It will be ready when the merge pull request button is green.
+```bash
+cd robot
+python3 -m unittest discover -s tests -v
+```
 
-![screenshot of green merge pull request button](/images/Green-merge-pull-request.png)
-### :keyboard: Activity: Merge the pull request
+覆盖运动学、视觉量程/FOV、建图边界、自动分区、A* 避障、大小不规则障碍物分类、弓字排序、环形边界裁剪、A/B 模式流程、孤岛脱离、低电/手动回充与断点续作、地图切换、真实 PGM 地图导入和 HTTP 接口。
 
-1. Click **Merge pull request**.
-1. Click **Confirm merge**.
-1. Once your branch has been merged, you don't need it anymore. To delete this branch, click **Delete branch**.<br>
-   <img alt="screenshot showing delete branch button" src="/images/delete-branch.png"/>
-2. Check out the **Finish** step to see what you can learn next!<br>
-   **Note**: Like before, you can wait about 20 seconds, then refresh this page (the one you're following instructions from) and [GitHub Actions](https://docs.github.com/en/actions) will automatically close this step and open the next one.
+### A/B 整图效率基准
 
-</details>
+`tests/benchmark_modes.py` 会对 5 张地图分别执行起点附近随机开阔位置、随机区域顺序的整图割草任务，A/B 两种模式使用相同起点和顺序。默认 11 次 × 5 图 × 2 模式 = **110 次整图试验**，并输出成功率、平均/中位/P95 时长、平均路程、平均覆盖率和碰撞统计。
 
-<!-- 
-  <<< Author notes: Finish >>> 
-  Review what we learned, ask for feedback, provide next steps.
--->
+```bash
+cd robot
+python3 tests/benchmark_modes.py --trials 11 --workers 8
+```
 
-<details id=X>
-<summary><h2>Finish</h2></summary>
+结果保存到 `/tmp/mode_benchmark_full.json`。
 
-_Congratulations friend, you've completed this course and joined the world of developers!_
-
-<img src=https://octodex.github.com/images/collabocats.jpg alt=celebrate width=300 align=right>
-
-Here's a recap of your accomplishments:
-
-- You learned about GitHub, repositories, branches, commits, and pull requests.
-- You created a branch, a commit, and a pull request.
-- You merged a pull request.
-- You made your first contribution! :tada:
-
-### What's next?
-
-  If you'd like to make a profile README, use the simplified instructions below or follow the instructions in the [Managing your profile README](https://docs.github.com/account-and-profile/setting-up-and-managing-your-github-profile/customizing-your-profile/managing-your-profile-readme) article.
-  1. Make a new public repository with a name that matches your GitHub username.
-  2. Create a file named `README.md` in its root. The "root" means not inside any folder in your repository.
-  3. Edit the contents of the `README.md` file.
-  4. If you created a new branch for your file, open and merge a pull request on your branch.
-  5. We'd love to see your new profile! Share your profile on social media and tag us!
-  6. Lastly, we'd love to hear what you thought of this course [in our discussion board](https://github.com/skills/.github/discussions).
-
-Check out these resources to learn more or get involved:
-- Are you a student? Check out the [Student Developer Pack](https://education.github.com/pack).
-- [Take another GitHub Skills course](https://github.com/skills).
-- [Read the GitHub Getting Started docs](https://docs.github.com/en/get-started).
-- To find projects to contribute to, check out [GitHub Explore](https://github.com/explore).
-
-</details>
-
-<!--
-  <<< Author notes: Footer >>>
-  Add a link to get support, GitHub status page, code of conduct, license link.
--->
-
----
-
-Get help: [Post in our discussion board](https://github.com/skills/.github/discussions) &bull; [Review the GitHub status page](https://www.githubstatus.com/)
-
-&copy; 2022 GitHub &bull; [Code of Conduct](https://www.contributor-covenant.org/version/2/1/code_of_conduct/code_of_conduct.md) &bull; [CC-BY-4.0 License](https://creativecommons.org/licenses/by/4.0/legalcode)
+`tests/benchmark_single_zone.py` 保留了早期单区域快速对比脚本。
