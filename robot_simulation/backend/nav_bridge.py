@@ -8,6 +8,7 @@
 """
 
 import math
+import time
 
 import nav_bus
 import world
@@ -53,6 +54,7 @@ class NavBridge(object):
         self.last_cmd = None
         self._cmd_at = None
         self._map_at = None
+        self._map_wall_at = None
 
     # --------------------------------------------------------- 仿真输入
     def tick(self, manager=None):
@@ -118,9 +120,14 @@ class NavBridge(object):
         self.planner.publish_pose()
         self.dock.publish_pose()
 
-        if self._map_at is None or now - self._map_at >= 2.0:
-            self._map_at = now
+        # publish_map 会按整张栅格生成 OccupancyGrid，高倍速下按仿真时间 2 s 触发会变成
+        # 每帧一次；这里改成按真实时间 1 s 节流，只影响界面/节点观测，不影响规划。
+        wall = time.monotonic()
+        if self._map_wall_at is None or wall - self._map_wall_at >= 1.0:
+            self._map_wall_at = wall
             if self.region.bus.last("map_info") is None and self.grid.zones:
+                self.region.publish_map()
+            elif self.grid.zones:
                 self.region.publish_map()
 
     def _zone_area(self, manager):

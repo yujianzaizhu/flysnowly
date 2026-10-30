@@ -157,6 +157,36 @@ WORLD_VERSION = 0
 _WORLD_CACHE = {}
 
 
+SEG_BUCKET = 1.5
+_SEG_BUCKETS = {}
+
+
+def _bucket_index(x, y):
+    return int(math.floor(x / SEG_BUCKET)), int(math.floor(y / SEG_BUCKET))
+
+
+def _index_segment(buckets, segment):
+    ax, ay, bx, by = segment
+    i0 = int(math.floor(min(ax, bx) / SEG_BUCKET))
+    i1 = int(math.floor(max(ax, bx) / SEG_BUCKET))
+    j0 = int(math.floor(min(ay, by) / SEG_BUCKET))
+    j1 = int(math.floor(max(ay, by) / SEG_BUCKET))
+    for i in range(i0, i1 + 1):
+        for j in range(j0, j1 + 1):
+            buckets.setdefault((i, j), []).append(segment)
+
+
+def _rebuild_segment_index():
+    """把外墙/障碍物线段按 1.5 m 方格分桶，射线与墙面距离只查邻近桶。"""
+    global _SEG_BUCKETS
+    buckets = {}
+    for segment in POLYGON_SEGMENTS:
+        _index_segment(buckets, segment)
+    for segment in OBSTACLE_SEGMENTS:
+        _index_segment(buckets, segment)
+    _SEG_BUCKETS = buckets
+
+
 def clamp(value, low, high):
     return max(low, min(high, value))
 
@@ -263,6 +293,7 @@ def _rebuild_static_geometry():
         segment for polygon in STATIC_POLYGONS for segment in _segments(polygon)
     ]
     _refresh_dynamic_geometry()
+    _rebuild_segment_index()
 
 
 def _refresh_dynamic_geometry():
@@ -582,6 +613,27 @@ def _segments(polygon):
 
 
 def boundary_distance(x, y, polygon=None):
+    if polygon is None or polygon is POLYGON:
+        # 快速路径：只算邻近分桶里的外墙线段（远距离查询回退全量）
+        buckets = _SEG_BUCKETS
+        if buckets:
+            i, j = _bucket_index(x, y)
+            best = 1e9
+            for di in (-1, 0, 1):
+                row = buckets.get((i + di, j))
+                for segment in row or ():
+                    distance = _segment_distance(x, y, *segment)
+                    if distance < best:
+                        best = distance
+            for jj in (j - 1, j + 1):
+                for di in (-1, 0, 1):
+                    col = buckets.get((i + di, jj))
+                    for segment in col or ():
+                        distance = _segment_distance(x, y, *segment)
+                        if distance < best:
+                            best = distance
+            if best <= SEG_BUCKET:
+                return best
     polygon = POLYGON if polygon is None else polygon
     best = 1e9
     count = len(polygon)
@@ -623,22 +675,56 @@ def _ray_circle(px, py, dx, dy, cx, cy, radius):
 
 
 def raycast(x, y, angle, max_range=None):
-    max_range = VISION_RANGE if max_range is None else max_range
-    dx, dy = math.cos(angle), math.sin(angle)
-    best = max_range
-    for ax, ay, bx, by in POLYGON_SEGMENTS:
-        hit = _ray_segment(x, y, dx, dy, ax, ay, bx, by)
-        if hit is not None:
-            best = min(best, hit)
+    """射线求交（内联几何运算，热路径上省掉函数调用开销）。"""
+    limit = VISION_RANGE if max_range is None else max_range
+    dx = math.cos(angle)
+    dy = math.sin(angle)
+    best = limit
+    # 墙面线段（只查射线覆盖范围内的分桶）
+    buckets = _SEG_BUCKETS
+    if buckets:
+        i0 = int(math.floor((x - limit) / SEG_BUCKET))
+        i1 = int(math.floor((x + limit) / SEG_BUCKET))
+        j0 = int(math.floor((y - limit) / SEG_BUCKET))
+        j1 = int(math.floor((y + limit) / SEG_BUCKET))
+        segments = []
+        for i in range(i0, i1 + 1):
+            for j in range(j0, j1 + 1):
+                row = buckets.get((i, j))
+                if row:
+                    segments.extend(row)
+    else:
+        segments = POLYGON_SEGMENTS + OBSTACLE_SEGMENTS
+    for ax, ay, bx, by in segments:
+        ex = bx - ax
+        ey = by - ay
+        denom = dx * ey - dy * ex
+        if denom > -1e-9 and denom < 1e-9:
+            continue
+        qx = ax - x
+        qy = ay - y
+        t = (qx * ey - qy * ex) / denom
+        if t <= 1e-6 or t >= best:
+            continue
+        u = (qx * dy - qy * dx) / denom
+        if -1e-9 <= u <= 1.0 + 1e-9:
+            best = t
+    # 障碍物圆
     for ox, oy, radius in OBSTACLES:
-        hit = _ray_circle(x, y, dx, dy, ox, oy, radius)
-        if hit is not None:
-            best = min(best, hit)
-    for ax, ay, bx, by in OBSTACLE_SEGMENTS:
-        hit = _ray_segment(x, y, dx, dy, ax, ay, bx, by)
-        if hit is not None:
-            best = min(best, hit)
-    return clamp(best, 0.0, max_range)
+        fx = x - ox
+        fy = y - oy
+        b = fx * dx + fy * dy
+        c = fx * fx + fy * fy - radius * radius
+        disc = b * b - c
+        if disc < 0.0:
+            continue
+        root = math.sqrt(disc)
+        hit = -b - root
+        if hit <= 1e-6:
+            hit = -b + root
+        if 1e-6 < hit < best:
+            best = hit
+    return best if best < limit else limit
 
 
 def vision_scan(x, y, theta, fov=None, max_range=None, rays=None):

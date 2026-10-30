@@ -11,7 +11,7 @@ import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -112,6 +112,14 @@ class Simulator(threading.Thread):
         with self.lock:
             self.manager = manager
 
+    def step_size(self):
+        """按倍速自适应积分步长：高倍速时用更大步长，避免每个 20 ms 都跑一遍全量计算。"""
+        if self.speed <= 4:
+            return self.tick_size
+        if self.speed <= 16:
+            return max(self.tick_size, 0.025)
+        return max(self.tick_size, 0.033)
+
     def run(self):
         last = time.monotonic()
         accumulator = 0.0
@@ -119,18 +127,24 @@ class Simulator(threading.Thread):
             now = time.monotonic()
             elapsed = min(0.2, max(0.0, now - last))
             last = now
+            tick = self.step_size()
             accumulator += elapsed * self.speed
+            # 卡顿后不要一次性补太多仿真时间（最多补 4 步），避免"时间突进"
+            if accumulator > tick * 4:
+                accumulator = tick * 4
             steps = 0
+            budget = max(8, int(0.25 / tick))
             try:
                 with self.lock:
                     manager = self.manager
-                    while accumulator >= self.tick_size and steps < 40:
-                        manager.tick(self.tick_size)
-                        accumulator -= self.tick_size
+                    while accumulator >= tick and steps < budget:
+                        manager.tick(tick)
+                        accumulator -= tick
                         steps += 1
             except Exception:
                 traceback.print_exc()
-            self._stop_event.wait(0.005)
+            # 1 ms 节拍：保证高倍速时每轮累积的仿真时间足以跨过一步，不会因节拍太粗掉速
+            self._stop_event.wait(0.001)
 
     def stop(self):
         self._stop_event.set()
@@ -144,7 +158,9 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == "/api/state":
-            self._send_json(self._state())
+            query = parse_qs(urlsplit(self.path).query)
+            with_map = (query.get("map") or ["1"])[0] not in ("0", "false", "")
+            self._send_json(self._state(include_map=with_map))
         elif path == "/api/world":
             self._send_json(world.world_dict())
         elif path == "/api/nav/config":
@@ -418,8 +434,8 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
             elif cmd in (nav_bus.ACTION_CANCEL, nav_bus.ACTION_FINISHED):
                 manager.stop_task("planner 节点请求结束任务", resumable=False)
 
-    def _state(self):
-        state = self.server.manager.get_state()
+    def _state(self, include_map=True):
+        state = self.server.manager.get_state(include_map=include_map)
         state["speed"] = self.server.simulator.speed
         state["map_id"] = world.MAP_ID
         state["map_name"] = world.MAP_NAME

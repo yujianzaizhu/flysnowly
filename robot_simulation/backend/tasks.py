@@ -150,6 +150,9 @@ class TaskManager(object):
         self.no_go_ring_exit = None
         self.no_go_ring_exit_point = None
         self.no_go_ring_last = None
+        self._edge_len_key = None
+        self._edge_len_value = 0.0
+        self._map_cache = None
         self.ring_points = []
         self.ring_index = 0
         self.ring_after = None
@@ -170,6 +173,7 @@ class TaskManager(object):
 
         self.mapping_done = False
         self.map_path = []
+        self._map_hash = {}
         self.map_path_dist = 0.0
         self.map_islands = []
         self.map_seek_log_time = 0.0
@@ -428,6 +432,7 @@ class TaskManager(object):
             # 优先沿历史路径倒车脱困；失败时再执行原来的远离障碍方向脱离。
             if self._begin_escape("map_follow"):
                 self.map_path = []
+                self._map_hash = {}
                 self.map_path_dist = 0.0
                 self.stuck_time = 0.0
                 self.stuck_ref = None
@@ -444,6 +449,7 @@ class TaskManager(object):
             self.map_escape_time = 0.0
             self.map_escape_dist = 0.0
             self.map_path = []
+            self._map_hash = {}
             self.map_path_dist = 0.0
             self.phase = "map_escape"
             self.last_phase = None
@@ -544,6 +550,7 @@ class TaskManager(object):
                 self.last_phase = None
                 return
             self.map_path = []
+            self._map_hash = {}
             self.map_path_dist = 0.0
             self.phase = "map_seek"
         elif resume == "zone_edge":
@@ -679,20 +686,46 @@ class TaskManager(object):
         v, w = self._follow_surface(MAP_SPEED, desired)
         x, y, _ = self._pose()
         if not self.map_path:
-            self.map_path.append((x, y))
+            self._append_map_point(x, y)
         else:
             last_x, last_y = self.map_path[-1]
             moved = math.hypot(x - last_x, y - last_y)
             if moved > 0.08:
-                self.map_path.append((x, y))
+                self._append_map_point(x, y)
                 self.map_path_dist += moved
                 if len(self.map_path) > 4000:
                     del self.map_path[:1000]
+                    self._rebuild_map_hash()
 
         result = self._check_mapping_loop()
         if result is not None:
             return 0.0, 0.0
         return v, w
+
+    MAP_HASH_CELL = 0.3
+
+    def _append_map_point(self, x, y):
+        index = len(self.map_path)
+        self.map_path.append((x, y))
+        key = (int(x / self.MAP_HASH_CELL), int(y / self.MAP_HASH_CELL))
+        bucket = self._map_hash.get(key)
+        if bucket is None:
+            self._map_hash[key] = [index]
+        else:
+            bucket.append(index)
+
+    def _rebuild_map_hash(self):
+        self._map_hash = {}
+        for index, point in enumerate(self.map_path):
+            key = (
+                int(point[0] / self.MAP_HASH_CELL),
+                int(point[1] / self.MAP_HASH_CELL),
+            )
+            bucket = self._map_hash.get(key)
+            if bucket is None:
+                self._map_hash[key] = [index]
+            else:
+                bucket.append(index)
 
     def _check_mapping_loop(self):
         path = self.map_path
@@ -711,7 +744,19 @@ class TaskManager(object):
             self._escape_island(path)
             return "island"
 
-        for index in range(len(path) - 20):
+        bx = int(x / self.MAP_HASH_CELL)
+        by = int(y / self.MAP_HASH_CELL)
+        candidates = []
+        for dc in (-1, 0, 1):
+            for dr in (-1, 0, 1):
+                bucket = self._map_hash.get((bx + dc, by + dr))
+                if bucket:
+                    candidates.extend(bucket)
+        candidates.sort()
+        limit = len(path) - 20
+        for index in candidates:
+            if index >= limit:
+                continue
             previous = path[index]
             if math.hypot(x - previous[0], y - previous[1]) < 0.30:
                 segment = path[index:]
@@ -776,6 +821,7 @@ class TaskManager(object):
         self.map_escape_dist = 0.0
         self.phase = "map_escape"
         self.map_path = []
+        self._map_hash = {}
         self.map_path_dist = 0.0
         self._log("warn", "识别到孤岛，已脱离并重新寻找真正的场地边界")
 
@@ -807,6 +853,7 @@ class TaskManager(object):
         self.mapping_done = True
         # 建图结束后不再保留巡边进度，避免之后回充/恢复任务时又回到巡边阶段。
         self.map_path = []
+        self._map_hash = {}
         self.map_path_dist = 0.0
         self.map_islands = []
         if self.breakpoint and str(self.breakpoint.get("phase", "")).startswith("map"):
@@ -1006,8 +1053,14 @@ class TaskManager(object):
         )
 
     def _edge_time_limit(self):
-        length = _path_length(self.edge_points) if self.edge_points else 0.0
-        expected = length / max(0.20, EDGE_SPEED)
+        points = self.edge_points
+        if not points:
+            return 120.0
+        key = (len(points), points[0], points[-1])
+        if key != self._edge_len_key:
+            self._edge_len_key = key
+            self._edge_len_value = _path_length(points)
+        expected = self._edge_len_value / max(0.20, EDGE_SPEED)
         return world.clamp(expected * 2.2 + 30.0, 120.0, 600.0)
 
     def _edge_step(self):
@@ -2652,6 +2705,16 @@ class TaskManager(object):
         self.phase = "ring"
 
     # ----------------------------------------------------------- 充电与断点
+    def _map_payload(self):
+        """栅格位图按 version 缓存：同一版本重复取状态时不再重新编码。"""
+        version = self.grid.version
+        cached = self._map_cache
+        if cached is not None and cached[0] == version:
+            return cached[1]
+        payload = self.grid.encode()
+        self._map_cache = (version, payload)
+        return payload
+
     def _log_task_summary(self):
         """任务完成时把各类指标写进事件日志。"""
         task = self.task or {}
@@ -2861,7 +2924,7 @@ class TaskManager(object):
             self.phase = "idle"
 
     # ----------------------------------------------------------- 状态输出
-    def get_state(self):
+    def get_state(self, include_map=True):
         with self.lock:
             state = self.robot.get_state()
             zone_list = []
@@ -2946,7 +3009,7 @@ class TaskManager(object):
                 task=task,
                 zones=zone_list,
                 obstacles=self.grid.obstacle_circles(None),
-                map=self.grid.encode(),
+                map=self._map_payload() if include_map else None,
                 world=world.world_dict(),
                 route=[[round(p[0], 2), round(p[1], 2)] for p in self.route],
                 segments=[

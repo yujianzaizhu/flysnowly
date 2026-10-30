@@ -288,7 +288,10 @@
     }
     lastBump = state.collisions;
 
-    updateMapImage(state.map);
+    if (state.map) {
+      lastMapPayload = state.map;
+      updateMapImage(state.map);
+    }
     updatePanels(state);
   }
 
@@ -297,16 +300,22 @@
     els.linkChip.className = "chip " + (connected ? "chip--ok" : "chip--down");
   }
 
+  let mapPollTick = 0;
+  let lastMapPayload = null;
+
   async function poll() {
+    const speed = current && current.speed ? current.speed : 1;
+    const fast = speed >= 4;
+    // 高倍速时位图 71 KB，隔几次轮询取一次，其余只取状态
+    mapPollTick += 1;
+    const withMap = !fast || mapPollTick % 4 === 0;
     try {
-      const state = await request("/api/state");
+      const state = await request("/api/state" + (withMap ? "" : "?map=0"));
       ingest(state);
       setConnected(true);
     } catch (error) {
       setConnected(false);
     }
-    const speed = current && current.speed ? current.speed : 1;
-    const fast = speed >= 4;
     interpMs = fast ? POLL_MS_FAST : POLL_MS;
     window.setTimeout(poll, fast ? POLL_MS_FAST : POLL_MS);
   }
@@ -1140,7 +1149,7 @@
     drawGroundBoundary(geom, world.polygon || []);
 
     if (state) {
-      drawMap(geom, state.map);
+      drawMap(geom, state.map || lastMapPayload);
       drawZones(geom, state.zones || []);
       drawGroundObstacles(
         geom,

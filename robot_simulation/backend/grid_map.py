@@ -161,38 +161,52 @@ class GridMap(object):
             self.data[index] = FREE
             self.data_version += 1
 
+    def _fill_rows(self, buffer, center_col, center_row, half, value=1):
+        """按行切片把 (center ± half) 的方块写进 buffer，比逐格循环快很多。
+
+        返回是否真的改动了内容（用于 data_version 失效判断）。
+        """
+        cols = self.cols
+        c0 = center_col - half
+        c1 = center_col + half + 1
+        if c0 < 0:
+            c0 = 0
+        if c1 > cols:
+            c1 = cols
+        if c1 <= c0:
+            return False
+        r0 = center_row - half
+        r1 = center_row + half + 1
+        if r0 < 0:
+            r0 = 0
+        if r1 > self.rows:
+            r1 = self.rows
+        span = c1 - c0
+        fill = bytes((value,)) * span
+        changed = False
+        for row in range(r0, r1):
+            base = row * cols + c0
+            if buffer[base:base + span] != fill:
+                buffer[base:base + span] = fill
+                changed = True
+        return changed
+
     def mark_occupied(self, col, row):
         if not self.in_bounds(col, row):
             return
-        changed = False
-        for dc in (-1, 0, 1):
-            for dr in (-1, 0, 1):
-                c, r = col + dc, row + dr
-                if not self.in_bounds(c, r):
-                    continue
-                index = self.index(c, r)
-                if self.data[index] != OCCUPIED:
-                    self.data[index] = OCCUPIED
-                    changed = True
-                self._block_around(c, r)
-                self._block_mow_around(c, r)
+        # 3×3 占据块 + 对应膨胀：按行切片写入（等价于原来逐格 9×(5×5) 的写法）
+        changed = self._fill_rows(self.data, col, row, 1, OCCUPIED)
+        self._fill_rows(self.blocked, col, row, 1 + INFLATE_CELLS)
+        self._fill_rows(self.mow_blocked, col, row, 1 + MOW_INFLATE_CELLS)
         self.version += 1
         if changed:
             self.data_version += 1
 
     def _block_around(self, col, row):
-        for dc in range(-INFLATE_CELLS, INFLATE_CELLS + 1):
-            for dr in range(-INFLATE_CELLS, INFLATE_CELLS + 1):
-                c, r = col + dc, row + dr
-                if self.in_bounds(c, r):
-                    self.blocked[self.index(c, r)] = 1
+        self._fill_rows(self.blocked, col, row, INFLATE_CELLS)
 
     def _block_mow_around(self, col, row):
-        for dc in range(-MOW_INFLATE_CELLS, MOW_INFLATE_CELLS + 1):
-            for dr in range(-MOW_INFLATE_CELLS, MOW_INFLATE_CELLS + 1):
-                c, r = col + dc, row + dr
-                if self.in_bounds(c, r):
-                    self.mow_blocked[self.index(c, r)] = 1
+        self._fill_rows(self.mow_blocked, col, row, MOW_INFLATE_CELLS)
 
     def stamp_obstacle(self, cx, cy, radius):
         """把已确认的圆形障碍物写入栅格，供割草与导航精确避让。"""
@@ -229,28 +243,40 @@ class GridMap(object):
         data = self.data
         changed_data = False
 
-        def mark_free_grid(px, py):
-            nonlocal changed_data
-            col = int(px / cell)
-            row = int(py / cell)
+        # 自由区采样：内联 + 步进累加，避免每条射线每格都调用一次函数（建图期占一半开销）
+        need_free = not self.mask_ready
+        if need_free:
+            col = int(x / cell)
+            row = int(y / cell)
             if 0 <= col < cols and 0 <= row < rows:
                 index = row * cols + col
                 if data[index] == UNKNOWN:
                     data[index] = FREE
                     changed_data = True
-
-        if not self.mask_ready:
-            mark_free_grid(x, y)
-        # 每格采样一次即可；0.05 m 采样会在同一栅格内重复写入多次。
         step = cell
+        limit = max_range - 1e-6
         for relative, distance in readings:
             heading = theta + relative
-            dx, dy = math.cos(heading), math.sin(heading)
-            if not self.mask_ready:
+            dx = math.cos(heading)
+            dy = math.sin(heading)
+            if need_free:
                 samples = int(distance / step)
-                for index in range(1, samples + 1):
-                    mark_free_grid(x + dx * step * index, y + dy * step * index)
-            if distance < max_range - 1e-6:
+                if samples > 0:
+                    px = x
+                    py = y
+                    sx = dx * step
+                    sy = dy * step
+                    for _ in range(samples):
+                        px += sx
+                        py += sy
+                        c = int(px / cell)
+                        r = int(py / cell)
+                        if 0 <= c < cols and 0 <= r < rows:
+                            index = r * cols + c
+                            if data[index] == UNKNOWN:
+                                data[index] = FREE
+                                changed_data = True
+            if distance < limit:
                 px = x + dx * max(0.0, distance - 0.02)
                 py = y + dy * max(0.0, distance - 0.02)
                 before = self.data_version
