@@ -2,6 +2,7 @@
 
 import heapq
 import math
+import time
 
 import world
 
@@ -10,7 +11,10 @@ FREE = 1
 OCCUPIED = 2
 
 INFLATE_CELLS = 2
-MOW_INFLATE_CELLS = 2
+MOW_INFLATE_CELLS = 1
+# 已确认障碍物的盖章余量：刀盘/车体都要真的绕开，留 2 格（0.2 m），
+# 比整片涂抹小得多，又能避免弓字线贴着障碍物蹭过去发生碰撞。
+STAMP_INFLATE_CELLS = 2
 LARGE_OBSTACLE_EXTENT = 0.85
 LARGE_OBSTACLE_AREA = 5.0
 MAX_OBSTACLE_CELLS = 1200
@@ -48,6 +52,7 @@ class GridMap(object):
         self.mowed = bytearray(self.cols * self.rows)
         self.blocked = bytearray(self.cols * self.rows)
         self.mow_blocked = bytearray(self.cols * self.rows)
+        self.dyn_blocked = bytearray(self.cols * self.rows)
         self.free_mask = bytearray(self.cols * self.rows)
         self.mask_ready = False
         self.zones = []
@@ -209,10 +214,12 @@ class GridMap(object):
         self._fill_rows(self.mow_blocked, col, row, MOW_INFLATE_CELLS)
 
     def stamp_obstacle(self, cx, cy, radius):
-        """把已确认的圆形障碍物写入栅格，供割草与导航精确避让。"""
-        r_occ = radius
-        r_mow = radius + 0.25
-        r_block = radius + 0.32
+        """写入一个**已知**的圆形障碍（测试/显式给定几何时使用）。
+
+        视觉聚类得到的障碍请用 ``stamp_footprint``：按真实轮廓外扩，不整片抹圆。
+        """
+        r_mow = radius + 0.10
+        r_block = radius + 0.20
         col0, row0 = self.cell_of(cx - r_block - 0.1, cy - r_block - 0.1)
         col1, row1 = self.cell_of(cx + r_block + 0.1, cy + r_block + 0.1)
         changed = False
@@ -223,7 +230,7 @@ class GridMap(object):
                 x, y = self.center_of(col, row)
                 distance = math.hypot(x - cx, y - cy)
                 index = self.index(col, row)
-                if distance <= r_occ:
+                if distance <= radius:
                     if self.data[index] != OCCUPIED:
                         self.data[index] = OCCUPIED
                         changed = True
@@ -234,6 +241,101 @@ class GridMap(object):
         if changed:
             self.version += 1
             self.data_version += 1
+
+    def stamp_footprint(self, cx, cy, radius):
+        """按障碍物**实际占据的栅格**写入导航/刀盘层，不再用包围圆整片涂抹。
+
+        视觉聚类给出的圆只用于绕障几何（绕行起点、花瓣探明），不能当成障碍物体积
+        整片刷进栅格 —— 那样障碍物周围会多出一大圈假障碍，割草永远补不上。
+
+        这里用已探明占据栅格的**凸包**代表障碍物轮廓：只把观测到的轮廓围出来的
+        区域补成实心（视觉看不到的背面与内部空洞），再沿真实轮廓外扩必要的车体、
+        刀盘余量。凸包始终不大于包围圆，所以障碍物附近的窄带可以正常割到。
+
+        返回写入的栅格数，便于统计与调试。
+        """
+        pad = 0.30
+        col0, row0 = self.cell_of(cx - radius - pad, cy - radius - pad)
+        col1, row1 = self.cell_of(cx + radius + pad, cy + radius + pad)
+        col0, row0 = max(0, col0), max(0, row0)
+        col1, row1 = min(self.cols - 1, col1), min(self.rows - 1, row1)
+        if col1 - col0 < 2 or row1 - row0 < 2:
+            return 0
+
+        # 只取离聚类中心最近的那个连通块，避免把旁边另一处障碍或视觉噪点
+        # 一起包进同一个凸包（那会把两块之间的空地也涂成障碍）。
+        seed = None
+        best = None
+        for row in range(row0, row1 + 1):
+            for col in range(col0, col1 + 1):
+                if self.data[self.index(col, row)] != OCCUPIED:
+                    continue
+                x, y = self.center_of(col, row)
+                distance = math.hypot(x - cx, y - cy)
+                if best is None or distance < best:
+                    best = distance
+                    seed = (col, row)
+        if seed is None:
+            return 0
+        points = []
+        seen = {seed}
+        stack = [seed]
+        while stack:
+            col, row = stack.pop()
+            points.append((col, row))
+            for dc in (-1, 0, 1):
+                for dr in (-1, 0, 1):
+                    nc, nr = col + dc, row + dr
+                    if not (col0 <= nc <= col1 and row0 <= nr <= row1):
+                        continue
+                    if (nc, nr) in seen:
+                        continue
+                    if self.data[self.index(nc, nr)] != OCCUPIED:
+                        continue
+                    seen.add((nc, nr))
+                    stack.append((nc, nr))
+        if len(points) < 3:
+            return 0
+        hull = _convex_hull(sorted(points))
+        if len(hull) < 3:
+            return 0
+
+        # 逐行求凸包与扫描线的交点，填充两极之间的栅格
+        spans = {}
+        count = len(hull)
+        for index in range(count):
+            ac, ar = hull[index]
+            bc, br = hull[(index + 1) % count]
+            if ar == br:
+                continue
+            low, high = (ar, br) if ar < br else (br, ar)
+            for row in range(max(row0, low), min(row1, high) + 1):
+                t = (row - ar) / float(br - ar)
+                col = ac + (bc - ac) * t
+                span = spans.get(row)
+                if span is None:
+                    spans[row] = [col, col]
+                else:
+                    span[0] = min(span[0], col)
+                    span[1] = max(span[1], col)
+
+        changed = False
+        total = 0
+        for row, span in spans.items():
+            lo = max(col0, int(math.floor(span[0])))
+            hi = min(col1, int(math.ceil(span[1])))
+            for col in range(lo, hi + 1):
+                index = self.index(col, row)
+                if self.data[index] != OCCUPIED:
+                    self.data[index] = OCCUPIED
+                    changed = True
+                self._fill_rows(self.blocked, col, row, INFLATE_CELLS)
+                self._fill_rows(self.mow_blocked, col, row, STAMP_INFLATE_CELLS)
+                total += 1
+        if changed:
+            self.version += 1
+            self.data_version += 1
+        return total
 
     def update_from_scan(self, pose, readings, max_range):
         x, y, theta = pose
@@ -279,6 +381,9 @@ class GridMap(object):
             if distance < limit:
                 px = x + dx * max(0.0, distance - 0.02)
                 py = y + dy * max(0.0, distance - 0.02)
+                if world.in_dynamic_obstacle(px, py, 0.08):
+                    # 动态障碍物是移动物体，只进临时层，不能写进建图数据
+                    continue
                 before = self.data_version
                 self.mark_occupied(int(px / cell), int(py / cell))
                 changed_data = changed_data or self.data_version != before
@@ -308,42 +413,59 @@ class GridMap(object):
         start_col, start_row = self.cell_of(seed[0], seed[1])
         if not self.in_bounds(start_col, start_row):
             return False
-        stack = [(start_col, start_row)]
-        mask[self.index(start_col, start_row)] = 1
-        touched_border = False
+        cols = self.cols
+        rows = self.rows
+        data = self.data
+        start_index = self.index(start_col, start_row)
+        stack = [start_index]
+        mask[start_index] = 1
+        touched_border = col_border = False
+        if (
+            start_col == 0
+            or start_row == 0
+            or start_col == cols - 1
+            or start_row == rows - 1
+        ):
+            col_border = True
+        # 用下标而不是坐标元组做 DFS：实景图 7 万格时能省一半以上时间
+        offsets = (-cols - 1, -cols, -cols + 1, -1, 1, cols - 1, cols, cols + 1)
         while stack:
-            col, row = stack.pop()
-            if col == 0 or row == 0 or col == self.cols - 1 or row == self.rows - 1:
-                touched_border = True
-            for dc in (-1, 0, 1):
-                for dr in (-1, 0, 1):
-                    if dc == 0 and dr == 0:
+            current = stack.pop()
+            if not col_border:
+                col = current % cols
+                row = current // cols
+                if col == 0 or row == 0 or col == cols - 1 or row == rows - 1:
+                    touched_border = True
+            for offset in offsets:
+                nindex = current + offset
+                if nindex < 0 or nindex >= len(data):
+                    continue
+                if mask[nindex] or data[nindex] == OCCUPIED:
+                    continue
+                # 行偏移会跨行，必须校验列变化
+                if offset in (-1, 1):
+                    if (current % cols) + offset < 0 or (current % cols) + offset >= cols:
                         continue
-                    nc, nr = col + dc, row + dr
-                    if not self.in_bounds(nc, nr):
+                elif offset in (-cols - 1, -cols + 1, cols - 1, cols + 1):
+                    neighbor_col = nindex % cols
+                    if abs(neighbor_col - (current % cols)) != 1:
                         continue
-                    nindex = self.index(nc, nr)
-                    if mask[nindex] or self.data[nindex] == OCCUPIED:
-                        continue
-                    mask[nindex] = 1
-                    stack.append((nc, nr))
+                mask[nindex] = 1
+                stack.append(nindex)
+            if touched_border:
+                break
 
-        if touched_border:
+        # 场地多边形按行栅格化后一次性裁剪（逐格 point_in_polygon 在实景图上要十几秒）
+        inside = world.polygon_mask(self.cols, self.rows, self.cell)
+        if touched_border or not col_border:
             mask = bytearray(self.cols * self.rows)
-            for row in range(self.rows):
-                for col in range(self.cols):
-                    x, y = self.center_of(col, row)
-                    if world.point_in_polygon(x, y) and self.data[self.index(col, row)] != OCCUPIED:
-                        mask[self.index(col, row)] = 1
+            for index in range(self.cols * self.rows):
+                if inside[index] and self.data[index] != OCCUPIED:
+                    mask[index] = 1
         else:
-            # 用已构建的场地边界裁掉凹角处可能泄漏出去的少量栅格
-            for row in range(self.rows):
-                for col in range(self.cols):
-                    index = self.index(col, row)
-                    if mask[index]:
-                        x, y = self.center_of(col, row)
-                        if not world.point_in_polygon(x, y):
-                            mask[index] = 0
+            for index in range(self.cols * self.rows):
+                if mask[index] and not inside[index]:
+                    mask[index] = 0
 
         self.free_mask = mask
         self.mask_ready = True
@@ -511,20 +633,29 @@ class GridMap(object):
     def _component_distances(self, start, cells):
         from collections import deque
 
+        cols = self.cols
+        offsets = (-cols - 1, -cols, -cols + 1, -1, 1, cols - 1, cols, cols + 1)
+        size = cols * self.rows
         distances = {start: 0}
         queue = deque([start])
         while queue:
             index = queue.popleft()
-            col = index % self.cols
-            row = index // self.cols
-            for dc, dr, _cost in _NEIGHBORS:
-                nc, nr = col + dc, row + dr
-                if not self.in_bounds(nc, nr):
+            step = distances[index] + 1
+            col = index % cols
+            for offset in offsets:
+                nindex = index + offset
+                if nindex < 0 or nindex >= size:
                     continue
-                nindex = self.index(nc, nr)
+                if offset in (-1, 1):
+                    ncol = col + offset
+                    if ncol < 0 or ncol >= cols:
+                        continue
+                elif offset in (-cols - 1, -cols + 1, cols - 1, cols + 1):
+                    if abs(nindex % cols - col) != 1:
+                        continue
                 if nindex not in cells or nindex in distances:
                     continue
-                distances[nindex] = distances[index] + 1
+                distances[nindex] = step
                 queue.append(nindex)
         return distances
 
@@ -679,11 +810,37 @@ class GridMap(object):
         return bool(self.mow_blocked[self.index(col, row)])
 
     def cell_mowable(self, col, row):
-        if self.data[self.index(col, row)] == OCCUPIED:
+        index = self.index(col, row)
+        if self.data[index] == OCCUPIED:
             return False
-        if self.mask_ready and not self.free_mask[self.index(col, row)]:
+        if self.mask_ready and not self.free_mask[index]:
             return False
         return True
+
+    def apply_dynamic(self, circles):
+        """动态障碍物临时占据层：每 tick 重建，不写入建图数据（否则会留下永久"拖影"）。
+
+        只用于行进路径避让，不参与弓字线规划与可割判定 —— 移动物会让栅格每帧变化，
+        一旦参与规划就要不断重排弓字线，既拖慢速度又留下大量漏扫。
+        贴近时的制动由 ``TaskManager._guard_dynamic`` 负责。
+        """
+        self.dyn_blocked = bytearray(self.cols * self.rows)
+        marked = 0
+        for circle in circles or []:
+            cx = float(circle["x"])
+            cy = float(circle["y"])
+            radius = float(circle["r"])
+            r_block = radius + 0.30
+            col0, row0 = self.cell_of(cx - r_block - 0.1, cy - r_block - 0.1)
+            col1, row1 = self.cell_of(cx + r_block + 0.1, cy + r_block + 0.1)
+            for row in range(row0, row1 + 1):
+                for col in range(col0, col1 + 1):
+                    x, y = self.center_of(col, row)
+                    if math.hypot(x - cx, y - cy) > r_block:
+                        continue
+                    self.dyn_blocked[self.index(col, row)] = 1
+                    marked += 1
+        return marked
 
     def unmowed_components(self, zone_id, min_cells=1):
         """返回区域内未割草且可割草栅格的连通块。"""
@@ -729,9 +886,34 @@ class GridMap(object):
                     components.append(cells)
         return components
 
+    def release_blocked_disc(self, x, y, radius):
+        """放开某点周边导航层的膨胀（最后一招：车体卡在狭窄缝隙时给它一条出路）。
+
+        只清 ``blocked``（导航层），不动 ``data``（建图占据）和 ``mow_blocked``
+        （刀盘层），所以不会把障碍物当成空地去割。
+        """
+        col0, row0 = self.cell_of(x - radius, y - radius)
+        col1, row1 = self.cell_of(x + radius, y + radius)
+        released = 0
+        for row in range(row0, row1 + 1):
+            for col in range(col0, col1 + 1):
+                if not self.in_bounds(col, row):
+                    continue
+                cx, cy = self.center_of(col, row)
+                if math.hypot(cx - x, cy - y) > radius:
+                    continue
+                index = self.index(col, row)
+                if self.blocked[index] and self.data[index] != OCCUPIED:
+                    self.blocked[index] = 0
+                    released += 1
+        if released:
+            self.version += 1
+        return released
+
     def is_blocked_world(self, x, y):
         col, row = self.cell_of(x, y)
-        return bool(self.blocked[self.index(col, row)])
+        index = self.index(col, row)
+        return bool(self.blocked[index] or self.dyn_blocked[index])
 
     def is_open_world(self, x, y):
         col, row = self.cell_of(x, y)
@@ -752,6 +934,63 @@ class GridMap(object):
                 if self.in_bounds(c, r) and self.data[self.index(c, r)] == OCCUPIED:
                     return True
         return False
+
+    def explore_goal(self, pose, step=5, min_distance=2.0):
+        """找一个“还没探明、但紧贴已探明自由区”的栅格作为建图去向（只在自身栅格上搜索）。
+
+        建图被困在小区域时，用它把机器人引到最近的未探明边界：最近的更稳，
+        最远的往往要穿过还没探明的区域。
+        """
+        cols, rows = self.cols, self.rows
+        data = self.data
+        best = None
+        best_distance = None
+        x0, y0 = pose[0], pose[1]
+        step = max(2, int(step))
+        for row in range(step, rows - step, step):
+            base = row * cols
+            for col in range(step, cols - step, step):
+                if data[base + col] != UNKNOWN:
+                    continue
+                neighbour_free = False
+                for dc, dr in ((step, 0), (-step, 0), (0, step), (0, -step)):
+                    if data[(row + dr) * cols + col + dc] == FREE:
+                        neighbour_free = True
+                        break
+                if not neighbour_free:
+                    continue
+                x, y = self.center_of(col, row)
+                distance = math.hypot(x - x0, y - y0)
+                if distance < min_distance:
+                    continue
+                if best_distance is None or distance < best_distance:
+                    best_distance = distance
+                    best = (x, y)
+        return best
+
+    def boundary_distance_world(self, x, y):
+        """到最近“已探明占据栅格”的距离；用于避开已经贴住的墙根。"""
+        col, row = self.cell_of(x, y)
+        span = 3
+        best = span * self.cell
+        for dc in range(-span, span + 1):
+            for dr in range(-span, span + 1):
+                c, r = col + dc, row + dr
+                if not self.in_bounds(c, r):
+                    continue
+                if self.data[self.index(c, r)] != OCCUPIED:
+                    continue
+                cx, cy = self.center_of(c, r)
+                best = min(best, math.hypot(cx - x, cy - y))
+        return best
+
+    def relax_trail(self, points, radius=0.35):
+        """沿一条“机器人真的走过”的轨迹放开导航膨胀，保证原路可以退回。"""
+        changed = 0
+        for point in points:
+            if self.relax_around(point[0], point[1], radius):
+                changed += 1
+        return changed
 
     def relax_around(self, x, y, radius=0.30):
         """临时清除机器人所在位置的导航膨胀（机器人已证明该点可通行）。"""
@@ -867,6 +1106,9 @@ class GridMap(object):
                         if math.hypot(fx - cx, fy - cy) < 0.35:
                             cx, cy = fx, fy
                             radius = max(fr, radius - 0.06)
+                # 只观测到弧段时质心会偏移、半径偏大；用包围盒半宽收一下，
+                # 避免障碍物周围被"涂抹"出大片不可割区域。
+                radius = min(radius, 0.55 * extent + 0.06)
                 radius = max(0.20, min(radius, 2.00))
                 # 按拟合圆估算面积：小于 5 m² 的一律视为小型障碍物（绕障 + 花瓣探明）。
                 area = math.pi * radius * radius
@@ -883,7 +1125,15 @@ class GridMap(object):
         return circles
 
     # ----------------------------------------------------------- 规划
-    def plan(self, start, goal, allow_unknown=True):
+    def plan(
+        self,
+        start,
+        goal,
+        allow_unknown=True,
+        ignore_blocked=False,
+        max_expansions=40000,
+        time_budget=0.09,
+    ):
         start_col, start_row = self._nearest_open(start)
         goal_col, goal_row = self._nearest_open(goal)
         if start_col is None or goal_col is None:
@@ -900,9 +1150,13 @@ class GridMap(object):
         found = False
         expansions = 0
 
-        while open_heap and expansions < 40000:
+        deadline = time.monotonic() + max(0.0, time_budget)
+        while open_heap and expansions < max_expansions:
             _, current = heapq.heappop(open_heap)
             expansions += 1
+            if expansions & 0x1FF == 0 and time.monotonic() > deadline:
+                # 超时放弃：宁可这一轮找不到路，也不要把仿真线程卡住
+                return []
             if current == goal_index:
                 found = True
                 break
@@ -913,7 +1167,7 @@ class GridMap(object):
                 if not self.in_bounds(nc, nr):
                     continue
                 nindex = self.index(nc, nr)
-                if self.blocked[nindex]:
+                if not ignore_blocked and self.blocked[nindex]:
                     continue
                 cdata = self.data[nindex]
                 if cdata == OCCUPIED:
@@ -925,6 +1179,10 @@ class GridMap(object):
                     if not allow_unknown:
                         continue
                     extra = 0.45
+                elif ignore_blocked:
+                    # 忽略膨胀层时，膨涨区仍按“可疑”加一点代价，尽量走已探明走廊
+                    if self.blocked[nindex]:
+                        extra = 0.6
                 new_cost = cost_so_far[current] + step_cost + extra
                 if nindex not in cost_so_far or new_cost < cost_so_far[nindex] - 1e-9:
                     cost_so_far[nindex] = new_cost
@@ -948,7 +1206,7 @@ class GridMap(object):
         path.reverse()
         return self.smooth(path)
 
-    def plan_near(self, start, goal, zone_id=None):
+    def plan_near(self, start, goal, zone_id=None, max_expansions=60000, time_budget=0.06):
         """当目标点不可达时，规划到当前位置连通域内离目标最近的栅格。"""
         from collections import deque
 
@@ -969,9 +1227,12 @@ class GridMap(object):
         best_index = start_index
         best_distance = metric(start_index)
         expansions = 0
-        while queue and expansions < 80000:
+        deadline = time.monotonic() + max(0.0, time_budget)
+        while queue and expansions < max_expansions:
             current = queue.popleft()
             expansions += 1
+            if expansions & 0x3FF == 0 and time.monotonic() > deadline:
+                break
             col = current % self.cols
             row = current // self.cols
             distance = metric(current)
@@ -1058,7 +1319,7 @@ class GridMap(object):
         if not self.in_bounds(col, row):
             return False
         index = self.index(col, row)
-        if self.blocked[index]:
+        if self.blocked[index] or self.dyn_blocked[index]:
             return False
         if self.mask_ready and not self.free_mask[index]:
             return False

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>1.0.5 机器人控制台 · Mower Console</title>
+  <title>1.0.6 机器人控制台 · Mower Console</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='26' fill='%230b1020' stroke='%2337e0a0' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='9' fill='%2337e0a0'/%3E%3C/svg%3E" />
   <script>
     try {
@@ -19,12 +19,14 @@
   <header class="topbar">
     <div class="brand">
       <span class="brand-mark" aria-hidden="true"></span>
-      <span class="brand-title">1.0.5 机器人控制台</span>
+      <span class="brand-title">1.0.6 机器人控制台</span>
       <span class="brand-sub">Vision Mower Console</span>
     </div>
     <div class="status-chips">
       <span id="modeChip" class="chip chip--manual">待机</span>
       <span id="linkChip" class="chip chip--ok">已连接</span>
+      <button id="sidebarToggleBtn" class="chip chip--ghost" type="button" aria-pressed="false"
+        title="收起 / 展开左侧栏（遥测、参数）">◧ 侧栏</button>
       <label class="theme-picker" title="界面配色">
         主题
         <select id="themeSelect" aria-label="界面配色">
@@ -47,11 +49,32 @@
           <button id="resetLayoutBtn" type="button">重置布局</button>
         </div>
       </div>
+      <button id="popupBackBtn" class="chip chip--ghost" type="button" hidden
+        title="把独立窗口里的面板收回到主界面">收回弹窗</button>
+      <button id="exitBtn" class="chip chip--exit" type="button" title="退出控制台并关闭后端服务">退出</button>
     </div>
   </header>
 
+  <div id="exitOverlay" class="exit-overlay" hidden>
+    <div class="exit-card">
+      <h2>控制台已退出</h2>
+      <p id="exitTip">后端服务已关闭，端口已释放。</p>
+      <p id="exitHint" class="exit-hint" hidden>
+        浏览器不允许网页关闭由地址栏直接打开的标签页：请按
+        <kbd>Ctrl</kbd> + <kbd>W</kbd>（macOS 为 <kbd>⌘</kbd> + <kbd>W</kbd>），
+        或点击标签页右上角的 ×。
+      </p>
+      <button id="exitCloseBtn" class="task-btn task-btn--primary" type="button">关闭标签页</button>
+    </div>
+  </div>
+
   <main class="layout">
     <div class="sidebar">
+      <div class="sidebar-head">
+        <span class="sidebar-head-title">侧栏</span>
+        <button id="sidebarHandle" class="side-handle" type="button"
+          title="向左收起左侧栏">« 收起</button>
+      </div>
       <section class="panel panel--telemetry" data-module="telemetry" data-drag-panel="telemetry" aria-label="遥测数据">
         <h2><span class="drag-grip" data-drag-handle title="拖动模块">⋮⋮</span>遥测 <span>Telemetry</span></h2>
 
@@ -70,6 +93,8 @@
           <div class="metric"><span>航向角</span><strong id="heading">0°</strong><em>deg</em></div>
           <div class="metric"><span>累计里程</span><strong id="distance">0.00</strong><em>m</em></div>
           <div class="metric"><span>碰撞次数</span><strong id="collisions">0</strong><em>次</em></div>
+          <div class="metric" title="回充预留 = 到桩距离 × 0.65 %/m + 3%"><span>距充电桩</span><strong id="dockDistance">0.0</strong><em>m</em></div>
+          <div class="metric"><span>回充预留</span><strong id="dockReserve">--</strong><em>%</em></div>
           <div class="metric"><span>运行时长</span><strong id="simTime">0.0</strong><em>s</em></div>
         </div>
 
@@ -270,17 +295,35 @@
           <span><i class="dot dot--obstacle-large"></i>大障碍估计</span>
           <span><i class="dot dot--obstacle-small"></i>小障碍估计</span>
           <span><i class="dot dot--path"></i>规划路径</span>
+          <span><i class="dot dot--trail"></i>实际轨迹</span>
+          <span><i class="dot dot--jump"></i>跳线</span>
+          <span><i class="dot dot--costmap"></i>日志代价地图</span>
         </div>
         <div class="tips">滚轮缩放 · 拖动平移 · 双击复位 · 建图 → 割草 → 回充</div>
+        <figure id="bagVideo" class="bag-video" hidden>
+          <div class="bag-video-head">
+            <span id="bagVideoTitle" class="bag-video-title">GrassSegImg</span>
+            <span id="bagVideoMeta" class="bag-video-meta">--</span>
+            <span class="bag-video-tools">
+              <button id="bagVideoLargeBtn" type="button" title="放大 / 还原">⤢</button>
+              <button id="bagVideoPopBtn" type="button" title="在独立窗口中打开">⧉</button>
+              <button id="bagVideoCloseBtn" type="button" title="关闭图像窗口">×</button>
+            </span>
+          </div>
+          <img id="bagVideoImg" class="bag-video-img" alt="日志图像" />
+        </figure>
       </section>
     </div>
   </main>
+
+  <button id="sidebarTab" class="side-tab" type="button" title="展开左侧栏" hidden>»</button>
 
   <section class="log-dock" data-module="events" data-drag-panel="events" aria-label="事件日志与导航节点">
     <div class="log-dock-head">
       <div class="dock-tabs" role="tablist" aria-label="底部面板">
         <button class="dock-tab is-active" type="button" role="tab" data-dock-tab="events">事件日志 <span>Events</span></button>
         <button class="dock-tab" type="button" role="tab" data-dock-tab="nodes">导航节点 <span>Nav Nodes</span></button>
+        <button class="dock-tab" type="button" role="tab" data-dock-tab="bag">日志播放 <span>Bag Player</span></button>
       </div>
       <span id="logCount" class="log-dock-count">0 条</span>
       <button id="logToggleBtn" class="log-toggle" type="button" aria-expanded="true">收起</button>
@@ -299,6 +342,77 @@
         <div id="navNodeList" class="nav-node-list"></div>
         <div id="navStaticList" class="nav-topic-list nav-topic-list--col"></div>
         <div id="navTopicList" class="nav-topic-list nav-topic-list--col"></div>
+      </div>
+    </div>
+    <div class="dock-pane" data-dock-pane="bag">
+      <div class="bag-player">
+        <div class="bag-col bag-col--left">
+          <div class="bag-row bag-row--play">
+            <button id="bagLoadBtn" class="task-btn task-btn--primary" type="button">载入</button>
+            <button id="bagPlayBtn" class="task-btn" type="button">播放</button>
+            <button id="bagPauseBtn" class="task-btn" type="button">暂停</button>
+            <button id="bagStopBtn" class="task-btn task-btn--ghost" type="button">停止</button>
+            <button id="bagQueueBtn" class="task-btn" type="button" title="按勾选顺序连续播放">连续播放</button>
+            <label class="bag-speed" title="回放倍速（与顶部仿真倍速相乘）">倍速
+              <select id="bagSpeed">
+                <option value="1">1x</option>
+                <option value="2">2x</option>
+                <option value="4">4x</option>
+              </select>
+            </label>
+          </div>
+          <div class="bag-row bag-progress-row">
+            <input id="bagProgress" class="bag-progress" type="range" min="0" max="1000" value="0" step="1" />
+            <span id="bagTime" class="bag-time">0.0 / 0.0 s</span>
+          </div>
+          <div class="bag-current">
+            <span>当前日志</span>
+            <strong id="bagCurrentName">未载入</strong>
+            <span id="bagHint" class="bag-current-hint">选择日志后点“载入”，再点“播放”；勾选多个可“连续播放”。</span>
+          </div>
+          <div class="bag-row">
+            <label class="bag-label" for="bagFolder">日志文件夹</label>
+            <select id="bagFolder" class="bag-select"></select>
+            <button id="bagRefreshBtn" class="task-btn task-btn--ghost" type="button">刷新</button>
+            <button id="bagVideoToggleBtn" class="task-btn task-btn--ghost" type="button"
+              title="显示 / 隐藏日志图像窗口">图像窗口</button>
+            <button id="bagPopBtn" class="task-btn task-btn--ghost" type="button"
+              title="把日志播放放到独立窗口">独立窗口</button>
+          </div>
+          <div class="bag-row bag-row--all">
+            <label class="bag-all"><input id="bagSelectAll" type="checkbox" /> 全选</label>
+            <span id="bagOrderHint" class="bag-order-hint">按日志编号从大到小</span>
+          </div>
+          <div id="bagList" class="bag-list" role="listbox" aria-label="日志列表"></div>
+        </div>
+        <div class="bag-col bag-col--right">
+          <details class="bag-topics" open>
+            <summary>话题列表 <strong id="bagTopicCount">0</strong>
+              <em>勾掉的话题不再参与画面显示</em>
+            </summary>
+            <div id="bagTopicList" class="bag-topic-list"></div>
+          </details>
+          <div class="bag-fidelity">
+            <span id="bagFidelity" class="bag-fidelity-value">--</span>
+            <span class="bag-fidelity-label">仿真吻合度</span>
+            <span id="bagQueueInfo" class="bag-queue">队列 --</span>
+          </div>
+          <div class="bag-stats bag-stats--compact">
+            <span>误差 <strong id="bagErrAvg">--</strong> m</span>
+            <span>最大 <strong id="bagErrMax">--</strong> m</span>
+            <span>帧 <strong id="bagSamples">0</strong></span>
+            <span>重定位 <strong id="bagTeleports">0</strong></span>
+            <span>时长 <strong id="bagDuration">--</strong> s</span>
+            <span>轨迹 <strong id="bagPathLen">--</strong> m</span>
+            <span>位姿 <strong id="bagPoseCount">--</strong> 帧</span>
+          </div>
+          <div class="bag-stats bag-stats--compact bag-stats--dim">
+            <span>地图 <strong id="bagMapInfo">--</strong></span>
+            <span>代价地图 <strong id="bagCostInfo">--</strong></span>
+            <span>位姿话题 <strong id="bagTopic">--</strong></span>
+            <span>电量 <strong id="bagBatteryInfo">--</strong></span>
+          </div>
+        </div>
       </div>
     </div>
   </section>

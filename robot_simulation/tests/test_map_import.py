@@ -72,5 +72,24 @@ class MapImportTest(unittest.TestCase):
         self.assertGreaterEqual(len(definition["obstacles"]), 1)
 
 
+class OpenFieldTest(unittest.TestCase):
+    def test_open_field_has_no_boundary_obstacles(self):
+        definition = map_import.build_open_field(6.0, 30.0)
+        self.assertTrue(definition["open_field"])
+        self.assertGreaterEqual(definition["width"], map_import.OPEN_FIELD_MIN)
+        self.assertGreaterEqual(definition["height"], 30.0 + map_import.OPEN_FIELD_MARGIN - 1.0)
+        self.assertEqual(definition["obstacles"], [])
+        self.assertEqual(len(definition["polygon"]), 4)
+        self.assertAlmostEqual(definition["dock"]["x"], definition["width"] / 2.0, places=3)
+        self.assertAlmostEqual(definition["start"]["y"], definition["height"] / 2.0, places=3)
+
+    def test_open_field_covers_small_and_large_tracks(self):
+        small = map_import.build_open_field(0.2, 0.3)
+        large = map_import.build_open_field(28.0, 4.0)
+        self.assertAlmostEqual(small["width"], small["height"], places=3)
+        self.assertGreater(large["width"], small["width"])
+        self.assertGreaterEqual(large["width"], 28.0)
+
+
 if __name__ == "__main__":
     unittest.main()

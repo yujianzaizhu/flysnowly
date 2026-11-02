@@ -2,8 +2,10 @@
 
 import math
 import threading
+import time
 from collections import deque
 
+import bag_player
 import config
 import planner
 import world
@@ -15,14 +17,34 @@ MAX_ZONE_PLAN_PASSES = 30
 PATCH_MIN_CELLS = 20
 PATCH_MAX_CELLS = 900
 
+# 单次导航规划的时间预算（秒）：大图 A* 可能几百毫秒，必须限时，
+# 否则一帧里多次规划叠加会把仿真线程卡住
+ROUTE_PLAN_BUDGET = 0.05
+# 单个 tick 内所有 A* 的时间上限：超了就这一帧先不做规划，下一帧再说
+TICK_PLAN_BUDGET = 0.10
+# 建图找边界不是每帧都做（1.5 s 一次），可以给更宽的预算
+MAP_PLAN_BUDGET = 0.35
+# 回桩/换区域这类“低频但必须成功”的规划可以多花点时间（一帧卡顿总比回不去桩好）
+DOCK_PLAN_BUDGET = 0.35
+
 NAV_SPEED = 0.38
-MAP_SPEED = 0.50
+MAP_SPEED = 0.55
 MOW_SPEED = 0.48
 EDGE_SPEED = 0.50
 INNER_CORNER_ADVANCE = 0.16
 
 MIN_OUTER_AREA = 12.0
 ISLAND_AREA = 8.0
+
+# 回充电量预估：走到充电桩每米的耗电（%/m）与固定余量。
+# 依据 robot_car 的耗电模型回推：满速附近约 0.5 %/m，再乘 1.25 安全系数。
+RETURN_SOC_PER_METER = 0.65
+RETURN_SOC_MARGIN = 3.0
+# 建图巡边多久没有任何新边界进展就判定"困在小区域"
+MAP_STALL_SECONDS = 30.0
+MAP_DONE_DISCOVERY = 0.85
+# 巡边过程中边界已探明到这个比例就直接收尾（避免"建图完成了还在建图"）
+MAP_DONE_DISCOVERY_NOW = 0.98
 
 PHASE_LABELS = {
     "idle": "待机",
@@ -38,6 +60,7 @@ PHASE_LABELS = {
     "detour": "绕障并回到历史路径",
     "ring": "绕障碍物一周",
     "charge_go": "返回充电桩",
+    "replay": "日志回放",
     "charging": "充电中",
     "charge_return": "返回任务断点",
     "align": "对齐断点航向",
@@ -64,6 +87,8 @@ class TaskManager(object):
 
             nav = nav_bridge.NavBridge(robot, grid)
         self.nav = nav
+        self.replay = bag_player.BagReplay(robot)
+        self.battery_series = []
         self.lock = threading.RLock()
         self.task_serial = 0
         self._last_collisions = 0
@@ -162,6 +187,8 @@ class TaskManager(object):
         self.phase_time = 0.0
         self.last_phase = None
         self.stuck_time = 0.0
+        self._dyn_yield = False
+        self.dock_stuck = 0
         self.stuck_ref = None
         self.detour_start = None
         self.detour_distance = 0.0
@@ -177,6 +204,25 @@ class TaskManager(object):
         self.map_path_dist = 0.0
         self.map_islands = []
         self.map_seek_log_time = 0.0
+        self.map_last_discovery = 0.0
+        self.map_progress_time = 0.0
+        self.map_seek_goal = None
+        self.map_seek_goal_time = -99.0
+        self.map_seek_mode = False
+        self.map_seek_mode_time = 0.0
+        self.map_follow_side = 1
+        self.map_side_flips = 0
+        self.map_seek_route = []
+        self.map_seek_index = 0
+        self.map_seek_blacklist = []
+        self.map_seek_last_pose = None
+        self.map_seek_move_time = 0.0
+        self.map_seek_best = None
+        self.map_seek_progress_time = 0.0
+        self.route_from_history = False
+        self.route_loose = False
+        self.loose_plan_cooldown = 0.0
+        self.tick_plan_left = TICK_PLAN_BUDGET
         self.map_escape_heading = 0.0
         self.map_escape_time = 0.0
         self.map_escape_dist = 0.0
@@ -268,6 +314,109 @@ class TaskManager(object):
                 if self.nav is not None:
                     self.nav.finish_planner(False, reason)
 
+    # ----------------------------------------------------------- 日志回放
+    def load_replay(self, info, transform=None):
+        with self.lock:
+            state = self.replay.load(info, transform)
+            self.robot.ghost = False
+            # 电量跟着日志走：日志里有电量话题就按它显示，否则锁在 100% 不变
+            self.battery_series = list((info or {}).get("battery") or [])
+            if self.battery_series:
+                self.robot.battery_lock = None
+                self._apply_replay_battery()
+            else:
+                self.robot.battery_lock = 100.0
+                self.robot.battery = 100.0
+            return state
+
+    def _apply_replay_battery(self):
+        if not self.battery_series:
+            return
+        when = self.replay.time
+        best = self.battery_series[0]
+        for stamp, value in self.battery_series:
+            if stamp > when:
+                break
+            best = (stamp, value)
+        self.robot.battery = max(0.0, min(100.0, float(best[1])))
+
+    def start_replay(self):
+        with self.lock:
+            if self.task is not None:
+                self.stop_task("开始日志回放，当前任务已取消", resumable=False)
+            self._reset_state()
+            self.task = {"type": "replay", "mode": "replay"}
+            self.phase = "replay"
+            self.task_start_sim = self.robot.sim_time
+            self.robot.ghost = True
+            state = self.replay.start()
+            self._log(
+                "event",
+                "开始回放日志 {}：{} 个位姿，时长 {:.1f} s".format(
+                    self.replay.name or "",
+                    (self.replay.info or {}).get("summary", {}).get("poses", 0),
+                    self.replay.duration,
+                ),
+            )
+            return state
+
+    def pause_replay(self):
+        with self.lock:
+            return self.replay.pause()
+
+    def resume_replay(self):
+        with self.lock:
+            if self.task is None or self.task.get("type") != "replay":
+                self.task = {"type": "replay", "mode": "replay"}
+            self.phase = "replay"
+            self.robot.ghost = True
+            return self.replay.resume()
+
+    def seek_replay(self, time):
+        with self.lock:
+            return self.replay.seek(time)
+
+    def stop_replay(self):
+        with self.lock:
+            state = self.replay.stop()
+            self.robot.ghost = False
+            self.robot.battery_lock = None
+            self.task = None
+            self.phase = "idle"
+            self.last_phase = None
+            self._log("event", "结束日志回放")
+            return state
+
+    def clear_replay(self):
+        with self.lock:
+            self.replay.clear()
+            self.robot.ghost = False
+            self.robot.battery_lock = None
+            self.battery_series = []
+            if self.phase == "replay":
+                self.task = None
+                self.phase = "idle"
+                self.last_phase = None
+
+    def replay_image(self, time=None):
+        """当前回放时刻的日志图像（割草分割图等）。"""
+        if self.replay is None:
+            return None
+        when = self.replay.time if time is None else float(time)
+        return self.replay.image_at(when)
+
+    def replay_state(self, with_costmap=False):
+        state = self.replay.state()
+        state["phase"] = self.phase
+        state["maps"] = (self.replay.info or {}).get("map_summary") or {}
+        info = self.replay.info or {}
+        state["battery_topic"] = info.get("battery_topic")
+        state["battery_series"] = len(self.battery_series)
+        state["battery_locked"] = self.robot.battery_lock is not None
+        if with_costmap:
+            state["costmap"] = self.replay.costmap_at(self.replay.time)
+        return state
+
     def request_charge(self):
         with self.lock:
             if self.phase in ("charge_go", "charge_return", "charging"):
@@ -300,7 +449,10 @@ class TaskManager(object):
     # ----------------------------------------------------------- 主循环
     def tick(self, dt):
         with self.lock:
+            self.tick_plan_left = TICK_PLAN_BUDGET
             world.update_dynamic(dt)
+            if world.DYNAMIC:
+                self.grid.apply_dynamic(world.DYNAMIC)
             readings = self.robot.scan()
             pose = self._pose()
             self.grid.update_from_scan(pose, readings, world.VISION_RANGE)
@@ -309,8 +461,31 @@ class TaskManager(object):
             if self._prev_pose is not None:
                 step = math.hypot(pose[0] - self._prev_pose[0], pose[1] - self._prev_pose[1])
             self._prev_pose = pose
-            if step > 0.02 and self.phase != "escape":
-                self.history.append((pose[0], pose[1]))
+            if step > 0.0 and self.phase != "escape":
+                # 按距离而不是按 tick 记录：低速时单步位移可能不足 2 cm，
+                # 否则历史轨迹几乎为空，回充/脱困就没路可退。
+                if not self.history or math.hypot(
+                    pose[0] - self.history[-1][0], pose[1] - self.history[-1][1]
+                ) >= 0.12:
+                    self.history.append((pose[0], pose[1]))
+
+            if self.replay.active:
+                self.replay.tick(dt)
+                self._apply_replay_battery()
+                self.robot.step(dt)
+                self._update_progress(dt)
+                if self.replay.finished:
+                    self._log(
+                        "event",
+                        "日志回放结束：仿真吻合度 {:.1f}%（平均误差 {:.2f} m）".format(
+                            self.replay.fidelity() * 100.0,
+                            self.replay.error_sum / max(1, self.replay.samples),
+                        ),
+                    )
+                    self.stop_replay()
+                if self.nav is not None:
+                    self.nav.tick(self)
+                return
 
             self._check_battery()
             if self.task is None and self.phase == "idle":
@@ -318,6 +493,8 @@ class TaskManager(object):
             else:
                 controls = self._control(dt, step)
                 controls = self._guard_no_go(controls, step)
+                self._dyn_yield = False
+                controls = self._guard_dynamic(controls)
                 self.robot.drive(*controls)
             self.robot.step(dt)
 
@@ -344,6 +521,8 @@ class TaskManager(object):
 
     # 只在“反应式”运动阶段做禁区保护；路径导航阶段（to_zone/to_segment/回充）
     # 已经由栅格 blocked 层绕开禁区，再加保护会打断正常绕行。
+    DOCK_PHASES = ("to_dock", "charge_go", "charge_return")
+
     NO_GO_GUARD_PHASES = (
         "map_seek",
         "map_follow",
@@ -354,6 +533,20 @@ class TaskManager(object):
         "detour",
         "ring",
     )
+
+    DYNAMIC_YIELD_MARGIN = 0.34
+
+    def _guard_dynamic(self, controls):
+        """移动障碍物贴身时先制动让行，避免车体与移动物相撞后反复触发碰撞恢复。"""
+        if not controls or not world.DYNAMIC:
+            return controls
+        x, y = self.robot.pose[0], self.robot.pose[1]
+        for item in world.DYNAMIC:
+            limit = item["r"] + world.ROBOT_RADIUS + self.DYNAMIC_YIELD_MARGIN
+            if math.hypot(item["x"] - x, item["y"] - y) <= limit:
+                self._dyn_yield = True
+                return 0.0, 0.0
+        return controls
 
     def _guard_no_go(self, controls, step=0.0):
         """沿边/割草/绕障等所有运动阶段都不允许进入禁区。"""
@@ -396,16 +589,25 @@ class TaskManager(object):
         else:
             self.stuck_time += dt
 
-        if self.stuck_time > 4.0 and self.phase in (
+        if self._dyn_yield:
+            # 给动态障碍物让行属于正常停车，不能算卡滞，否则会触发无谓的脱困。
+            self.stuck_ref = None
+            self.stuck_time = 0.0
+        if self.stuck_time > 2.6 and self.phase in (
             "no_go_ring",
             "zone_edge",
             "zone_stripes",
             "ring",
             "detour",
             "to_zone",
+            "to_dock",
+            "charge_go",
+            "charge_return",
         ):
             self._recover_stuck()
-        if self.phase == "to_segment" and (self.phase_time > 10.0 or self.stuck_time > 3.0):
+        if self.phase == "to_segment" and not self._dyn_yield and (
+            self.phase_time > 10.0 or self.stuck_time > 3.0
+        ):
             self.replan_cooldown = 0.0
             if self._replan_route():
                 self.stuck_time = 0.0
@@ -463,6 +665,28 @@ class TaskManager(object):
             self.failed_segments.add(_segment_key(self.segment_plan or self.segment))
         if self.zone_escape_count < 3 and self._begin_escape(phase):
             self.zone_escape_count += 1
+            self.stuck_time = 0.0
+            self.stuck_ref = None
+            self.last_phase = None
+            return
+        if phase in self.DOCK_PHASES:
+            self.dock_stuck += 1
+            if self.dock_stuck <= 2:
+                self.phase = phase
+                self._set_route((world.DOCK["x"], world.DOCK["y"]), self.route_kind or "to_dock")
+                self.stuck_time = 0.0
+                self.stuck_ref = None
+                self.last_phase = None
+                return
+            # 连续脱困仍到不了桩：放开车体周边导航膨胀，给它一条出路再回桩
+            released = self.grid.release_blocked_disc(self._pose()[0], self._pose()[1], 0.75)
+            self._log(
+                "warn",
+                "回桩持续受阻，放开周边 {} 格膨胀后重新规划".format(released),
+            )
+            self.dock_stuck = 0
+            self.phase = phase
+            self._set_route((world.DOCK["x"], world.DOCK["y"]), self.route_kind or "to_dock")
             self.stuck_time = 0.0
             self.stuck_ref = None
             self.last_phase = None
@@ -564,6 +788,9 @@ class TaskManager(object):
         elif resume == "to_zone":
             self.phase = "to_zone"
             self._plan_to_zone_corner()
+        elif resume in self.DOCK_PHASES:
+            self.phase = resume
+            self._set_route((world.DOCK["x"], world.DOCK["y"]), self.route_kind or "to_dock")
         else:
             self.phase = "zone_plan"
         self.last_phase = None
@@ -581,6 +808,11 @@ class TaskManager(object):
             self.phase = "zone_plan"
             self.last_phase = None
 
+    def _return_reserve(self):
+        """按当前位置到充电桩的直线距离，估算"开回去需要多少电"（百分比）。"""
+        distance = getattr(self.robot, "dock_distance", 0.0)
+        return RETURN_SOC_MARGIN + distance * RETURN_SOC_PER_METER
+
     def _check_battery(self):
         if not self.task:
             return
@@ -588,16 +820,22 @@ class TaskManager(object):
             return
         if self.charge_reason:
             return
-        if self.robot.battery <= LOW_BATTERY:
-            self._save_breakpoint()
-            self.charge_reason = "low"
-            self.stats["charge_count"] += 1
-            self.phase = "charge_go"
-            self._log(
-                "warn",
-                "电量低于 {:.0f}%，保存任务并自动返回充电桩".format(LOW_BATTERY),
-            )
-            self._set_route((world.DOCK["x"], world.DOCK["y"]), "to_dock")
+        battery = self.robot.battery
+        reserve = self._return_reserve()
+        if battery > max(LOW_BATTERY, reserve):
+            return
+        self._save_breakpoint()
+        self.charge_reason = "low"
+        self.stats["charge_count"] += 1
+        self.phase = "charge_go"
+        if battery <= LOW_BATTERY:
+            message = "电量低于 {:.0f}%，保存任务并自动返回充电桩".format(LOW_BATTERY)
+        else:
+            message = (
+                "电量 {:.0f}% 仅够回桩（距桩 {:.0f} m 需预留 {:.0f}%），提前返回充电桩"
+            ).format(battery, getattr(self.robot, "dock_distance", 0.0), reserve)
+        self._log("warn", message)
+        self._set_route((world.DOCK["x"], world.DOCK["y"]), "to_dock")
 
     # ----------------------------------------------------------- 控制分发
     def _control(self, dt, step):
@@ -658,32 +896,181 @@ class TaskManager(object):
 
     # ----------------------------------------------------------- 建图
     def _map_seek(self):
-        nearest = _front_distance(self.robot.vision, 20.0)
         x, y, theta = self._pose()
+        if self.map_seek_mode:
+            if self.robot.sim_time - self.map_seek_mode_time > 90.0:
+                self.map_seek_mode = False
+                self._log("info", "探索超时，恢复贴边巡边")
+            else:
+                route = self._map_seek_route()
+                controls = self._follow_seek_route(route) if route else None
+                if controls is not None:
+                    return controls
+                if not self.map_seek_route:
+                    # 探索模式下先离开当前小区域，不立刻又贴回同一段墙
+                    nearest = _front_distance(self.robot.vision, 20.0)
+                    if nearest is not None and nearest[0] < 0.65:
+                        steer = -1.3 if nearest[1] >= 0.0 else 1.3
+                        speed = 0.0 if nearest[0] < 0.36 else 0.16
+                        return speed, steer
+                    return MAP_SPEED, 0.0
+        nearest = _front_distance(self.robot.vision, 20.0)
+        near_boundary = nearest is not None and nearest[0] < 0.85 and self._hit_is_outer_wall(
+            nearest, x, y, theta
+        )
+        if near_boundary:
+            self.phase = "map_follow"
+            self.map_path = [(x, y)]
+            self.map_path_dist = 0.0
+            self.map_seek_mode = False
+            self.map_seek_route = []
+            self.map_seek_goal = None
+            self.map_progress_time = self.robot.sim_time
+            self.map_last_discovery = self.grid.boundary_discovery()
+            self.map_side_flips = 0
+            self._log("event", "视觉发现边界，开始巡边建图")
+            return self._map_follow(0.02)
         if nearest is not None and nearest[0] < 0.85:
+            # 场内障碍物：先绕开，避免把孤岛当作场地边界
             hit_x = x + math.cos(theta + nearest[1]) * nearest[0]
             hit_y = y + math.sin(theta + nearest[1]) * nearest[0]
             if self._near_known_island(hit_x, hit_y):
                 return 0.12, 1.3
-            # 只有贴近场地外墙的命中才作为建图起点；
-            # 场内障碍物先绕开，避免把孤岛当作场地边界。
-            if world.boundary_distance(hit_x, hit_y) > 0.42:
-                if self.robot.sim_time - self.map_seek_log_time > 2.0:
-                    self.map_seek_log_time = self.robot.sim_time
-                    self._log("info", "视觉命中场内障碍物，绕开后继续寻找外墙")
-                steer = -1.0 if nearest[1] >= 0.0 else 1.0
-                return 0.26, steer
-            self.phase = "map_follow"
-            self.map_path = [(x, y)]
-            self.map_path_dist = 0.0
-            self._log("event", "视觉发现边界，开始逆时针巡边")
-            return self._map_follow(0.02)
+            if self.robot.sim_time - self.map_seek_log_time > 2.0:
+                self.map_seek_log_time = self.robot.sim_time
+                self._log("info", "视觉命中场内障碍物，绕开后继续寻找外墙")
+            steer = -1.0 if nearest[1] >= 0.0 else 1.0
+            return 0.26, steer
+        return self._seek_forward()
+
+    def _seek_forward(self):
+        """找边界时的直行：靠视觉近距保护减速转向，避免贴着实景墙蹭出碰撞。"""
+        readings = self.robot.vision
+        if not readings:
+            return MAP_SPEED, 0.0
+        relative, distance = min(readings, key=lambda item: item[1])
+        if distance < 0.48:
+            steer = -1.4 if relative >= 0.0 else 1.4
+            return 0.0, steer
+        if distance < 0.72 and abs(relative) < math.radians(65.0):
+            steer = -0.9 if relative >= 0.0 else 0.9
+            return 0.18, steer
         return MAP_SPEED, 0.0
+
+    def _hit_is_outer_wall(self, nearest, x, y, theta):
+        hit_x = x + math.cos(theta + nearest[1]) * nearest[0]
+        hit_y = y + math.sin(theta + nearest[1]) * nearest[0]
+        return world.boundary_distance(hit_x, hit_y) <= 0.42
+
+    def _map_seek_route(self):
+        """给"寻找未探明边界"阶段算一条能真正走出当前小区域的路线。
+
+        建图时栅格上的导航膨胀可能把门口糊死，所以这里忽略膨胀层（只尊重
+        已探明占据格）规划，靠视觉前向保护避免真的撞墙。
+        """
+        if self.map_seek_route and self.map_seek_index < len(self.map_seek_route):
+            return self.map_seek_route
+        now = self.robot.sim_time
+        if now - self.map_seek_goal_time < 1.5:
+            return []
+        self.map_seek_goal_time = now
+        goal = self._map_seek_target()
+        if goal is None:
+            # 没有未探明边界了：建图完成
+            self.map_seek_route = []
+            if self.grid.boundary_discovery() >= MAP_DONE_DISCOVERY:
+                self._finish_mapping()
+            return []
+        path = self.grid.plan(
+            self._pose()[:2], goal, ignore_blocked=True, time_budget=MAP_PLAN_BUDGET
+        )
+        if not path:
+            path = [goal]
+        self.map_seek_route = path
+        self.map_seek_index = 0
+        self.map_seek_best = None
+        self.map_seek_progress_time = now
+        return self.map_seek_route
+
+    def _follow_seek_route(self, route):
+        x, y, theta = self._pose()
+        goal = route[-1]
+        if math.hypot(goal[0] - x, goal[1] - y) < 0.9:
+            # 到达未探明边界附近：交回贴边逻辑，由视觉去找真正的边界
+            self.map_seek_mode = False
+            self.map_seek_route = []
+            self.map_seek_goal = None
+            return None
+        while self.map_seek_index < len(route) - 1:
+            point = route[self.map_seek_index]
+            if math.hypot(point[0] - x, point[1] - y) > 0.45:
+                break
+            self.map_seek_index += 1
+        target = route[min(self.map_seek_index + 2, len(route) - 1)]
+        now = self.robot.sim_time
+        if self.map_seek_last_pose is None:
+            self.map_seek_last_pose = (x, y)
+            self.map_seek_move_time = now
+        elif math.hypot(x - self.map_seek_last_pose[0], y - self.map_seek_last_pose[1]) > 0.08:
+            self.map_seek_last_pose = (x, y)
+            self.map_seek_move_time = now
+        elif now - self.map_seek_move_time > 3.0:
+            # 顶住墙角推不动：跳过几个路径点换个方向，实在不行就把这个目标拉黑
+            self.map_seek_last_pose = None
+            self.map_seek_move_time = now
+            self.map_seek_index += 4
+            if self.map_seek_index >= len(route) - 1:
+                self._blacklist_seek_goal(route[-1])
+                self._log("warn", "前往未探明边界的路线走不通，换一个方向探索")
+            return 0.0, 1.2
+        err = world.wrap_angle(math.atan2(target[1] - y, target[0] - x) - theta)
+        front = _front_distance(self.robot.vision, 30.0)
+        if front is not None and front[0] < 0.42:
+            steer = -1.3 if front[1] >= 0.0 else 1.3
+            return 0.12, steer
+        if abs(err) > 1.4:
+            return 0.0, world.clamp(2.2 * err, -1.4, 1.4)
+        speed = MAP_SPEED * max(0.4, 1.0 - abs(err) / 1.8)
+        return speed, world.clamp(2.2 * err, -1.4, 1.4)
+
+    def _blacklist_seek_goal(self, goal):
+        self.map_seek_blacklist.append((goal[0], goal[1]))
+        if len(self.map_seek_blacklist) > 12:
+            del self.map_seek_blacklist[0]
+        self.map_seek_goal = None
+        self.map_seek_route = []
+        self.map_seek_index = 0
+        self.map_seek_last_pose = None
+
+    def _seek_goal_blocked(self, point):
+        for bx, by in self.map_seek_blacklist:
+            if math.hypot(point[0] - bx, point[1] - by) < 2.0:
+                return True
+        return False
+
+    def _map_seek_target(self):
+        """每 2 s 更新一次“最远的未探明前沿”，让机器人真的离开困境小区域。"""
+        now = self.robot.sim_time
+        if self.map_seek_goal is not None and now - self.map_seek_goal_time < 2.0:
+            x, y = self._pose()[0], self._pose()[1]
+            if math.hypot(self.map_seek_goal[0] - x, self.map_seek_goal[1] - y) > 0.8:
+                return self.map_seek_goal
+        self.map_seek_goal_time = now
+        goal = self.grid.explore_goal(self._pose()[:2])
+        if goal is not None and (
+            self._near_known_island(goal[0], goal[1]) or self._seek_goal_blocked(goal)
+        ):
+            goal = None
+        self.map_seek_goal = goal
+        return goal
 
     def _map_follow(self, dt):
         # 实景地图（顶点多、锯齿边界）需要更大的贴墙距离，否则容易擦墙。
-        desired = 0.55 if len(world.POLYGON) > 40 else 0.45
-        v, w = self._follow_surface(MAP_SPEED, desired)
+        if len(world.POLYGON) > 40:
+            # 实景地图（多房间、直角多）前向余量放大，避免贴墙巡边时蹭墙
+            v, w = self._follow_surface(MAP_SPEED, 0.55, front_limit=0.46)
+        else:
+            v, w = self._follow_surface(MAP_SPEED, 0.45)
         x, y, _ = self._pose()
         if not self.map_path:
             self._append_map_point(x, y)
@@ -697,10 +1084,56 @@ class TaskManager(object):
                     del self.map_path[:1000]
                     self._rebuild_map_hash()
 
+        if self.grid.boundary_discovery() >= MAP_DONE_DISCOVERY_NOW:
+            # 边界基本探明就不必再绕一圈了
+            self._finish_mapping()
+            return 0.0, 0.0
         result = self._check_mapping_loop()
         if result is not None:
             return 0.0, 0.0
+        if self._mapping_stalled():
+            return 0.0, 0.0
         return v, w
+
+    def _mapping_stalled(self):
+        """巡边在小区域里来回蹭、边界进度不再明显增长时，改为主动去找未探明边界。"""
+        discovery = self.grid.boundary_discovery()
+        if discovery > self.map_last_discovery + 0.01:
+            self.map_last_discovery = discovery
+            self.map_progress_time = self.robot.sim_time
+            return False
+        if self.robot.sim_time - self.map_progress_time < MAP_STALL_SECONDS:
+            return False
+        segment = self.map_path[-240:] if len(self.map_path) > 240 else list(self.map_path)
+        if len(segment) > 20:
+            xs = [point[0] for point in segment]
+            ys = [point[1] for point in segment]
+            cx = sum(xs) / len(xs)
+            cy = sum(ys) / len(ys)
+            radius = max(math.hypot(px - cx, py - cy) for px, py in segment) + 0.25
+            self.map_islands.append(
+                {"x": round(cx, 2), "y": round(cy, 2), "r": round(radius, 2)}
+            )
+        pose = self._pose()
+        released = self.grid.release_blocked_disc(pose[0], pose[1], 1.6)
+        self.map_progress_time = self.robot.sim_time
+        self.map_last_discovery = discovery
+        self.map_path = []
+        self._map_hash = {}
+        self.map_path_dist = 0.0
+        self.map_seek_goal = None
+        self.map_seek_route = []
+        self.map_seek_mode = True
+        self.map_seek_mode_time = self.robot.sim_time
+        self.phase = "map_seek"
+        self.last_phase = None
+        self._log(
+            "warn",
+            "巡边在 {:.0f}% 边界后长时间没有新进展（困在小区域），放开 {} 格膨胀改为寻找未探明边界".format(
+                discovery * 100.0, released
+            ),
+        )
+        return True
 
     MAP_HASH_CELL = 0.3
 
@@ -738,9 +1171,11 @@ class TaskManager(object):
             and math.hypot(x - path[0][0], y - path[0][1]) < 0.55
         ):
             area = abs(_polygon_area(path))
-            if area >= MIN_OUTER_AREA:
+            discovery = self.grid.boundary_discovery()
+            if area >= MIN_OUTER_AREA and discovery >= MAP_DONE_DISCOVERY:
                 self._finish_mapping()
                 return "complete"
+            # 闭环了但边界还差很多：说明只是在一个小区域里绕了一圈
             self._escape_island(path)
             return "island"
 
@@ -834,8 +1269,9 @@ class TaskManager(object):
         w = world.clamp(2.0 * err, -1.5, 1.5)
         front = _front_distance(self.robot.vision, 18.0)
         if front is not None and front[0] < 0.45:
-            v = 0.15
-            w = 1.2
+            # 脱离方向上顶着墙：原地朝远离墙的一侧转，别硬往前挤
+            v = 0.0 if front[0] < 0.32 else 0.10
+            w = 1.4 if front[1] >= 0.0 else -1.4
         if self.map_escape_dist > 2.5 or self.map_escape_time > 5.0:
             self.phase = "map_seek"
             self._log("info", "脱离完成，继续寻找场地边界")
@@ -1485,11 +1921,11 @@ class TaskManager(object):
         relative, distance = min(readings, key=lambda item: item[1])
         # 弓字巡迹速度较高，需要比贴边模式留更大的制动距离。
         if self.phase in ("zone_stripes", "to_segment"):
-            limit = 0.25
+            limit = 0.32
         elif self.phase in ("ring", "detour"):
-            limit = 0.24
+            limit = 0.30
         else:
-            limit = 0.20
+            limit = 0.28
         if distance < limit:
             steer = -1.4 if relative >= 0.0 else 1.4
             return 0.0, world.clamp(w + steer, -1.6, 1.6)
@@ -1515,7 +1951,7 @@ class TaskManager(object):
             # 贴墙的视觉碎片不是场内障碍，盖章会在区域内形成封锁环。
             if world.boundary_distance(circle["x"], circle["y"]) < circle["r"] + 0.45:
                 continue
-            self.grid.stamp_obstacle(circle["x"], circle["y"], circle["r"])
+            self.grid.stamp_footprint(circle["x"], circle["y"], circle["r"])
         # 只要覆盖率还在涨，就不把重规划计入"无效轮次"上限，避免大区域被提前结束。
         coverage_now = self.grid.zone_coverage(self.zone_id)
         if coverage_now > self.last_plan_coverage + 0.01:
@@ -1888,7 +2324,7 @@ class TaskManager(object):
             and circle is not None
             and circle.get("kind") == "large"
         ):
-            self.grid.stamp_obstacle(circle["x"], circle["y"], circle["r"])
+            self.grid.stamp_footprint(circle["x"], circle["y"], circle["r"])
             self.bypassed_circles.append(dict(circle))
             if self.segment is not None:
                 self.failed_segments.add(_segment_key(self.segment_plan or self.segment))
@@ -2337,6 +2773,10 @@ class TaskManager(object):
         return False
 
     def _on_bump(self):
+        # 贴住障碍物时先放开脚下导航膨胀：否则重规划会沿着同一圈膨胀再撞一次
+        if self.phase in ("zone_stripes", "zone_edge", "to_segment", "detour", "ring"):
+            pose = self._pose()
+            self.grid.relax_around(pose[0], pose[1], 0.45)
         if self.phase in ("zone_stripes", "zone_edge"):
             self.zone_bump_count += 1
         if self.phase == "zone_stripes" and self.zone_bump_count >= 2:
@@ -2390,7 +2830,7 @@ class TaskManager(object):
         if self.phase == "zone_plan":
             circle = self._nearest_circle(self._pose()[0], self._pose()[1], 1.0)
             if circle is not None:
-                self.grid.stamp_obstacle(circle["x"], circle["y"], circle["r"])
+                self.grid.stamp_footprint(circle["x"], circle["y"], circle["r"])
                 self.bypassed_circles.append(dict(circle))
             self.phase = "zone_plan"
         elif self.phase == "zone_stripes":
@@ -2403,44 +2843,81 @@ class TaskManager(object):
             self._replan_route()
 
     # ----------------------------------------------------------- 沿边控制
-    def _follow_surface(self, speed, desired, front_limit=0.38):
+    def _follow_surface(self, speed, desired, front_limit=0.38, side=1):
+        """贴墙巡边；side=1 让墙在右侧（逆时针），side=-1 让墙在左侧（顺时针）。"""
         readings = self.robot.vision
         front = _front_distance(readings, 15.0)
-        right = _right_surface_distance(readings)
+        wall = _side_surface_distance(readings, side)
         if front is not None and front[0] < front_limit:
-            return 0.16, 1.6
+            return 0.16, 1.6 * side
         nearest = min(d for _, d in readings) if readings else world.VISION_RANGE
         if nearest < 0.30:
-            return 0.14, 1.6
-        if right is None:
-            return 0.35, -0.9
-        if right < 0.30:
-            return 0.30, 1.2
-        if right < desired - 0.08:
-            return min(speed, 0.40), 0.7
-        if right > desired + 0.20:
-            return min(speed, 0.40), -0.8
+            return 0.14, 1.6 * side
+        if wall is None:
+            return 0.35, -0.9 * side
+        if wall < 0.30:
+            return 0.30, 1.2 * side
+        if wall < desired - 0.08:
+            return min(speed, 0.40), 0.7 * side
+        if wall > desired + 0.20:
+            return min(speed, 0.40), -0.8 * side
         return speed, 0.0
 
     # ----------------------------------------------------------- 导航
-    def _find_route(self, goal):
+    def _plan_with_budget(self, start, goal, budget=None, **kwargs):
+        """带 tick 级时间预算的 A*：大图单次可能上百毫秒，多调用叠加会卡住仿真线程。
+
+        ``budget`` 显式给定时（回桩等低频关键规划）不受本帧预算限制，用完把本帧预算清零。
+        """
+        if budget is None:
+            if self.tick_plan_left <= 0.005:
+                return []
+            budget = min(ROUTE_PLAN_BUDGET, self.tick_plan_left)
+        began = time.monotonic()
+        path = self.grid.plan(start, goal, time_budget=budget, **kwargs)
+        self.tick_plan_left -= time.monotonic() - began
+        return path
+
+    def _find_route(self, goal, budget=None):
+        self.route_loose = False
+        if budget is None and self.tick_plan_left <= 0.005:
+            return [], goal, float("inf")
         x, y, _ = self._pose()
         if self._node_mode():
             # planner 节点 nav_task_action(NAVIGATION) → task_plan_path
+            began = time.monotonic()
             result = self.nav.plan_navigation((x, y), goal)
+            self.tick_plan_left -= time.monotonic() - began
             if result is not None:
                 return result["path"], result["endpoint"], result["deviation"]
-        path = self.grid.plan((x, y), goal)
+            if self.tick_plan_left <= 0.005:
+                return [], goal, float("inf")
+        path = self._plan_with_budget((x, y), goal, budget=budget)
         if not path and self.grid.relax_around(x, y, 0.45):
             # 机器人当前点可能被相邻障碍的保守膨胀包围；该点本身已证明
             # 可通行，先释放脚下膨胀再尝试一次，避免区域间导航死锁。
-            path = self.grid.plan((x, y), goal)
+            path = self._plan_with_budget((x, y), goal, budget=budget)
         if not path and self.grid.relax_around(goal[0], goal[1], 0.30):
             # 目标（弓字起点/桩位）落在膨胀带里时，放开目标周围再试。
-            path = self.grid.plan((x, y), goal)
+            path = self._plan_with_budget((x, y), goal, budget=budget)
         if path:
             self.route_fail_streak = 0
             return path, path[-1], 0.0
+        # 门口被视觉膨胀糊死时，允许沿“已探明自由区”穿过膨胀带（靠视觉前向保护避障）。
+        # 这条 A* 在大图上要 0.3 s，必须限频，否则重规划循环会把仿真线程拖死。
+        loose = None
+        now = self.robot.sim_time
+        if now >= self.loose_plan_cooldown:
+            loose = self._plan_with_budget(
+                (x, y), goal, budget=budget, allow_unknown=False, ignore_blocked=True
+            )
+            self.loose_plan_cooldown = now + (0.8 if loose else 2.0)
+        if loose:
+            self.grid.relax_trail(loose, 0.30)
+            self.route_loose = True
+            self.route_fail_streak = 0
+            self._log("warn", "目标被导航膨胀挡住，放开途经膨胀后继续前往")
+            return loose, loose[-1], 0.0
         near_path, distance = self.grid.plan_near((x, y), goal)
         if near_path and distance <= 0.35:
             self.route_fail_streak = 0
@@ -2450,7 +2927,7 @@ class TaskManager(object):
             # 连续多目标不可达：多半是视觉碎片盖章把区域封死，放开周边再试。
             self.route_fail_streak = 0
             self.grid.relax_around(x, y, 1.30)
-            path = self.grid.plan((x, y), goal)
+            path = self._plan_with_budget((x, y), goal, budget=budget)
             if path:
                 self._log("warn", "连续导航受阻，放开周边导航膨胀后重新规划")
                 return path, path[-1], 0.0
@@ -2460,12 +2937,107 @@ class TaskManager(object):
                 return near_path, near_path[-1], distance
         return [], goal, float("inf")
 
+    HISTORY_STEP = 0.6
+    DOCK_ROUTE_KINDS = ("to_dock", "map_dock", "mow_dock", "charge_return")
+
+    def _history_route(self, goal):
+        """沿机器人真实走过的轨迹倒推一条回程路线。
+
+        场地被障碍或窄口切成小区域时，A* 要么绕一大圈、要么因为视觉膨胀找不到路；
+        走过的轨迹一定可通行，因此可以直接原路退回，先离开当前小区域再接管导航。
+        """
+        points = list(self.history)
+        if len(points) < 4:
+            return []
+        x, y = self._pose()[0], self._pose()[1]
+        route = []
+        last = (x, y)
+        for point in reversed(points):
+            if math.hypot(point[0] - last[0], point[1] - last[1]) < self.HISTORY_STEP:
+                continue
+            route.append((point[0], point[1]))
+            last = point
+            if math.hypot(point[0] - goal[0], point[1] - goal[1]) <= 1.2:
+                break
+        if not route:
+            return []
+        route.reverse()
+        if math.hypot(route[-1][0] - goal[0], route[-1][1] - goal[1]) > 0.45:
+            route.append((float(goal[0]), float(goal[1])))
+        return route
+
+    def _history_detour_route(self, goal, path):
+        """A* 路线异常（过长或不可达）时，判断"原路退回"是不是更划算。"""
+        history = self._history_route(goal)
+        if len(history) < 2:
+            return None
+        x, y = self._pose()[0], self._pose()[1]
+        straight = math.hypot(goal[0] - x, goal[1] - y)
+        history_length = _path_length(history)
+        if history_length > max(30.0, straight * 4.0 + 20.0):
+            return None
+        if not path:
+            return history
+        if _path_length(path) > max(straight * 2.2, history_length * 1.1):
+            return history
+        return None
+
+    def _find_dock_route(self, goal):
+        """回桩专用规划：A* 不通时按“走过的路 → 已探明自由区”两级回退。"""
+        self.route_loose = False
+        path, endpoint, near_distance = self._find_route(goal, budget=DOCK_PLAN_BUDGET)
+        if path and near_distance <= 1.0:
+            return path, endpoint, near_distance
+        history = self._history_route(goal)
+        if len(history) >= 2 and _path_length(history) <= max(30.0, near_distance if near_distance < 1e6 else 30.0):
+            self.grid.relax_trail(history, 0.30)
+            self.route_from_history = True
+            self.route_loose = True
+            self._log(
+                "warn",
+                "回桩路线不可达，改为沿历史轨迹原路退回（{} 个路径点）".format(len(history)),
+            )
+            return history, history[-1], 0.0
+        loose = self._plan_with_budget(
+            self._pose()[:2],
+            goal,
+            budget=DOCK_PLAN_BUDGET,
+            allow_unknown=False,
+            ignore_blocked=True,
+        )
+        if loose:
+            self.grid.relax_trail(loose, 0.35)
+            self.route_loose = True
+            self._log(
+                "warn", "回桩路径被导航膨胀堵死，放开途经膨胀后沿已探明自由区回桩"
+            )
+            return loose, loose[-1], 0.0
+        return path, endpoint, near_distance
+
     def _set_route(self, goal, kind):
         goal = (float(goal[0]), float(goal[1]))
         if kind in ("to_dock", "map_dock", "mow_dock", "charge_return"):
             # 桩位附近常被障碍膨胀覆盖，先放开桩周一圈，保证能开上桩。
             self.grid.relax_around(world.DOCK["x"], world.DOCK["y"], world.DOCK["r"] + 0.20)
-        path, endpoint, near_distance = self._find_route(goal)
+        if kind in self.DOCK_ROUTE_KINDS:
+            path, endpoint, near_distance = self._find_dock_route(goal)
+        else:
+            path, endpoint, near_distance = self._find_route(goal)
+        self.route_from_history = False
+        if kind in self.DOCK_ROUTE_KINDS:
+            detour = self._history_detour_route(goal, path)
+            if detour:
+                self.grid.relax_trail(detour, 0.30)
+                path = detour
+                endpoint = detour[-1]
+                near_distance = 0.0
+                self.route_from_history = True
+                self._log(
+                    "warn",
+                    "回桩路径受阻，改为沿历史轨迹原路退回（{} 个路径点）".format(
+                        len(detour)
+                    ),
+                )
         limits = {
             "to_zone": 2.0,
             "to_segment": 0.8,
@@ -2527,6 +3099,24 @@ class TaskManager(object):
             self._advance_edge_after_collision(0.55)
         elif kind == "breakpoint":
             self._restore_breakpoint()
+        elif kind in self.DOCK_ROUTE_KINDS:
+            self.dock_retries += 1
+            if self.dock_retries <= 3:
+                x, y = self._pose()[:2]
+                released = self.grid.release_blocked_disc(x, y, 2.0)
+                self._log(
+                    "warn",
+                    "回桩目标不可达，放开车体周边 {} 格导航膨胀后重试（第 {} 次）".format(
+                        released, self.dock_retries
+                    ),
+                )
+                self.replan_cooldown = 0.0
+                self._set_route((world.DOCK["x"], world.DOCK["y"]), kind)
+                return
+            self.dock_retries = 0
+            self._log("warn", "多次放开膨胀仍无法回桩，任务停留在当前位置")
+            self.robot.stop()
+            self.phase = "idle"
         else:
             self.robot.stop()
             self.phase = "idle"
@@ -2547,7 +3137,19 @@ class TaskManager(object):
     def _replan_route(self):
         if self.nav_goal is None or self.replan_cooldown > 0.0:
             return False
-        path, endpoint, near_distance = self._find_route(self.nav_goal)
+        if self.route_from_history and self.route_kind in self.DOCK_ROUTE_KINDS:
+            detour = self._history_route(self.nav_goal)
+            if len(detour) >= 2:
+                self.grid.relax_trail(detour, 0.30)
+                self.route = detour
+                self.route_index = 1 if len(detour) > 1 else 0
+                self.replan_cooldown = 0.8
+                return True
+            self.route_from_history = False
+        if self.route_kind in self.DOCK_ROUTE_KINDS:
+            path, endpoint, near_distance = self._find_dock_route(self.nav_goal)
+        else:
+            path, endpoint, near_distance = self._find_route(self.nav_goal)
         if path and near_distance <= 1.6:
             self.nav_goal = endpoint
             self.route = path
@@ -2565,9 +3167,10 @@ class TaskManager(object):
 
         x, y, theta = self._pose()
         target = self.route[self.route_index]
-        if self.grid.is_blocked_world(target[0], target[1]) or self.grid.is_occupied_world(
-            target[0], target[1]
-        ):
+        blocked = self.grid.is_occupied_world(target[0], target[1]) or (
+            not self.route_loose and self.grid.is_blocked_world(target[0], target[1])
+        )
+        if blocked:
             if self.replan_cooldown <= 0.0:
                 self._replan_route()
             return 0.0, 0.0
@@ -2595,7 +3198,7 @@ class TaskManager(object):
         front = _front_distance(self.robot.vision, 16.0)
         # 目标在侧后方时先原地转向目标；此时前向障碍不会造成平移碰撞，
         # 若仍按前向避障左右切换，会在狭窄回廊中来回摆动而卡死。
-        if front is not None and front[0] < 0.42 and abs(err) < 1.0:
+        if front is not None and front[0] < 0.50 and abs(err) < 1.0:
             v = 0.0
             w = -1.3 if front[1] >= 0.0 else 1.3
             return v, w
@@ -2641,6 +3244,7 @@ class TaskManager(object):
                 self._set_route((world.DOCK["x"], world.DOCK["y"]), kind)
                 return
             self.dock_retries = 0
+            self.dock_stuck = 0
             if self.nav is not None:
                 self.nav.finish_autodock(True, "已到达充电桩")
             if self.mapping_done and self.task and self.task.get("type") == "map":
@@ -3069,15 +3673,20 @@ def _front_distance(readings, half_angle_deg):
     return best
 
 
-def _right_surface_distance(readings):
+def _side_surface_distance(readings, side=1):
+    """side=1 取右侧墙面投影距离，side=-1 取左侧（贴哪面墙就用哪面）。"""
     values = []
     for relative, distance in readings:
-        degrees = math.degrees(relative)
+        degrees = math.degrees(relative) * side
         if -50.0 <= degrees <= -25.0 and distance < world.VISION_RANGE - 1e-6:
             values.append(distance * math.sin(math.radians(-degrees)))
     if not values:
         return None
     return min(values)
+
+
+def _right_surface_distance(readings):
+    return _side_surface_distance(readings, 1)
 
 
 def _polygon_area(points):

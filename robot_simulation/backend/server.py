@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import bag_reader  # noqa: E402
 import config  # noqa: E402
 import map_import  # noqa: E402
 import nav_bus  # noqa: E402
@@ -26,6 +27,20 @@ from tasks import TaskManager  # noqa: E402
 
 FRONTEND_DIR = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "frontend")
+)
+
+# 日志（bag）目录：默认仓库根的 data/bag，可用环境变量 ROBOT_BAG_DIR 覆盖
+BAG_DIR = os.environ.get(
+    "ROBOT_BAG_DIR",
+    os.path.normpath(
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            os.pardir,
+            os.pardir,
+            "data",
+            "bag",
+        )
+    ),
 )
 
 CONTENT_TYPES = {
@@ -97,6 +112,191 @@ def _store_uploaded_map(files):
     return root
 
 
+def bag_roots(server):
+    """当前可用的日志根目录（默认目录 + 用户导入的文件夹）。"""
+    roots = getattr(server, "bag_roots", None)
+    if roots is None:
+        roots = [BAG_DIR]
+        server.bag_roots = roots
+    return roots
+
+
+def add_bag_root(server, path):
+    """把用户指定的文件夹加入日志根目录（去重）。"""
+    path = os.path.abspath(os.path.expanduser(str(path)))
+    if not os.path.isdir(path):
+        raise ValueError("文件夹不存在: {}".format(path))
+    roots = bag_roots(server)
+    known = {os.path.realpath(item) for item in roots}
+    if os.path.realpath(path) not in known:
+        roots.append(path)
+    return roots
+
+
+def list_bag_entries(server):
+    """汇总所有根目录下的日志（带分组），按分组 + 修改时间排序。"""
+    entries = []
+    seen = set()
+    for index, root in enumerate(bag_roots(server)):
+        for bag in bag_reader.list_bags(root):
+            real = os.path.realpath(bag["path"])
+            if real in seen:
+                continue
+            seen.add(real)
+            item = dict(bag)
+            item["root"] = root
+            item["root_index"] = index
+            item["group"] = bag["group"] or (
+                "根目录" if index == 0 else (os.path.basename(root.rstrip(os.sep)) or root)
+            )
+            entries.append(item)
+    return entries
+
+
+def resolve_bag(server, name):
+    """把日志标识（分组/文件名、文件名或绝对路径）解析成绝对路径。"""
+    name = str(name or "").strip()
+    if not name:
+        raise ValueError("请选择日志文件")
+    if os.path.isabs(name):
+        path = os.path.abspath(name)
+        if not os.path.isfile(path):
+            raise ValueError("日志文件不存在: {}".format(os.path.basename(path)))
+        if os.path.splitext(path)[1].lower() not in bag_reader.BAG_SUFFIXES:
+            raise ValueError("不支持的文件类型: {}".format(os.path.basename(path)))
+        return path
+    if ".." in name.replace("\\", "/").split("/"):
+        raise ValueError("日志名称无效")
+    for root in bag_roots(server):
+        candidate = os.path.normpath(os.path.join(root, name))
+        if os.path.isfile(candidate):
+            return candidate
+    raise ValueError("找不到日志: {}".format(name))
+
+
+def load_bag(httpd, name, use_log_map=True):
+    """解析日志并载入回放；日志自带地图时同时把它建成仿真场地。"""
+    path = resolve_bag(httpd, name)
+    info = bag_reader.read_bag(path)
+    transform = None
+    log_map = (info.get("maps") or {}).get("whole_map")
+    manager = httpd.manager
+    if use_log_map:
+        label = os.path.splitext(os.path.basename(path))[0].split("_")[0] or "日志"
+        definition = None
+        if log_map:
+            try:
+                definition = map_import.build_map_from_grid(
+                    log_map["resolution"],
+                    log_map["width"],
+                    log_map["height"],
+                    log_map["data"],
+                    grid_origin=log_map["origin"],
+                    name="{}·日志".format(label),
+                )
+            except Exception as exc:  # 日志地图坏了就退回开阔场地
+                print("日志地图构造失败：{}".format(exc))
+                definition = None
+        if definition is None:
+            # 日志里没有地图：给一块没有边界、没有障碍的开阔场地，不限制机器人活动
+            bounds = (info.get("summary") or {}).get("bounds") or {}
+            span_x = max(0.0, float(bounds.get("x1", 0.0)) - float(bounds.get("x0", 0.0)))
+            span_y = max(0.0, float(bounds.get("y1", 0.0)) - float(bounds.get("y0", 0.0)))
+            definition = map_import.build_open_field(
+                span_x, span_y, name="{}·无地图".format(label)
+            )
+        try:
+            transform = definition.get("replay_transform")
+            manager = rebuild_system(httpd, definition)
+        except Exception as exc:  # 场地构造失败时退回当前地图
+            print("日志场地构造失败：{}".format(exc))
+            transform = None
+            manager = httpd.manager
+    manager.load_replay(info, transform)
+    replay = manager.replay
+    if replay is not None and replay.track:
+        # 轨迹已按日志地图自由区中心摆放，起点即回放第一帧位置
+        first = replay.track[0]
+        pose = (round(first[1], 4), round(first[2], 4), round(first[3], 4))
+        world.START.update({"x": pose[0], "y": pose[1], "theta": pose[2]})
+        world.DOCK.update({"x": pose[0], "y": pose[1], "r": 0.45})
+        manager.robot.pose = [pose[0], pose[1], pose[2]]
+    return manager, info, path
+
+
+def bag_queue_snapshot(server):
+    queue = getattr(server, "bag_queue", None) or {}
+    names = list(queue.get("names") or [])
+    index = int(queue.get("index") or 0)
+    active = bool(queue.get("active"))
+    current = names[index] if 0 <= index < len(names) else None
+    return {
+        "active": active,
+        "names": names,
+        "index": index,
+        "total": len(names),
+        "current": current if active else None,
+        "use_log_map": bool(queue.get("use_log_map", True)),
+    }
+
+
+def _queue_worker(server):
+    """后台线程：载入队列里的下一条日志并自动播放。"""
+    try:
+        queue = getattr(server, "bag_queue", {}) or {}
+        names = queue.get("names") or []
+        index = queue.get("index", 0)
+        if not queue.get("active") or index >= len(names):
+            queue["active"] = False
+            return
+        manager, _info, _path = load_bag(server, names[index], queue.get("use_log_map", True))
+        manager.start_replay()
+    except Exception as exc:
+        print("连续播放失败：{}".format(exc))
+        queue = getattr(server, "bag_queue", None)
+        if queue is not None:
+            queue["active"] = False
+    finally:
+        queue = getattr(server, "bag_queue", None)
+        if queue is not None:
+            queue["loading"] = False
+
+
+def start_bag_queue(server, names, use_log_map=True):
+    """按顺序连续播放多个日志（每个播完自动切下一个）。"""
+    cleaned = [str(item) for item in (names or []) if str(item).strip()]
+    if not cleaned:
+        raise ValueError("请先勾选要连续播放的日志")
+    for name in cleaned:
+        resolve_bag(server, name)
+    server.bag_queue = {
+        "names": cleaned,
+        "index": 0,
+        "active": True,
+        "use_log_map": bool(use_log_map),
+        "loading": True,
+    }
+    threading.Thread(target=_queue_worker, args=(server,), daemon=True).start()
+    return bag_queue_snapshot(server)
+
+
+def poll_bag_queue(server):
+    """仿真每轮调用：当前日志播完就切队列里的下一条。"""
+    queue = getattr(server, "bag_queue", None)
+    if not queue or not queue.get("active") or queue.get("loading"):
+        return
+    manager = server.manager
+    replay = getattr(manager, "replay", None)
+    if replay is None or not replay.finished:
+        return
+    queue["index"] = int(queue.get("index") or 0) + 1
+    if queue["index"] >= len(queue.get("names") or []):
+        queue["active"] = False
+        return
+    queue["loading"] = True
+    threading.Thread(target=_queue_worker, args=(server,), daemon=True).start()
+
+
 class Simulator(threading.Thread):
     """固定步长推进仿真；speed 仅改变每帧执行的步数，保证控制稳定。"""
 
@@ -107,6 +307,7 @@ class Simulator(threading.Thread):
         self.speed = 1
         self.lock = threading.RLock()
         self._stop_event = threading.Event()
+        self.on_cycle = None
 
     def replace_manager(self, manager):
         with self.lock:
@@ -143,6 +344,11 @@ class Simulator(threading.Thread):
                         steps += 1
             except Exception:
                 traceback.print_exc()
+            if self.on_cycle is not None:
+                try:
+                    self.on_cycle()
+                except Exception:
+                    traceback.print_exc()
             # 1 ms 节拍：保证高倍速时每轮累积的仿真时间足以跨过一步，不会因节拍太粗掉速
             self._stop_event.wait(0.001)
 
@@ -169,6 +375,44 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
         elif path == "/api/nav":
             nav = self.server.manager.nav
             self._send_json(nav.snapshot() if nav is not None else {"error": "导航节点未启用"})
+        elif path == "/api/bag":
+            manager = self.server.manager
+            entries = list_bag_entries(self.server)
+            groups = []
+            for entry in entries:
+                if entry["group"] not in groups:
+                    groups.append(entry["group"])
+            self._send_json(
+                {
+                    "directory": BAG_DIR,
+                    "roots": list(bag_roots(self.server)),
+                    "groups": groups,
+                    "bags": entries,
+                    "queue": bag_queue_snapshot(self.server),
+                    "state": manager.replay_state(),
+                    "topics": (manager.replay.info or {}).get("topics") or [],
+                    "path": manager.replay.reference_path(),
+                }
+            )
+        elif path == "/api/bag/frame":
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                when = float((query.get("t") or ["0"])[0])
+            except ValueError:
+                when = 0.0
+            self._send_json({"image": self.server.manager.replay.image_at(when)})
+        elif path == "/api/bag/costmap":
+            query = parse_qs(urlsplit(self.path).query)
+            time_value = (query.get("t") or ["0"])[0]
+            try:
+                time_value = float(time_value)
+            except ValueError:
+                time_value = 0.0
+            replay = self.server.manager.replay
+            layer = replay.costmap_at(time_value)
+            self._send_json(
+                {"costmap": layer, "maps": (replay.info or {}).get("map_summary") or {}}
+            )
         elif path == "/api/config":
             self._send_json(self._state())
         elif path == "/api/health":
@@ -217,6 +461,8 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
             elif path == "/api/resume":
                 manager.request_resume()
             elif path == "/api/reset":
+                self.server.bag_queue = None
+                manager.clear_replay()
                 self.server.robot.reset()
                 self.server.grid.reset_map()
                 manager.reset()
@@ -399,6 +645,83 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                 if response.get("error"):
                     raise ValueError(response["error"])
                 self._apply_nav_side_effects(manager, action, request["cmd"], goal, response)
+            elif path.startswith("/api/bag/"):
+                action = path[len("/api/bag/"):]
+                if action == "load":
+                    name = str(payload.get("name") or "").strip()
+                    if not name:
+                        raise ValueError("请选择日志文件")
+                    self.server.bag_queue = None
+                    manager, info, bag_path = load_bag(
+                        self.server, name, payload.get("use_log_map", True)
+                    )
+                    entries = list_bag_entries(self.server)
+                    self._send_json(
+                        {
+                            "directory": BAG_DIR,
+                            "roots": list(bag_roots(self.server)),
+                            "groups": sorted({item["group"] for item in entries}),
+                            "bags": entries,
+                            "queue": bag_queue_snapshot(self.server),
+                            "state": manager.replay_state(),
+                            "path": manager.replay.reference_path(),
+                            "topics": info.get("topics"),
+                            "summary": info.get("summary"),
+                            "bag_path": bag_path,
+                        }
+                    )
+                    return
+                if action == "dir":
+                    requested = str(payload.get("path") or "").strip()
+                    add_bag_root(self.server, requested)
+                    entries = list_bag_entries(self.server)
+                    self._send_json(
+                        {
+                            "roots": list(bag_roots(self.server)),
+                            "groups": sorted({item["group"] for item in entries}),
+                            "bags": entries,
+                            "added": os.path.abspath(os.path.expanduser(requested)),
+                        }
+                    )
+                    return
+                if action == "playlist":
+                    snapshot = start_bag_queue(
+                        self.server,
+                        payload.get("names") or payload.get("name"),
+                        payload.get("use_log_map", True),
+                    )
+                    self._send_json({"queue": snapshot, "state": manager.replay_state()})
+                    return
+                if action == "control":
+                    command = str(payload.get("command") or "")
+                    with self.server.simulator.lock:
+                        if command == "play":
+                            self.server.bag_queue = None
+                            manager.start_replay()
+                        elif command == "pause":
+                            manager.pause_replay()
+                        elif command == "resume":
+                            manager.resume_replay()
+                        elif command == "stop":
+                            self.server.bag_queue = None
+                            manager.stop_replay()
+                        elif command == "seek":
+                            manager.seek_replay(payload.get("time", 0.0))
+                        else:
+                            raise ValueError("未知的日志播放指令: {}".format(command))
+                    self._send_json(
+                        {
+                            "state": manager.replay_state(),
+                            "path": manager.replay.reference_path(),
+                        }
+                    )
+                    return
+                raise ValueError("接口不存在")
+            elif path == "/api/shutdown":
+                manager.stop_task("控制台退出，服务即将关闭", resumable=False)
+                self._send_json({"ok": True, "message": "服务已关闭，可以关闭此页面"})
+                self.server.stop_service()
+                return
             elif path == "/api/speed":
                 speed = int(payload.get("speed", 1))
                 if speed not in (1, 2, 4, 8, 16, 32):
@@ -442,6 +765,7 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
         state["config"] = dict(config.settings.__dict__)
         nav = self.server.manager.nav if self.server.manager else None
         state["nav"] = nav.snapshot() if nav is not None else None
+        state["bag"] = self.server.manager.replay_state()
         return state
 
     def _read_json(self, limit=MAX_BODY_BYTES):
@@ -512,6 +836,23 @@ class RobotHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def stop_service(self):
+        """退出服务：停掉仿真线程并关闭监听端口（可从请求线程调用）。
+
+        ``shutdown()`` 会等 ``serve_forever()`` 退出，所以必须放在独立线程里，
+        并稍等片刻让 HTTP 响应先发回浏览器。
+        """
+
+        def _shutdown():
+            time.sleep(0.15)
+            try:
+                self.simulator.stop()
+            except Exception:
+                pass
+            self.shutdown()
+
+        threading.Thread(target=_shutdown, name="robot-shutdown", daemon=True).start()
+
 
 def build_manager(robot, grid):
     """创建任务管理器，并接入 planner / dock / region_manager / trajectory_map 四个节点。"""
@@ -521,6 +862,24 @@ def build_manager(robot, grid):
     except Exception as exc:  # static_config 缺失时保持默认参数
         print("static_config 未导入：{}".format(exc))
     return TaskManager(robot, grid, nav=nav), nav
+
+
+def rebuild_system(httpd, definition=None):
+    """按给定地图定义（或当前地图）重建机器人 / 栅格 / 任务 / 节点。"""
+    if definition is not None:
+        map_id = world.register_map(definition)
+        world.select_map(map_id)
+    robot = RobotCar()
+    grid = GridMap()
+    manager, nav = build_manager(robot, grid)
+    nav.set_enabled(getattr(httpd.nav, "enabled", True))
+    with httpd.simulator.lock:
+        httpd.robot = robot
+        httpd.grid = grid
+        httpd.manager = manager
+        httpd.nav = nav
+        httpd.simulator.replace_manager(manager)
+    return manager
 
 
 def create_server(host="127.0.0.1", port=8000):
@@ -533,7 +892,10 @@ def create_server(host="127.0.0.1", port=8000):
     httpd.grid = grid
     httpd.manager = manager
     httpd.nav = nav
+    httpd.bag_roots = [BAG_DIR]
+    httpd.bag_queue = None
     httpd.simulator = Simulator(manager)
+    httpd.simulator.on_cycle = lambda: poll_bag_queue(httpd)
     httpd.simulator.start()
     return httpd
 

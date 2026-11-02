@@ -427,6 +427,113 @@ def build_map(source, name=None, max_extent=40.0):
     if not (0.005 <= resolution <= 1.0):
         raise MapImportError("地图分辨率无效: {}".format(resolution))
     native_width, native_height, raw = _read_pgm(map_file)
+    map_name = name
+    if not map_name:
+        listed = map_info.get("map_list") or []
+        if listed and isinstance(listed[0], dict):
+            map_name = listed[0].get("map_name")
+    if not map_name:
+        map_name = os.path.splitext(os.path.basename(map_file))[0]
+    return _definition(
+        native_width,
+        native_height,
+        raw,
+        resolution,
+        map_name,
+        source_path=root if os.path.isdir(source) else map_file,
+        map_file=map_file,
+        max_extent=max_extent,
+    )
+
+
+def build_map_from_grid(
+    resolution, width, height, data, grid_origin=(0.0, 0.0), name="日志地图", max_extent=40.0
+):
+    """用日志里的占据栅格（OccupancyGrid）构造仿真场地定义。
+
+    栅格行 0 对应最小 y，与仿真坐标方向一致，因此不需要翻转；返回的定义里带上
+    ``replay_transform``，回放时用它把日志坐标换到仿真坐标。
+    """
+    resolution = float(resolution)
+    if not (0.005 <= resolution <= 1.0):
+        raise MapImportError("日志地图分辨率无效: {}".format(resolution))
+    width = int(width)
+    height = int(height)
+    if width <= 0 or height <= 0 or len(data) < width * height:
+        raise MapImportError("日志地图栅格数据不完整")
+    # 0/100 占据栅格 → PGM 灰度（254 自由 / 0 占据）
+    raw = bytearray(width * height)
+    for index in range(width * height):
+        raw[index] = 254 if data[index] < 50 else 0
+    definition = _definition(
+        width,
+        height,
+        raw,
+        resolution,
+        name,
+        source_path="bag:{}".format(name),
+        map_file=name,
+        max_extent=max_extent,
+    )
+    scale = definition["import_meta"]["scale"]
+    half = world.CELL * scale * 0.5
+    definition["replay_transform"] = {
+        "origin": [float(grid_origin[0]), float(grid_origin[1])],
+        "scale": round(scale, 6),
+        "padding": PADDING,
+        "cell": world.CELL,
+        # 日志坐标 → 仿真坐标：sim = (log - origin) * scale + padding + 半格
+        "offset": [round(PADDING + half, 4), round(PADDING + half, 4)],
+    }
+    return definition
+
+
+OPEN_FIELD_MIN = 26.0
+OPEN_FIELD_MARGIN = 14.0
+
+
+def build_open_field(span_x=0.0, span_y=0.0, name="日志·无地图"):
+    """给没有地图数据的日志造一块开阔场地：没有边界墙、没有障碍物。
+
+    场地尺寸按日志轨迹的跨度自动放大（最小 26 m），充电桩/起点放在正中间，
+    回放轨迹会被摆到场地中心，所以机器人可以在整块场地里自由行驶。
+    """
+    width = max(OPEN_FIELD_MIN, float(span_x) + OPEN_FIELD_MARGIN)
+    height = max(OPEN_FIELD_MIN, float(span_y) + OPEN_FIELD_MARGIN)
+    cols = max(8, int(round(width / world.CELL)))
+    rows = max(8, int(round(height / world.CELL)))
+    raw = bytearray([254]) * (cols * rows)
+    tag = "{}x{}".format(round(width, 1), round(height, 1))
+    definition = _definition(
+        cols,
+        rows,
+        raw,
+        world.CELL,
+        name,
+        source_path="bag:open:{}".format(tag),
+        map_file="open:{}".format(tag),
+        max_extent=max(width, height) + 1.0,
+    )
+    definition["name"] = name
+    definition["open_field"] = True
+    center_x = round(definition["width"] / 2.0, 3)
+    center_y = round(definition["height"] / 2.0, 3)
+    definition["dock"] = {"x": center_x, "y": center_y, "r": 0.45}
+    definition["start"] = {"x": center_x, "y": center_y, "theta": 0.0}
+    return definition
+
+
+def _definition(
+    native_width,
+    native_height,
+    raw,
+    resolution,
+    map_name,
+    source_path=None,
+    map_file=None,
+    max_extent=40.0,
+):
+    """从原生灰度栅格构造场地定义（build_map / build_map_from_grid 共用）。"""
     width, height, mask = _resample(native_width, native_height, raw, resolution)
     component, component_cells = _largest_component(width, height, mask)
     loops = _boundary_loops(width, height, component)
@@ -459,6 +566,7 @@ def build_map(source, name=None, max_extent=40.0):
         max_extent = 40.0
     if max_extent <= 0.0:
         max_extent = 40.0
+    # 日志地图的栅格原点（米）由调用方写入 replay_transform
     scale = min(1.0, max_extent / max(natural_width, natural_height))
     # 栅格边长按缩放后的米制计算，保证充电桩/起点离墙间隙够机器人用。
     dock_col, dock_row, start_col, start_row, theta = _choose_pose(
@@ -486,14 +594,7 @@ def build_map(source, name=None, max_extent=40.0):
                 "area": round(area, 2),
             }
         )
-    map_name = name
-    if not map_name:
-        listed = map_info.get("map_list") or []
-        if listed and isinstance(listed[0], dict):
-            map_name = listed[0].get("map_name")
-    if not map_name:
-        map_name = os.path.splitext(os.path.basename(map_file))[0]
-    map_name = str(map_name).strip() or "实景地图"
+    map_name = str(map_name or "").strip() or "实景地图"
     if not map_name.endswith("·实景"):
         map_name = "{}·实景".format(map_name)
 
@@ -515,7 +616,7 @@ def build_map(source, name=None, max_extent=40.0):
         "name": map_name,
         "native": True,
         "imported": True,
-        "source_path": root if os.path.isdir(source) else map_file,
+        "source_path": source_path,
         "map_file": map_file,
         "width": width_m,
         "height": height_m,
@@ -532,7 +633,7 @@ def build_map(source, name=None, max_extent=40.0):
             "scale": round(scale, 4),
             "free_area_m2": round(free_area, 2),
             "obstacle_count": len(shapes),
-            "map_file": os.path.basename(map_file),
+            "map_file": os.path.basename(map_file or ""),
         },
     }
 

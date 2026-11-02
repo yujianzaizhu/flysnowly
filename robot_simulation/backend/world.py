@@ -415,6 +415,25 @@ def add_no_go_zone(x0, y0, x1, y1=None, height=None):
     return item
 
 
+def dynamic_clearance(x, y, radius=None):
+    """到最近动态障碍物表面的距离；负数表示车体已经与其重叠，无动态障碍物时返回 None。"""
+    radius = ROBOT_RADIUS if radius is None else radius
+    best = None
+    for item in DYNAMIC:
+        gap = math.hypot(x - item["x"], y - item["y"]) - item["r"] - radius
+        if best is None or gap < best:
+            best = gap
+    return best
+
+
+def in_dynamic_obstacle(x, y, margin=0.0):
+    """点是否落在某个动态障碍物圆内（含余量）；用于避免把移动物体写进建图数据。"""
+    for item in DYNAMIC:
+        if math.hypot(x - item["x"], y - item["y"]) <= item["r"] + margin:
+            return True
+    return False
+
+
 def in_no_go(x, y, margin=0.0):
     """判断点是否落在任一禁区矩形内（margin>0 时向外扩张）。"""
     for zone in NO_GO:
@@ -740,12 +759,17 @@ def vision_scan(x, y, theta, fov=None, max_range=None, rays=None):
 
 
 def collision(x, y, radius=None):
+    """静态几何碰撞（墙体 + 原始障碍物 + 静态障碍物编辑）。
+
+    动态障碍物不在这里判定：它会主动移动、甚至扫过车体，交给
+    ``dynamic_clearance`` 单独处理，避免车体被移动物卡在原地。
+    """
     radius = ROBOT_RADIUS if radius is None else radius
     if not point_in_polygon(x, y):
         return True
     if boundary_distance(x, y) < radius:
         return True
-    for ox, oy, oradius in OBSTACLES:
+    for ox, oy, oradius in STATIC_PARTS:
         if (x - ox) ** 2 + (y - oy) ** 2 < (oradius + radius) ** 2:
             return True
     for polygon in OBSTACLE_POLYGONS:
@@ -754,6 +778,54 @@ def collision(x, y, radius=None):
         if boundary_distance(x, y, polygon) < radius:
             return True
     return False
+
+
+_POLYGON_MASK_CACHE = {}
+
+
+def polygon_mask(cols, rows, cell=None):
+    """把场地多边形栅格化成按行填充的位图（缓存），避免逐格 point_in_polygon。
+
+    导入的实景地图有 300+ 个顶点，逐格判断要 20M+ 次线段测试（实测 13 s），
+    用扫描线填充后只需 rows × edges 次。
+    """
+    from math import ceil, floor
+
+    cell = CELL if cell is None else cell
+    key = (WORLD_VERSION, int(cols), int(rows), round(cell, 6))
+    cached = _POLYGON_MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    mask = bytearray(cols * rows)
+    count = len(POLYGON)
+    if count < 3:
+        _POLYGON_MASK_CACHE[key] = mask
+        return mask
+    for row in range(rows):
+        y = (row + 0.5) * cell
+        crossings = []
+        for index in range(count):
+            x1, y1 = POLYGON[index]
+            x2, y2 = POLYGON[(index + 1) % count]
+            if (y1 > y) == (y2 > y):
+                continue
+            crossings.append(x1 + (y - y1) * (x2 - x1) / (y2 - y1))
+        if not crossings:
+            continue
+        crossings.sort()
+        base = row * cols
+        for pair in range(0, len(crossings) - 1, 2):
+            left = crossings[pair]
+            right = crossings[pair + 1]
+            col0 = max(0, int(ceil(left / cell - 0.5)))
+            col1 = min(cols - 1, int(floor(right / cell - 0.5)))
+            if col1 < col0:
+                continue
+            mask[base + col0 : base + col1 + 1] = b"\x01" * (col1 - col0 + 1)
+    if len(_POLYGON_MASK_CACHE) > 4:
+        _POLYGON_MASK_CACHE.clear()
+    _POLYGON_MASK_CACHE[key] = mask
+    return mask
 
 
 def boundary_cells():

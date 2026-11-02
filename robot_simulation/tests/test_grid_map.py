@@ -185,6 +185,32 @@ class MappingTest(unittest.TestCase):
         self.assertTrue(grid.is_blocked_world(10.7, 5.6))
         self.assertFalse(grid.is_blocked_world(11.2, 5.6))
 
+    def test_stamp_footprint_only_paints_real_shape(self):
+        grid = GridMap()
+        # 1) 绕行一圈后占据栅格围成闭合轮廓：内部空洞应被补齐
+        for index in range(120):
+            angle = 2 * math.pi * index / 120.0
+            col, row = grid.cell_of(
+                5.0 + 0.50 * math.cos(angle), 4.0 + 0.50 * math.sin(angle)
+            )
+            grid.mark_occupied(col, row)
+        stamped = grid.stamp_footprint(5.0, 4.0, 0.56)
+        self.assertGreater(stamped, 0)
+        center = grid.cell_of(5.0, 4.0)
+        self.assertEqual(grid.data[grid.index(*center)], OCCUPIED)
+
+        # 2) 只看到一段弧形（未闭合）时不能按包围圆整片涂抹
+        arc = GridMap()
+        for index in range(30):
+            angle = -math.pi / 3 + (2 * math.pi / 3) * index / 29.0
+            col, row = arc.cell_of(
+                5.0 + 0.50 * math.cos(angle), 4.0 + 0.50 * math.sin(angle)
+            )
+            arc.mark_occupied(col, row)
+        arc.stamp_footprint(5.0, 4.0, 0.56)
+        inner = arc.cell_of(5.0, 4.0)
+        self.assertNotEqual(arc.data[arc.index(*inner)], OCCUPIED)
+
     def test_obstacle_cluster_detection(self):
         grid = GridMap()
         for index in range(40):

@@ -258,7 +258,7 @@ def edge_route_grid(grid, zone, start_xy, clearance=None):
             if grid.line_clear(current, loop[0]):
                 bridge = [current, loop[0]]
             else:
-                bridge = grid.plan(current, loop[0])
+                bridge = grid.plan(current, loop[0], time_budget=0.08)
             if bridge and len(bridge) > 1:
                 route.extend(bridge[1:])
             route.extend(loop[1:])

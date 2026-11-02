@@ -57,9 +57,16 @@ class RobotCar(object):
             self.battery = 100.0
             self.charging = False
             self.depleted = False
+            self.ghost = False
+            self.replay_limits = None
+            # 日志回放时电量由日志决定；None 表示按正常放电/充电逻辑走
+            self.battery_lock = None
             self.collisions = 0
             self.bump_cooldown = 0.0
             self.distance_traveled = 0.0
+            self.dock_distance = math.hypot(
+                world.DOCK["x"] - self.pose[0], world.DOCK["y"] - self.pose[1]
+            )
             self.sim_time = 0.0
             self.vision = world.vision_scan(*self.pose)
             self.events.clear()
@@ -85,9 +92,12 @@ class RobotCar(object):
             self.target_v, self.target_w = COMMANDS[name]
 
     def drive(self, linear, angular):
+        limits = self.replay_limits
+        max_v = MAX_LINEAR if limits is None else limits[0]
+        max_w = MAX_ANGULAR if limits is None else limits[1]
         with self.lock:
-            self.target_v = max(-MAX_LINEAR, min(MAX_LINEAR, linear))
-            self.target_w = max(-MAX_ANGULAR, min(MAX_ANGULAR, angular))
+            self.target_v = max(-max_v, min(max_v, linear))
+            self.target_w = max(-max_w, min(max_w, angular))
 
     def stop(self):
         self.drive(0.0, 0.0)
@@ -119,10 +129,12 @@ class RobotCar(object):
             if self._collides(nx, ny):
                 self.v = 0.0
                 self.pose[2] = ntheta
-                if self.bump_cooldown <= 0.0:
-                    self.collisions += 1
-                    self.bump_cooldown = 0.6
-                    self.log("warn", "检测到碰撞，已制动")
+                # 原地转向时位置不变，不该反复记成碰撞（否则贴着墙转圈会刷出一堆假碰撞）
+                if abs(self.v * dt) > 1e-4 or abs(self.target_v) > 0.02:
+                    if self.bump_cooldown <= 0.0:
+                        self.collisions += 1
+                        self.bump_cooldown = 0.6
+                        self.log("warn", "检测到碰撞，已制动")
             else:
                 self.pose = [nx, ny, ntheta]
                 self.distance_traveled += abs(self.v) * dt
@@ -131,10 +143,28 @@ class RobotCar(object):
             self._update_battery(dt)
 
     def _collides(self, x, y):
-        return world.collision(x, y)
+        if self.ghost:
+            # 日志回放：机器人按日志轨迹走，不因为当前地图与日志场景不一致被挡住
+            return False
+        if world.collision(x, y):
+            return True
+        gap = world.dynamic_clearance(x, y)
+        if gap is None or gap >= 0.0:
+            return False
+        # 移动物自己扫过车体不算碰撞（否则会在重叠位置反复报警、反复制动），
+        # 只有车体主动更深地撞进去才判成碰撞，这样机器人也能从重叠里开出来。
+        return gap < world.dynamic_clearance(self.pose[0], self.pose[1])
 
     def _update_battery(self, dt):
         distance = math.hypot(world.DOCK["x"] - self.pose[0], world.DOCK["y"] - self.pose[1])
+        # 记录到充电桩的直线距离：任务里用来估算"够不够电开回去"
+        self.dock_distance = distance
+        if self.battery_lock is not None:
+            # 回放日志时电量不按仿真放电算（日志里没有电量话题就锁在 100%）
+            self.battery = float(self.battery_lock)
+            self.charging = False
+            self.depleted = False
+            return
         was_charging = self.charging
         self.charging = distance < world.DOCK["r"] and abs(self.v) < 0.05
 
@@ -207,6 +237,7 @@ class RobotCar(object):
                 "depleted": self.depleted,
                 "collisions": self.collisions,
                 "distance": round(self.distance_traveled, 2),
+                "dock_distance": round(self.dock_distance, 2),
                 "vision": self._vision_summary(),
                 "robot": {
                     "radius": world.ROBOT_RADIUS,

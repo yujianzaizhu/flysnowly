@@ -1,12 +1,18 @@
 import base64
 import json
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import unittest
 import urllib.error
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import test_bag_player as bag_fixtures  # noqa: E402
 
 BACKEND_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend"
@@ -441,6 +447,106 @@ class ServerTest(unittest.TestCase):
         status, body = self.get("/")
         self.assertEqual(status, 200)
         self.assertIn("控制台", body)
+
+    def test_bag_dir_import_and_image_frame(self):
+        tmp = tempfile.mkdtemp(prefix="robot-bagdir-")
+        group = os.path.join(tmp, "连续play")
+        os.makedirs(group)
+        bag_fixtures.build_bag(os.path.join(group, "a.bag"), with_images=True)
+        try:
+            _status, body = self.post("/api/bag/dir", {"path": tmp})
+            keys = {item["key"] for item in body["bags"]}
+            key = os.path.join("连续play", "a.bag")
+            self.assertIn(key, keys)
+            self.assertIn(tmp, body["roots"])
+
+            _status, data = self.post("/api/bag/load", {"name": key})
+            self.assertTrue(data["state"]["loaded"])
+            self.assertGreater(data["state"]["image_frames"], 0)
+            self.assertEqual(data["state"]["image_topic"], "perception_debug_image")
+            self.assertIn("perception_debug_image", [t["name"] for t in data["topics"]])
+
+            _status, frame = self.get("/api/bag/frame?t=0")
+            image = json.loads(frame)["image"]
+            self.assertTrue(image["image"].startswith("data:image/jpeg;base64,"))
+            self.assertEqual(image["count"], 2)
+        finally:
+            self.post("/api/bag/control", {"command": "stop"})
+            self.httpd.bag_queue = None
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_bag_playlist_plays_multiple_bags(self):
+        tmp = tempfile.mkdtemp(prefix="robot-bagqueue-")
+        group = os.path.join(tmp, "队列")
+        os.makedirs(group)
+        bag_fixtures.build_bag(os.path.join(group, "one.bag"))
+        bag_fixtures.build_bag(os.path.join(group, "two.bag"))
+        names = [os.path.join("队列", "one.bag"), os.path.join("队列", "two.bag")]
+        try:
+            self.post("/api/bag/dir", {"path": tmp})
+            _status, body = self.post("/api/bag/playlist", {"names": names})
+            self.assertTrue(body["queue"]["active"])
+            self.assertEqual(body["queue"]["total"], 2)
+            self.assertEqual(body["queue"]["names"], names)
+            deadline = time.time() + 8.0
+            state = {}
+            while time.time() < deadline:
+                state = json.loads(self.get("/api/bag")[1])["state"]
+                if state.get("loaded") and state.get("playing"):
+                    break
+                time.sleep(0.2)
+            self.assertTrue(state.get("loaded"))
+            self.assertTrue(state.get("playing"))
+            self.assertEqual(state.get("name"), "one.bag")
+        finally:
+            self.post("/api/bag/control", {"command": "stop"})
+            self.httpd.bag_queue = None
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_bag_without_map_gets_open_field(self):
+        tmp = tempfile.mkdtemp(prefix="robot-bagnomap-")
+        path = os.path.join(tmp, "nomap.bag")
+        bag_fixtures.build_bag(path)
+        try:
+            self.post("/api/bag/dir", {"path": tmp})
+            _status, data = self.post("/api/bag/load", {"name": "nomap.bag"})
+            self.assertTrue(data["state"]["loaded"])
+            _status, body = self.get("/api/state")
+            state = json.loads(body)
+            definition = state["world"]
+            self.assertIn("无地图", definition["name"])
+            self.assertGreaterEqual(definition["width"], 24.0)
+            self.assertEqual(state.get("obstacles") or [], [])
+            self.assertAlmostEqual(
+                state["pose"]["x"], definition["width"] / 2.0, delta=3.0
+            )
+        finally:
+            self.post("/api/bag/control", {"command": "stop"})
+            self.post("/api/map", {"map": 1})
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_bag_topics_expose_layers(self):
+        tmp = tempfile.mkdtemp(prefix="robot-baglayer-")
+        bag_fixtures.build_map_bag(os.path.join(tmp, "layer.bag"))
+        try:
+            self.post("/api/bag/dir", {"path": tmp})
+            _status, data = self.post("/api/bag/load", {"name": "layer.bag"})
+            layers = {topic["name"]: topic.get("layer") for topic in data["topics"]}
+            self.assertEqual(layers.get("whole_map"), "map")
+            self.assertEqual(layers.get("grid_costmap"), "costmap")
+            self.assertEqual(layers.get("base_pose"), "pose")
+            self.assertIsNone(layers.get("imu_data"))
+            self.assertTrue(data["state"]["battery_locked"])
+            self.assertIsNone(data["state"]["battery_topic"])
+        finally:
+            self.post("/api/bag/control", {"command": "stop"})
+            self.post("/api/map", {"map": 1})
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_bag_playlist_requires_names(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post("/api/bag/playlist", {"names": []})
+        self.assertEqual(ctx.exception.code, 400)
 
     def test_static_traversal_is_blocked(self):
         with self.assertRaises(urllib.error.HTTPError) as context:

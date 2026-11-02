@@ -433,11 +433,11 @@ class PlannerNode(BaseNavNode):
     # --------------------------------------------------------- 规划工具
     def _plan_path(self, start, goal):
         grid = self.grid
-        path = grid.plan(start, goal)
+        path = grid.plan(start, goal, time_budget=0.02)
         if not path and grid.relax_around(start[0], start[1], 0.45):
-            path = grid.plan(start, goal)
+            path = grid.plan(start, goal, time_budget=0.02)
         if not path and grid.relax_around(goal[0], goal[1], 0.30):
-            path = grid.plan(start, goal)
+            path = grid.plan(start, goal, time_budget=0.02)
         if path:
             self._fail_streak = 0
             return path, 0.0
@@ -451,7 +451,7 @@ class PlannerNode(BaseNavNode):
             self._fail_streak = 0
             grid.relax_around(start[0], start[1], 1.20)
             grid.relax_around(goal[0], goal[1], 1.20)
-            path = grid.plan(start, goal)
+            path = grid.plan(start, goal, time_budget=0.02)
             if path:
                 self.log("连续多目标不可达，放开周边膨胀后重新规划")
                 return path, 0.0
@@ -607,11 +607,11 @@ class DockNode(BaseNavNode):
 
     def _plan_path(self, start, goal):
         grid = self.grid
-        path = grid.plan(start, goal)
+        path = grid.plan(start, goal, time_budget=0.02)
         if not path and grid.relax_around(start[0], start[1], 0.45):
-            path = grid.plan(start, goal)
+            path = grid.plan(start, goal, time_budget=0.02)
         if not path and grid.relax_around(goal[0], goal[1], 0.30):
-            path = grid.plan(start, goal)
+            path = grid.plan(start, goal, time_budget=0.02)
         if path:
             self._fail_streak = 0
             return path, 0.0
@@ -625,7 +625,7 @@ class DockNode(BaseNavNode):
             self._fail_streak = 0
             grid.relax_around(start[0], start[1], 1.20)
             grid.relax_around(goal[0], goal[1], 1.20)
-            path = grid.plan(start, goal)
+            path = grid.plan(start, goal, time_budget=0.02)
             if path:
                 self.log("连续多目标不可达，放开周边膨胀后重新规划")
                 return path, 0.0

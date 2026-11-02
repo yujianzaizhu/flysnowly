@@ -16,6 +16,11 @@
   const els = {
     modeChip: document.getElementById("modeChip"),
     linkChip: document.getElementById("linkChip"),
+    exitBtn: document.getElementById("exitBtn"),
+    exitOverlay: document.getElementById("exitOverlay"),
+    exitTip: document.getElementById("exitTip"),
+    exitHint: document.getElementById("exitHint"),
+    exitCloseBtn: document.getElementById("exitCloseBtn"),
     batteryText: document.getElementById("batteryText"),
     batteryFill: document.getElementById("batteryFill"),
     chargeRow: document.getElementById("chargeRow"),
@@ -24,6 +29,8 @@
     heading: document.getElementById("heading"),
     distance: document.getElementById("distance"),
     collisions: document.getElementById("collisions"),
+    dockDistance: document.getElementById("dockDistance"),
+    dockReserve: document.getElementById("dockReserve"),
     simTime: document.getElementById("simTime"),
     leftWheel: document.getElementById("leftWheel"),
     rightWheel: document.getElementById("rightWheel"),
@@ -82,6 +89,49 @@
     paramTabs: Array.from(document.querySelectorAll("[data-param-tab]")),
     paramPanes: Array.from(document.querySelectorAll("[data-param-pane]")),
     dockTabs: Array.from(document.querySelectorAll("[data-dock-tab]")),
+    bagFolder: document.getElementById("bagFolder"),
+    bagList: document.getElementById("bagList"),
+    bagQueueBtn: document.getElementById("bagQueueBtn"),
+    bagQueueInfo: document.getElementById("bagQueueInfo"),
+    sidebarToggleBtn: document.getElementById("sidebarToggleBtn"),
+    sidebarHandle: document.getElementById("sidebarHandle"),
+    sidebarTab: document.getElementById("sidebarTab"),
+    bagSelectAll: document.getElementById("bagSelectAll"),
+    bagOrderHint: document.getElementById("bagOrderHint"),
+    bagCurrentName: document.getElementById("bagCurrentName"),
+    bagBatteryInfo: document.getElementById("bagBatteryInfo"),
+    popupBackBtn: document.getElementById("popupBackBtn"),
+    bagPopBtn: document.getElementById("bagPopBtn"),
+    bagVideoLargeBtn: document.getElementById("bagVideoLargeBtn"),
+    bagVideoPopBtn: document.getElementById("bagVideoPopBtn"),
+    bagVideoCloseBtn: document.getElementById("bagVideoCloseBtn"),
+    bagVideoToggleBtn: document.getElementById("bagVideoToggleBtn"),
+    bagVideo: document.getElementById("bagVideo"),
+    bagVideoImg: document.getElementById("bagVideoImg"),
+    bagVideoTitle: document.getElementById("bagVideoTitle"),
+    bagVideoMeta: document.getElementById("bagVideoMeta"),
+    bagRefreshBtn: document.getElementById("bagRefreshBtn"),
+    bagLoadBtn: document.getElementById("bagLoadBtn"),
+    bagPlayBtn: document.getElementById("bagPlayBtn"),
+    bagPauseBtn: document.getElementById("bagPauseBtn"),
+    bagStopBtn: document.getElementById("bagStopBtn"),
+    bagSpeed: document.getElementById("bagSpeed"),
+    bagProgress: document.getElementById("bagProgress"),
+    bagTime: document.getElementById("bagTime"),
+    bagHint: document.getElementById("bagHint"),
+    bagFidelity: document.getElementById("bagFidelity"),
+    bagErrAvg: document.getElementById("bagErrAvg"),
+    bagErrMax: document.getElementById("bagErrMax"),
+    bagSamples: document.getElementById("bagSamples"),
+    bagTeleports: document.getElementById("bagTeleports"),
+    bagTopic: document.getElementById("bagTopic"),
+    bagDuration: document.getElementById("bagDuration"),
+    bagPoseCount: document.getElementById("bagPoseCount"),
+    bagPathLen: document.getElementById("bagPathLen"),
+    bagTopicList: document.getElementById("bagTopicList"),
+    bagTopicCount: document.getElementById("bagTopicCount"),
+    bagMapInfo: document.getElementById("bagMapInfo"),
+    bagCostInfo: document.getElementById("bagCostInfo"),
     dockPanes: Array.from(document.querySelectorAll("[data-dock-pane]")),
     editButtons: Array.from(document.querySelectorAll("[data-edit-kind]")),
     editRadius: document.getElementById("editRadius"),
@@ -184,7 +234,20 @@
   let previous = null;
   let currentAt = 0;
   let trail = [];
+  // 话题图层开关：日志里的 grid_costmap（红色代价方块）、轨迹、图像窗口都可单独屏蔽
+  const LAYER_KEY = "mowerTopicLayersV1";
+  let layerVisible = { pose: true, costmap: true, image: true, map: true, static_costmap: true };
+  try {
+    const saved = JSON.parse(localStorage.getItem(LAYER_KEY) || "null");
+    if (saved && typeof saved === "object") layerVisible = Object.assign(layerVisible, saved);
+  } catch (error) {
+    /* ignore */
+  }
   let lastSampleTime = -1;
+  let lastTeleportsMark = 0;
+  let lastRestarts = 0;
+  let lastLogName = "";
+  let lastBagActive = false;
   let lastBump = 0;
   let bumpFlashUntil = 0;
   let logSignature = "";
@@ -239,8 +302,10 @@
     current = state;
     currentAt = performance.now();
 
+    const replaying = !!(state.bag && state.bag.loaded);
     if (lastMapId !== null && state.map_id !== lastMapId) {
-      trail = [];
+      // 连续播放日志会重建场地，这里保留轨迹以便对照上一段作业
+      if (!replaying) trail = [];
       mapVersion = -1;
       zoneAutoValue = "";
       zoneInputDirty = false;
@@ -270,16 +335,36 @@
       renderMapEdits(state.world.edits);
     }
 
-    if (state.time + 1e-6 < lastSampleTime) {
+    if (state.time + 1e-6 < lastSampleTime && !replaying) {
       trail = [];
       previous = state;
       mapVersion = -1;
     }
     lastSampleTime = state.time;
 
+    const bag = state.bag || {};
+    const teleports = Number(bag.teleports || 0);
+    const restarts = Number(bag.restarts || 0);
+    const logName = bag.name || "";
+    const bagRestarted =
+      (logName && lastLogName && logName !== lastLogName) ||
+      restarts > lastRestarts ||
+      (!!bag.active && !lastBagActive);
+    lastRestarts = restarts;
+    lastBagActive = !!bag.active;
+    if (logName) lastLogName = logName;
+    if (bagRestarted) {
+      // 刚开始回放 / 换日志 / 拖了进度条：从当前位置重新起笔画，不画"初始跳线"
+      trail = [];
+    }
+
     const tail = trail[trail.length - 1];
-    if (!tail || Math.hypot(state.pose.x - tail.x, state.pose.y - tail.y) > 0.02) {
-      trail.push({ x: state.pose.x, y: state.pose.y });
+    const step = tail ? Math.hypot(state.pose.x - tail.x, state.pose.y - tail.y) : 0.0;
+    if (!tail || step > 0.02) {
+      // 回放中发生重定位、或位置突然跳很远：这一段画成红色跳线
+      const jump = !!tail && (teleports > lastTeleportsMark || step > 2.0);
+      lastTeleportsMark = teleports;
+      trail.push({ x: state.pose.x, y: state.pose.y, jump });
       if (trail.length > TRAIL_LIMIT) trail.shift();
     }
 
@@ -293,6 +378,10 @@
       updateMapImage(state.map);
     }
     updatePanels(state);
+    if (state.bag) {
+      renderBagState(state.bag);
+      refreshCostmap(false);
+    }
   }
 
   function setConnected(connected) {
@@ -303,7 +392,10 @@
   let mapPollTick = 0;
   let lastMapPayload = null;
 
+  let shuttingDown = false;
+
   async function poll() {
+    if (shuttingDown) return;
     const speed = current && current.speed ? current.speed : 1;
     const fast = speed >= 4;
     // 高倍速时位图 71 KB，隔几次轮询取一次，其余只取状态
@@ -780,6 +872,10 @@
     els.heading.textContent = heading.toFixed(0) + "°";
     els.distance.textContent = Math.round(state.distance);
     els.collisions.textContent = String(state.collisions);
+    if (state.dock_distance != null) {
+      els.dockDistance.textContent = state.dock_distance.toFixed(1);
+      els.dockReserve.textContent = (state.dock_distance * 0.65 + 3).toFixed(0);
+    }
     els.simTime.textContent = Math.round(state.time);
     els.leftWheel.textContent = (state.velocity.left_wheel || 0).toFixed(2);
     els.rightWheel.textContent = (state.velocity.right_wheel || 0).toFixed(2);
@@ -1162,6 +1258,7 @@
       drawDynamicPaths(geom, (state.world && state.world.dynamic) || []);
       drawObstacles(geom, state.obstacles || []);
       drawPaths(geom, state);
+      drawCostmap(geom);
       drawTrail(geom);
       drawDock(geom, world.dock, state.charging);
       const pose = poseAt(now);
@@ -1645,17 +1742,102 @@
     }
   }
 
-  function drawTrail(geom) {
-    if (trail.length < 2) return;
+  const costCanvas = document.createElement("canvas");
+  let costmapLayer = null;
+  let costmapVersion = 0;
+
+  function updateCostmapLayer(layer) {
+    if (!layer || !layer.cells || !layer.cells.length) {
+      costmapLayer = null;
+      return;
+    }
+    const width = layer.width;
+    const height = layer.height;
+    costCanvas.width = width;
+    costCanvas.height = height;
+    const cctx = costCanvas.getContext("2d");
+    const image = cctx.createImageData(width, height);
+    const data = image.data;
+    for (let row = 0; row < height; row += 1) {
+      const line = layer.cells[row];
+      for (let col = 0; col < width; col += 1) {
+        const digit = line.charCodeAt(col) - 48;
+        if (digit <= 0) continue;
+        const offset = (row * width + col) * 4;
+        if (digit >= 9) {
+          data[offset] = 255;
+          data[offset + 1] = 96;
+          data[offset + 2] = 72;
+          data[offset + 3] = 210;
+        } else if (digit >= 5) {
+          data[offset] = 255;
+          data[offset + 1] = 176;
+          data[offset + 2] = 46;
+          data[offset + 3] = 150;
+        } else {
+          data[offset] = 79;
+          data[offset + 1] = 195;
+          data[offset + 2] = 255;
+          data[offset + 3] = 70;
+        }
+      }
+    }
+    cctx.putImageData(image, 0, 0);
+    layer.flipRows = true;
+    costmapLayer = layer;
+    costmapVersion += 1;
+  }
+
+  function drawCostmap(geom) {
+    if (layerVisible.costmap === false) return;
+    if (!costmapLayer) return;
+    const width = costmapLayer.width;
+    const height = costmapLayer.height;
+    const resolution = costmapLayer.resolution;
+    if (!width || !height || !resolution) return;
+    // 栅格行 0 是最小 y：画布 y 轴向下，需要用负高度翻转绘制
+    const left = geom.x(costmapLayer.origin[0]);
+    const top = geom.y(costmapLayer.origin[1] + height * resolution);
     ctx.save();
-    ctx.lineWidth = Math.max(1, geom.scale * 0.025);
+    ctx.globalAlpha = 0.6;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(
+      costCanvas,
+      left,
+      top,
+      width * resolution * geom.scale,
+      height * resolution * geom.scale
+    );
+    ctx.restore();
+  }
+
+  // 日志自带地图说明当时是在割草作业，实际轨迹画粗一点
+  function bagPathBold() {
+    return !!(bagState && bagState.loaded && bagState.maps && bagState.maps.whole_map);
+  }
+
+  function drawTrail(geom) {
+    if (layerVisible.pose === false) return;
+    if (trail.length < 2) return;
+    const bold = bagPathBold();
+    const normal = bold ? Math.max(2.2, geom.scale * 0.05) : Math.max(1.4, geom.scale * 0.03);
+    // 跳线（回放中重定位）：红色细线
+    const jumpWidth = Math.max(1.0, geom.scale * 0.008);
+    ctx.save();
     ctx.lineCap = "round";
     for (let index = 1; index < trail.length; index += 1) {
-      const alpha = 0.03 + 0.22 * (index / trail.length);
-      ctx.strokeStyle = "rgba(" + palette.cyan + ", " + alpha.toFixed(3) + ")";
+      const point = trail[index];
+      const alpha = point.jump
+        ? 0.7
+        : bold
+        ? 0.08 + 0.4 * (index / trail.length)
+        : 0.05 + 0.3 * (index / trail.length);
+      ctx.strokeStyle =
+        "rgba(" + (point.jump ? palette.red : palette.cyan) + ", " + alpha.toFixed(3) + ")";
+      ctx.lineWidth = point.jump ? jumpWidth : normal;
       ctx.beginPath();
       ctx.moveTo(geom.x(trail[index - 1].x), geom.y(trail[index - 1].y));
-      ctx.lineTo(geom.x(trail[index].x), geom.y(trail[index].y));
+      ctx.lineTo(geom.x(point.x), geom.y(point.y));
       ctx.stroke();
     }
     ctx.restore();
@@ -2110,7 +2292,781 @@
   }
 
   els.resetBtn.addEventListener("click", resetAll);
+
+  // 退出：关闭后端服务并释放端口，界面切到退出提示
+  // 浏览器只允许脚本关闭“由脚本打开”的窗口；地址栏直接打开的标签页会被拒绝，
+  // 这时退化为“控制台已退出”的整屏提示 + 快捷键说明。
+  function tryClosePage() {
+    try {
+      window.close();
+    } catch (error) {
+      /* 被浏览器拒绝时继续走提示分支 */
+    }
+    window.setTimeout(() => {
+      if (!window.closed) els.exitHint.hidden = false;
+    }, 350);
+  }
+
+  async function shutdownConsole() {
+    const running = current && current.task && current.task.type;
+    const warning = running
+      ? "当前任务会被停止（不会保存断点），确定退出并关闭服务吗？"
+      : "确定退出控制台并关闭后端服务吗？";
+    if (!window.confirm(warning)) return;
+    shuttingDown = true;
+    let message = "后端服务已关闭，端口已释放。";
+    try {
+      await request("/api/shutdown", {});
+    } catch (error) {
+      message = "服务已关闭（连接已断开），端口已释放。";
+    }
+    document.title = "已退出 · 机器人控制台";
+    els.exitTip.textContent = message;
+    els.exitOverlay.hidden = false;
+    tryClosePage();
+  }
+
+  els.exitBtn.addEventListener("click", shutdownConsole);
+  els.exitCloseBtn.addEventListener("click", tryClosePage);
   els.estopBtn.addEventListener("click", () => send("/api/command", { command: "stop" }));
+
+  // ------------------------------------------------------------- 左侧栏收起
+  const SIDE_KEY = "mowerSideHiddenV1";
+  const layoutEl = document.querySelector(".layout");
+  let sideHidden = false;
+  try {
+    sideHidden = localStorage.getItem(SIDE_KEY) === "1";
+  } catch (error) {
+    sideHidden = false;
+  }
+
+  function applySidebarHidden(hidden) {
+    if (!layoutEl) return;
+    layoutEl.classList.toggle("is-side-hidden", !!hidden);
+    if (els.sidebarToggleBtn) {
+      els.sidebarToggleBtn.setAttribute("aria-pressed", hidden ? "true" : "false");
+      els.sidebarToggleBtn.textContent = hidden ? "◨ 侧栏" : "◧ 侧栏";
+    }
+    if (els.sidebarTab) els.sidebarTab.hidden = !hidden;
+    try {
+      localStorage.setItem(SIDE_KEY, hidden ? "1" : "0");
+    } catch (error) {
+      /* ignore */
+    }
+  }
+
+  applySidebarHidden(sideHidden);
+  if (els.popupBackBtn) els.popupBackBtn.addEventListener("click", recallPopups);
+  function toggleSidebar() {
+    sideHidden = !sideHidden;
+    applySidebarHidden(sideHidden);
+  }
+  if (els.sidebarToggleBtn) els.sidebarToggleBtn.addEventListener("click", toggleSidebar);
+  if (els.sidebarHandle) els.sidebarHandle.addEventListener("click", toggleSidebar);
+  if (els.sidebarTab) els.sidebarTab.addEventListener("click", toggleSidebar);
+
+  // ------------------------------------------------------------- 独立窗口（弹窗）
+  const POPUP_CSS = [
+    "html,body{margin:0;height:100%;background:var(--bg);color:var(--text);",
+    "font-family:'Segoe UI','PingFang SC','Microsoft YaHei',system-ui,sans-serif;font-size:12px}",
+    ".popup-host{height:100%;box-sizing:border-box}",
+  ].join("");
+  const popups = {};
+  const bagPlayerEl = document.querySelector(".bag-player");
+
+  function popupWindow(key, node, options) {
+    const opts = options || {};
+    const known = popups[key];
+    if (known && !known.win.closed) {
+      known.win.focus();
+      return known.win;
+    }
+    const size =
+      "width=" + (opts.width || 560) + ",height=" + (opts.height || 420) +
+      ",menubar=no,toolbar=no,location=no,status=no,alwaysRaised=yes";
+    const win = window.open("", "mower-" + key, size);
+    if (!win) {
+      setBagHint("浏览器拦截了弹出窗口，请允许弹窗后重试", 6000);
+      return null;
+    }
+    const doc = win.document;
+    doc.open();
+    doc.write(
+      "<!DOCTYPE html><html><head><meta charset='utf-8'><title>" +
+        (opts.title || "机器人控制台") +
+        "</title></head><body></body></html>"
+    );
+    doc.close();
+    doc.documentElement.dataset.theme = document.documentElement.dataset.theme || "dark";
+    const link = doc.createElement("link");
+    link.rel = "stylesheet";
+    link.href = location.origin + "/styles.css";
+    doc.head.appendChild(link);
+    const style = doc.createElement("style");
+    style.textContent = POPUP_CSS;
+    doc.head.appendChild(style);
+    const host = doc.createElement("div");
+    host.className = "popup-host";
+    doc.body.appendChild(host);
+    const parent = node.parentNode;
+    const next = node.nextSibling;
+    node.classList.add("is-popped");
+    host.appendChild(node);
+    popups[key] = { win, node, parent, next };
+    // 只在弹窗真的被关掉时收回节点（失焦 / 切到主窗口时不能消失）
+    refreshPopupBack();
+    try {
+      win.focus();
+    } catch (error) {
+      /* 某些浏览器不允许脚本抢焦点，忽略 */
+    }
+    return win;
+  }
+
+  function restorePopup(key) {
+    const record = popups[key];
+    if (!record) return;
+    delete popups[key];
+    if (!record.win.closed) {
+      try {
+        record.win.close();
+      } catch (error) {
+        /* 关闭失败时只把节点搬回来 */
+      }
+    }
+    record.node.classList.remove("is-popped");
+    if (record.parent && record.parent.isConnected && record.node.parentNode !== record.parent) {
+      const anchor = record.next && record.next.parentNode === record.parent ? record.next : null;
+      record.parent.insertBefore(record.node, anchor);
+    }
+    refreshPopupBack();
+  }
+
+  function refreshPopupBack() {
+    if (!els.popupBackBtn) return;
+    const open = Object.keys(popups).some((key) => !popups[key].win.closed);
+    els.popupBackBtn.hidden = !open;
+  }
+
+  function recallPopups() {
+    Object.keys(popups).forEach((key) => restorePopup(key));
+  }
+
+  function syncPopups() {
+    Object.keys(popups).forEach((key) => {
+      if (popups[key].win.closed) restorePopup(key);
+    });
+  }
+
+  // ------------------------------------------------------------- 日志播放
+  let bagState = null;
+  let bagPath = [];
+  let bagDragging = false;
+  let bagEntries = [];
+  let bagGroups = [];
+  let bagVisible = [];
+  let bagCurrentKey = "";
+  let bagChecked = new Set();
+  let bagOrder = [];
+
+  function setLayerVisible(layer, visible) {
+    layerVisible[layer] = !!visible;
+    try {
+      localStorage.setItem(LAYER_KEY, JSON.stringify(layerVisible));
+    } catch (error) {
+      /* ignore */
+    }
+    if (layer === "image") {
+      bagVideoClosed = !visible;
+      if (visible && bagState && bagState.loaded) refreshBagImage(true);
+      updateBagVideo(bagState);
+    }
+  }
+
+  let bagQueue = null;
+  let bagImageState = { index: -1, key: "", busy: false };
+  let bagImageTimer = 0;
+  let bagLiveName = "";
+  let bagVideoClosed = false;
+
+  // 提示语：操作类提示短暂优先显示，避免被每秒两次的状态刷新覆盖
+  let bagHintUntil = 0;
+
+  function setBagHint(text, stickyMs) {
+    const now = performance.now();
+    if (!stickyMs && now < bagHintUntil) return;
+    if (stickyMs) bagHintUntil = now + stickyMs;
+    els.bagHint.textContent = text;
+  }
+
+  // 日志编号：zmqbag_15_2026-09-15-... → 15，用于“从大到小”排序
+  function bagNumber(bag) {
+    const name = (bag && bag.name) || "";
+    const matched = name.match(/(\d+)/g);
+    if (!matched) return -1;
+    return parseInt(matched[0], 10);
+  }
+
+  function sortBagsDesc(bags) {
+    return bags
+      .slice()
+      .sort((a, b) => {
+        const diff = bagNumber(b) - bagNumber(a);
+        if (diff !== 0) return diff;
+        return (b.mtime || 0) - (a.mtime || 0);
+      });
+  }
+
+  function selectAllVisible() {
+    const ordered = sortBagsDesc(bagVisible);
+    bagChecked = new Set(ordered.map((bag) => bag.key));
+    bagOrder = ordered.map((bag) => bag.key);
+    renderBagList();
+    renderBagQueue(bagQueue);
+  }
+
+  function clearBagSelection() {
+    bagChecked = new Set();
+    bagOrder = [];
+    renderBagList();
+    renderBagQueue(bagQueue);
+  }
+
+  function formatSize(bytes) {
+    return ((bytes || 0) / 1048576).toFixed(1) + " MB";
+  }
+
+  function renderBagFolders() {
+    if (!els.bagFolder) return;
+    const current = els.bagFolder.value;
+    els.bagFolder.textContent = "";
+    const all = document.createElement("option");
+    all.value = "";
+    all.textContent = "全部（" + bagEntries.length + " 个）";
+    els.bagFolder.append(all);
+    bagGroups.forEach((group) => {
+      const option = document.createElement("option");
+      option.value = group;
+      const count = bagEntries.filter((bag) => bag.group === group).length;
+      option.textContent = group + "（" + count + "）";
+      els.bagFolder.append(option);
+    });
+    els.bagFolder.value = bagGroups.includes(current) ? current : "";
+  }
+
+  function renderBagList() {
+    if (!els.bagList) return;
+    const group = els.bagFolder ? els.bagFolder.value : "";
+    bagVisible = sortBagsDesc(bagEntries.filter((bag) => !group || bag.group === group));
+    els.bagList.textContent = "";
+    if (!bagVisible.length) {
+      const empty = document.createElement("p");
+      empty.className = "bag-hint";
+      empty.textContent = "这个文件夹里没有 .bag 日志，可以导入其他文件夹";
+      els.bagList.append(empty);
+      return;
+    }
+    bagVisible.forEach((bag) => {
+      const row = document.createElement("div");
+      row.className = "bag-item" + (bag.key === bagCurrentKey ? " is-active" : "");
+      row.title = bag.path;
+      const check = document.createElement("input");
+      check.type = "checkbox";
+      check.checked = bagChecked.has(bag.key);
+      check.addEventListener("change", () => {
+        if (check.checked) {
+          bagChecked.add(bag.key);
+          if (!bagOrder.includes(bag.key)) bagOrder.push(bag.key);
+        } else {
+          bagChecked.delete(bag.key);
+          bagOrder = bagOrder.filter((key) => key !== bag.key);
+        }
+        renderBagList();
+        renderBagQueue(bagQueue);
+      });
+      const orderIndex = bagOrder.indexOf(bag.key);
+      const name = document.createElement("span");
+      name.className = "bag-item-name";
+      name.textContent = bag.name;
+      row.append(check);
+      if (orderIndex >= 0) {
+        const order = document.createElement("span");
+        order.className = "bag-item-order";
+        order.textContent = String(orderIndex + 1);
+        row.append(order);
+      }
+      row.append(name);
+      const meta = document.createElement("em");
+      meta.textContent = formatSize(bag.size);
+      row.append(meta);
+      if (orderIndex >= 0) {
+        const tools = document.createElement("span");
+        tools.className = "bag-item-move";
+        const up = document.createElement("button");
+        up.type = "button";
+        up.textContent = "▲";
+        up.title = "提前播放";
+        up.disabled = orderIndex === 0;
+        up.addEventListener("click", (event) => {
+          event.stopPropagation();
+          moveBagOrder(bag.key, -1);
+        });
+        const down = document.createElement("button");
+        down.type = "button";
+        down.textContent = "▼";
+        down.title = "延后播放";
+        down.disabled = orderIndex === bagOrder.length - 1;
+        down.addEventListener("click", (event) => {
+          event.stopPropagation();
+          moveBagOrder(bag.key, 1);
+        });
+        tools.append(up, down);
+        row.append(tools);
+      }
+      row.addEventListener("click", (event) => {
+        if (event.target === check || event.target.closest(".bag-item-move")) return;
+        bagCurrentKey = bag.key;
+        renderBagList();
+      });
+      row.addEventListener("dblclick", () => {
+        bagCurrentKey = bag.key;
+        renderBagList();
+        loadBag();
+      });
+      els.bagList.append(row);
+    });
+    if (els.bagSelectAll) {
+      const allChecked =
+        bagVisible.length > 0 && bagVisible.every((bag) => bagChecked.has(bag.key));
+      els.bagSelectAll.checked = allChecked;
+    }
+    if (els.bagOrderHint) {
+      els.bagOrderHint.textContent = bagOrder.length
+        ? "已按编号从大到小排好，可 ▲▼ 微调"
+        : "按日志编号从大到小";
+    }
+  }
+
+  function moveBagOrder(key, delta) {
+    const from = bagOrder.indexOf(key);
+    const to = from + delta;
+    if (from < 0 || to < 0 || to >= bagOrder.length) return;
+    bagOrder.splice(to, 0, bagOrder.splice(from, 1)[0]);
+    renderBagList();
+    renderBagQueue(bagQueue);
+  }
+
+  const LAYER_LABELS = {
+    pose: "仿真实际轨迹（跳变处画细线）",
+    costmap: "日志代价地图叠加（机器人周围的红/橙方块就是它）",
+    static_costmap: "静态代价地图（当前未叠加显示）",
+    image: "日志图像窗口",
+    map: "日志真实地图（已作为仿真场地，不能隐藏）",
+  };
+
+  function renderBagTopics(topics) {
+    if (!els.bagTopicList) return;
+    els.bagTopicList.textContent = "";
+    if (els.bagTopicCount) els.bagTopicCount.textContent = String((topics || []).length);
+    (topics || []).forEach((topic) => {
+      const layer = topic.layer;
+      const row = document.createElement("label");
+      row.className = "bag-topic";
+      const check = document.createElement("input");
+      check.type = "checkbox";
+      if (layer) {
+        check.checked = layerVisible[layer] !== false;
+        row.title = "勾选=显示，“" + topic.name + "”对应：" + (LAYER_LABELS[layer] || layer);
+        check.addEventListener("change", () => {
+          setLayerVisible(layer, check.checked);
+          renderBagTopics(topics);
+        });
+        if (layer === "map" || layer === "static_costmap") {
+          row.classList.add("bag-topic--static");
+          check.disabled = true;
+        }
+      } else {
+        check.checked = true;
+        check.disabled = true;
+        row.title = "该话题只参与回放数据，不单独绘制图层";
+      }
+      const name = document.createElement("span");
+      name.className = "bag-topic-name";
+      name.textContent = topic.name;
+      const meta = document.createElement("em");
+      meta.textContent = topic.count + " · " + topic.hz + " Hz";
+      row.append(check, name, meta);
+      if (layer && layerVisible[layer] === false) row.classList.add("bag-topic--off");
+      els.bagTopicList.append(row);
+    });
+    if (!topics || !topics.length) {
+      const empty = document.createElement("p");
+      empty.className = "bag-hint";
+      empty.textContent = "载入日志后显示话题列表";
+      els.bagTopicList.append(empty);
+    }
+  }
+
+  function renderBagQueue(queue) {
+    bagQueue = queue || null;
+    if (!els.bagQueueInfo) return;
+    const total = queue && queue.total ? queue.total : 0;
+    const index = queue && queue.total ? queue.index + 1 : 0;
+    if (!total) {
+      els.bagQueueInfo.textContent = bagOrder.length
+        ? "顺序 " + bagOrder.length + " 个"
+        : "队列 --";
+      return;
+    }
+    els.bagQueueInfo.textContent = (queue.active ? "连续播放 " : "队列 ") + index + "/" + total;
+  }
+
+  function renderBagState(state) {
+    if (!state || !els.bagTime) return;
+    bagState = state;
+    const duration = state.duration || 0;
+    const time = state.time || 0;
+    if (!bagDragging) {
+      const ratio = duration > 0 ? time / duration : 0;
+      els.bagProgress.value = String(Math.round(ratio * 1000));
+    }
+    els.bagTime.textContent = time.toFixed(1) + " / " + duration.toFixed(1) + " s";
+    const percent = state.samples ? (state.fidelity * 100).toFixed(1) : "--";
+    els.bagFidelity.textContent = percent === "--" ? "--" : percent + "%";
+    els.bagFidelity.classList.toggle("is-good", state.samples > 0 && state.fidelity >= 0.9);
+    els.bagFidelity.classList.toggle("is-bad", state.samples > 0 && state.fidelity < 0.9);
+    els.bagErrAvg.textContent = state.samples ? state.error_avg.toFixed(3) : "--";
+    els.bagErrMax.textContent = state.samples ? state.error_max.toFixed(2) : "--";
+    els.bagSamples.textContent = String(state.samples || 0);
+    els.bagTeleports.textContent = String(state.teleports || 0);
+    els.bagTopic.textContent = state.pose_topic || "--";
+    if (els.bagCurrentName) {
+      els.bagCurrentName.textContent = state.loaded && state.name ? state.name : "未载入";
+    }
+    if (els.bagBatteryInfo) {
+      els.bagBatteryInfo.textContent = state.loaded
+        ? state.battery_topic
+          ? state.battery_topic + "（日志）"
+          : "无电量话题 · 固定 100%"
+        : "--";
+    }
+    els.bagDuration.textContent = duration ? duration.toFixed(1) : "--";
+    const summary = state.summary;
+    els.bagPoseCount.textContent = summary ? String(summary.poses) : "--";
+    els.bagPathLen.textContent = summary ? summary.path_length.toFixed(1) : "--";
+    const maps = state.maps || {};
+    if (els.bagMapInfo) {
+      const whole = maps.whole_map;
+      els.bagMapInfo.textContent = whole
+        ? whole.size[0] + "×" + whole.size[1] + " m"
+        : "--";
+    }
+    if (els.bagCostInfo) {
+      const cost = maps.grid_costmap;
+      els.bagCostInfo.textContent = cost
+        ? cost.size[0] + "×" + cost.size[1] + " m · " + (cost.frames || 1) + " 帧"
+        : "--";
+    }
+    if (state.loaded && state.name && state.name !== bagLiveName) {
+      // 连续播放会自动切换日志：同步新的日志轨迹与话题
+      bagLiveName = state.name;
+      syncBagDetail();
+    }
+    if (state.loaded) {
+      const noMap = !(maps.whole_map || {}).size
+        ? "（该日志没有地图数据，已切换为不限制区域的开阔场地）"
+        : "";
+      const paused = state.active && !state.playing && !state.finished;
+      setBagHint(
+        (state.playing
+          ? "回放中：青色线是仿真实际轨迹，红色细线是跳变（重定位/换日志）"
+          : state.finished
+          ? "回放结束，可拖动进度条重播或重新载入其他日志"
+          : paused
+          ? "已暂停，点“继续”从当前位置接着回放"
+          : "已载入，点“播放”开始把日志轨迹映射到仿真机器人上") + noMap,
+        0
+      );
+    } else {
+      setBagHint("选择日志后点“载入”，再点“播放”；勾选多个可“连续播放”。", 0);
+    }
+    if (els.bagPlayBtn) {
+      const paused = state.loaded && state.active && !state.playing && !state.finished;
+      els.bagPlayBtn.textContent = paused ? "继续" : "播放";
+      els.bagPlayBtn.title = paused
+        ? "从暂停位置继续回放"
+        : "从头播放（已暂停时可直接继续）";
+      els.bagPauseBtn.disabled = !state.playing;
+    }
+    updateBagVideo(state);
+    if (els.bagVideoToggleBtn) {
+      els.bagVideoToggleBtn.setAttribute(
+        "aria-pressed",
+        els.bagVideo && !els.bagVideo.hidden ? "true" : "false"
+      );
+    }
+    syncPopups();
+  }
+
+  let costmapPollAt = 0;
+  let costmapTime = -1;
+
+  async function refreshCostmap(force) {
+    const state = bagState;
+    if (!state || !state.loaded) {
+      costmapLayer = null;
+      return;
+    }
+    const time = state.time || 0;
+    // 暂停 / 拖动进度条后也要更新代价地图，按时间变化判定即可
+    if (!force && !state.playing && Math.abs(time - costmapTime) < 0.3) return;
+    const now = performance.now();
+    if (!force && now - costmapPollAt < 500) return;
+    costmapPollAt = now;
+    costmapTime = time;
+    try {
+      const data = await request("/api/bag/costmap?t=" + time);
+      if (data.costmap) updateCostmapLayer(data.costmap);
+    } catch (error) {
+      /* 回放切换/结束期间的请求失败忽略 */
+    }
+  }
+
+  // ------------------------------------------------------------- 日志图像窗口
+  function updateBagVideo(state) {
+    if (!els.bagVideo) return;
+    const loaded = !!(state && state.loaded && state.image_frames);
+    els.bagVideo.hidden = !loaded || bagVideoClosed;
+    if (!loaded) {
+      bagImageState = { index: -1, key: "", busy: false };
+      if (bagImageTimer) {
+        clearInterval(bagImageTimer);
+        bagImageTimer = 0;
+      }
+      if (popups.video && !popups.video.win.closed) popups.video.win.close();
+      return;
+    }
+    if (els.bagVideoTitle && state.image_topic) {
+      els.bagVideoTitle.textContent = state.image_topic;
+    }
+    const key = (state.name || "") + ":" + (state.time || 0).toFixed(1);
+    if (!bagImageTimer) {
+      bagImageTimer = setInterval(() => refreshBagImage(false), 160);
+    }
+    if (bagImageState.key !== key) refreshBagImage(true);
+  }
+
+  async function refreshBagImage(force) {
+    const state = bagState;
+    if (!state || !state.loaded || !state.image_frames) return;
+    if (bagImageState.busy) return;
+    bagImageState.busy = true;
+    try {
+      const data = await request("/api/bag/frame?t=" + (state.time || 0));
+      const image = data.image;
+      if (!image) {
+        bagImageState = { index: -1, key: "", busy: false };
+        return;
+      }
+      const stamp = (state.name || "") + ":" + image.index;
+      if (stamp !== bagImageState.key) {
+        bagImageState.key = stamp;
+        if (els.bagVideoImg) els.bagVideoImg.src = image.image;
+      }
+      if (els.bagVideoMeta) {
+        els.bagVideoMeta.textContent =
+          image.index + 1 + "/" + image.count + " · " + image.width + "×" + image.height;
+      }
+      bagImageState.index = image.index;
+    } catch (error) {
+      /* 回放切换/结束期间的请求失败忽略 */
+    } finally {
+      bagImageState.busy = false;
+    }
+  }
+
+  // ------------------------------------------------------------- 日志文件与队列
+  async function syncBagDetail() {
+    try {
+      const data = await request("/api/bag");
+      if (data.path && data.path.length) bagPath = data.path;
+      if (data.state) {
+        bagVideoClosed = false;
+        renderBagState(data.state);
+        renderBagTopics(data.topics || []);
+      }
+      renderBagQueue(data.queue);
+      refreshCostmap(true);
+      refreshBagImage(true);
+    } catch (error) {
+      /* 切换瞬间的失败忽略，下一次轮询会补上 */
+    }
+  }
+
+  async function refreshBags() {
+    try {
+      const data = await request("/api/bag");
+      bagEntries = data.bags || [];
+      bagGroups = data.groups || [];
+      renderBagFolders();
+      if (!bagCurrentKey && bagEntries.length) bagCurrentKey = bagEntries[0].key;
+      renderBagList();
+      renderBagQueue(data.queue);
+      renderBagState(data.state);
+      if (data.path && data.path.length) bagPath = data.path;
+    } catch (error) {
+      setBagHint("刷新失败：" + error.message, 6000);
+    }
+  }
+
+  async function loadBag() {
+    const key = bagCurrentKey;
+    if (!key) {
+      setBagHint("日志目录里没有可用的 bag 文件", 6000);
+      return;
+    }
+    setBagHint("正在解析日志…（100 MB 级 bag 约 0.5 s）", 6000);
+    try {
+      const data = await request("/api/bag/load", { name: key });
+      bagCurrentKey = key;
+      renderBagState(data.state);
+      renderBagQueue(data.queue);
+      bagPath = data.path || [];
+      renderBagTopics(data.topics);
+      bagVideoClosed = false;
+      refreshCostmap(true);
+      refreshBagImage(true);
+      const summary = data.summary || {};
+      setBagHint(
+        "已载入 " + key.split("/").pop() + "：" + (summary.poses || 0) + " 帧位姿，时长 " +
+          (data.state.duration || 0).toFixed(1) + " s，轨迹 " +
+          (summary.path_length || 0).toFixed(1) + " m",
+        6000
+      );
+    } catch (error) {
+      setBagHint("载入失败：" + error.message, 6000);
+    }
+  }
+
+  async function startBagQueue() {
+    // 优先按用户勾选的顺序（可用 ▲▼ 调整），没勾选则按当前列表顺序
+    const known = new Set(bagEntries.map((bag) => bag.key));
+    const names = bagOrder.filter((key) => known.has(key));
+    const queueNames = names.length ? names : bagVisible.map((bag) => bag.key);
+    if (!queueNames.length) {
+      setBagHint("当前文件夹里没有可播放的日志", 6000);
+      return;
+    }
+    setBagHint("连续播放 " + queueNames.length + " 个日志…", 6000);
+    try {
+      const data = await request("/api/bag/playlist", { names: queueNames });
+      renderBagQueue(data.queue);
+      renderBagState(data.state);
+    } catch (error) {
+      setBagHint("连续播放失败：" + error.message, 6000);
+    }
+  }
+
+  async function bagControl(command, extra) {
+    try {
+      const data = await request("/api/bag/control", Object.assign({ command }, extra || {}));
+      renderBagState(data.state);
+      if (data.path) bagPath = data.path;
+    } catch (error) {
+      setBagHint("操作失败：" + error.message, 6000);
+    }
+  }
+
+  if (els.bagSelectAll) {
+    els.bagSelectAll.addEventListener("change", () => {
+      if (els.bagSelectAll.checked) selectAllVisible();
+      else clearBagSelection();
+    });
+  }
+
+  if (els.bagVideoToggleBtn) {
+    els.bagVideoToggleBtn.addEventListener("click", () => {
+      if (!bagState || !bagState.loaded) {
+        setBagHint("先载入日志，图像窗口只在回放日志时显示", 6000);
+        return;
+      }
+      bagVideoClosed = !bagVideoClosed;
+      if (!bagVideoClosed) {
+        refreshBagImage(true);
+      }
+      if (bagVideoClosed && popups.video && !popups.video.win.closed) {
+        popups.video.win.close();
+      }
+      updateBagVideo(bagState);
+      els.bagVideoToggleBtn.setAttribute("aria-pressed", bagVideoClosed ? "false" : "true");
+    });
+  }
+
+  if (els.bagVideoLargeBtn) {
+    els.bagVideoLargeBtn.addEventListener("click", () => {
+      const large = els.bagVideo.classList.toggle("is-large");
+      els.bagVideoLargeBtn.setAttribute("aria-pressed", large ? "true" : "false");
+      els.bagVideoLargeBtn.textContent = large ? "⤡" : "⤢";
+      els.bagVideoLargeBtn.title = large ? "还原大小" : "放大";
+    });
+    els.bagVideoPopBtn.addEventListener("click", () => {
+      popupWindow("video", els.bagVideo, {
+        title: (bagState && bagState.image_topic) || "日志图像",
+        width: 620,
+        height: 540,
+      });
+    });
+    els.bagVideoCloseBtn.addEventListener("click", () => {
+      bagVideoClosed = true;
+      els.bagVideo.hidden = true;
+      if (popups.video && !popups.video.win.closed) popups.video.win.close();
+    });
+  }
+
+  if (els.bagPopBtn) {
+    els.bagPopBtn.addEventListener("click", () => {
+      popupWindow("player", bagPlayerEl, {
+        title: "日志播放 · 机器人控制台",
+        width: 1020,
+        height: 480,
+      });
+    });
+  }
+
+  if (els.bagLoadBtn) {
+    els.bagRefreshBtn.addEventListener("click", refreshBags);
+    els.bagLoadBtn.addEventListener("click", loadBag);
+    els.bagQueueBtn.addEventListener("click", startBagQueue);
+    els.bagFolder.addEventListener("change", renderBagList);
+    els.bagPlayBtn.addEventListener("click", () => {
+      // 暂停/拖动后点"继续"是从当前位置接着放，不是从头重播
+      const paused = bagState && bagState.active && !bagState.playing && !bagState.finished;
+      bagControl(paused ? "resume" : "play");
+    });
+    els.bagPauseBtn.addEventListener("click", () => bagControl("pause"));
+    els.bagStopBtn.addEventListener("click", () => bagControl("stop"));
+    els.bagSpeed.addEventListener("change", () => {
+      // 回放倍速叠加在仿真倍速上：直接改仿真速度
+      const factor = Number(els.bagSpeed.value) || 1;
+      send("/api/speed", { speed: factor >= 4 ? 4 : factor });
+    });
+    els.bagProgress.addEventListener("pointerdown", () => {
+      bagDragging = true;
+    });
+    els.bagProgress.addEventListener("pointerup", () => {
+      bagDragging = false;
+      const duration = bagState && bagState.duration ? bagState.duration : 0;
+      const ratio = Number(els.bagProgress.value) / 1000;
+      bagControl("seek", { time: ratio * duration });
+    });
+    els.bagProgress.addEventListener("change", () => {
+      if (bagDragging) return;
+      const duration = bagState && bagState.duration ? bagState.duration : 0;
+      const ratio = Number(els.bagProgress.value) / 1000;
+      bagControl("seek", { time: ratio * duration });
+    });
+    refreshBags();
+  }
 
   // ------------------------------------------------------------- 模块显示 / 拖动
   const MODULE_KEY = "mowerModulesV1";
@@ -2209,7 +3165,7 @@
   }
 
   function selectDockTab(name, persist) {
-    dockTab = name === "nodes" ? "nodes" : "events";
+    dockTab = ["nodes", "bag"].includes(name) ? name : "events";
     els.dockTabs.forEach((tab) => {
       const active = tab.dataset.dockTab === dockTab;
       tab.classList.toggle("is-active", active);
