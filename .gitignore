@@ -35,3 +35,6 @@
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# 本地日志包（bag）体积大，不入库
+data/bag/
