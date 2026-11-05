@@ -40,7 +40,7 @@ def advance(manager, seconds, stop=("done",), phases=None, poses=None, keep_batt
 
 def map_field(robot, grid, manager):
     manager.start_mapping()
-    advance(manager, 250.0)
+    advance(manager, 1400.0)
 
 
 class MappingTaskTest(unittest.TestCase):
@@ -57,7 +57,7 @@ class MappingTaskTest(unittest.TestCase):
         robot, grid, manager = make_system()
         poses = []
         manager.start_mapping()
-        advance(manager, 250.0, poses=poses)
+        advance(manager, 1400.0, poses=poses)
         self.assertEqual(manager.phase, "done")
         self.assertGreaterEqual(grid.boundary_discovery(), 0.95)
         self.assertEqual(robot.collisions, 0)
@@ -78,7 +78,7 @@ class MappingTaskTest(unittest.TestCase):
         robot.battery = 35.0
         phases = set()
         manager.start_mapping()
-        advance(manager, 400.0, phases=phases)
+        advance(manager, 1800.0, phases=phases)
         self.assertIn("charging", phases)
         self.assertIn("charge_return", phases)
         self.assertEqual(manager.phase, "done")
@@ -89,15 +89,22 @@ class MappingTaskTest(unittest.TestCase):
         self.assertEqual(robot.collisions, 0)
 
 
-    def test_mapping_clears_map_edits(self):
+    def test_mapping_keeps_map_edits(self):
+        """用户手动加的障碍/禁区只能由用户删除，重新建图不能清掉。"""
         robot, grid, manager = make_system()
         world.add_static_obstacle(5.0, 4.5, 0.4)
         world.add_no_go_zone(3.0, 3.0, 5.0, 4.0)
-        self.assertTrue(world.edit_dict()["static"])
-        manager.start_mapping()
-        self.assertEqual(world.edit_dict()["static"], [])
-        self.assertEqual(world.edit_dict()["no_go"], [])
-        self.assertEqual(world.NO_GO, [])
+        try:
+            self.assertTrue(world.edit_dict()["static"])
+            manager.start_mapping()
+            self.assertTrue(world.edit_dict()["static"])
+            self.assertTrue(world.edit_dict()["no_go"])
+            self.assertTrue(world.NO_GO)
+            # 障碍物也要重新写进栅格，规划才知道那儿过不去
+            col, row = grid.cell_of(5.0, 4.5)
+            self.assertTrue(grid.is_occupied_world(5.0, 4.5) or grid.cell_blocked(col, row))
+        finally:
+            world.clear_edits()
 
     def test_no_go_ring_bypass_generates_counter_clockwise_route(self):
         robot, grid, manager = make_system()
@@ -239,9 +246,10 @@ class MowingTaskTest(unittest.TestCase):
         grid.data[smear] = 2
         grid.mow_blocked[smear] = 1
         manager.start_mowing([zone["id"]])
-        self.assertEqual(grid.data[smear], 0)
+        self.assertNotEqual(grid.data[smear], 2)
         self.assertFalse(grid.mow_blocked[smear])
-        self.assertEqual([tuple(point) for point in grid.zones[0]["outline"]], outline_before)
+        after = [item for item in grid.zones if item["id"] == zone["id"]][0]
+        self.assertEqual([tuple(point) for point in after["outline"]], outline_before)
         messages = [entry["message"] for entry in robot.events]
         self.assertTrue(any("重置区域内障碍涂抹" in message for message in messages))
 

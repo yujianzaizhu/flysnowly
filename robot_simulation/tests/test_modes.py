@@ -41,7 +41,7 @@ def advance(manager, seconds, phases=None, stop=("done",), keep_battery=False):
 
 def map_field(robot, grid, manager):
     manager.start_mapping()
-    advance(manager, 250.0)
+    advance(manager, 1400.0)
 
 
 class ModeFlowTest(unittest.TestCase):

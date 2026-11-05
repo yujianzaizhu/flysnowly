@@ -25,6 +25,17 @@ def zone_cell(grid, zone):
     return None
 
 
+def _segment_hits_circle(segment, cx, cy, radius):
+    """线段是否与圆相交（只判中点与两个端点已足够用于测试）。"""
+    (ax, ay), (bx, by) = segment
+    for ratio in (0.0, 0.25, 0.5, 0.75, 1.0):
+        x = ax + (bx - ax) * ratio
+        y = ay + (by - ay) * ratio
+        if math.hypot(x - cx, y - cy) <= radius:
+            return True
+    return False
+
+
 class MappingTest(unittest.TestCase):
     def setUp(self):
         world.select_map(1)
@@ -296,6 +307,88 @@ class PlannerTest(unittest.TestCase):
         ]
         self.assertLess(max(jumps), 0.25)
 
+    def test_edge_route_mask_stays_inside_zone(self):
+        """新规则：区域矩形框 ∩ 自由区 → 腐蚀 → 轮廓，路径必须整段落在该区域内。"""
+        for map_id in (1, 3, 5):
+            world.select_map(map_id)
+            grid = GridMap()
+            self.assertTrue(grid.build_free_area((world.START["x"], world.START["y"])))
+            for zone in grid.partition_zones():
+                route = planner.edge_route_mask(grid, zone, (zone["cx"], zone["cy"]))
+                self.assertGreater(len(route), 20)
+                inside = sum(
+                    1
+                    for x, y in route
+                    if grid.cell_in_zone(*grid.cell_of(x, y), zone["id"])
+                )
+                self.assertEqual(inside, len(route), "区域 %d 的沿边点跑出区域外" % zone["id"])
+                # 闭合
+                self.assertLess(math.hypot(route[0][0] - route[-1][0], route[0][1] - route[-1][1]), 1e-6)
+                # 加密到 <= 0.16 m
+                gaps = [
+                    math.hypot(route[index + 1][0] - route[index][0], route[index + 1][1] - route[index][1])
+                    for index in range(len(route) - 1)
+                ]
+                self.assertLess(max(gaps), 0.17)
+                # 不再按"离多边形墙至少多少米"断言：沿边内缩已收到 EDGE_INSET
+                # （0.02 m）以贴墙割草，而 map_3/map_5 的墙体在几何上是零宽缝隙，
+                # 缝两侧到墙距离本来就很小。路径是否贴着区域边界由上面的
+                # "整段落在区域内 + 闭合 + 加密到 0.16 m" 与下面的内缩矩形测试覆盖。
+
+    def test_lane_segments_skip_unreachable_obstacle_interior(self):
+        """绕障绕完一圈后，障碍物内部是"从没看到过"的未知格，但被已探明占据环
+        封死。它不是机器人所在连通域的一部分，不能在新弓字线里出现。"""
+        world.select_map(1)
+        grid = GridMap()
+        self.assertTrue(grid.build_free_area((world.START["x"], world.START["y"])))
+        zone = grid.partition_zones()[0]
+        cx, cy = zone["cx"], zone["cy"]
+        radius = 0.6
+        # 人为造一个**闭合**的占据环（内部保持未知），模拟"绕障一圈后就再没看到
+        # 内部"：环要有厚度，否则格子缝隙会让内外连通。
+        span = int(radius / grid.cell) + 3
+        col0, row0 = grid.cell_of(cx, cy)
+        for dc in range(-span, span + 1):
+            for dr in range(-span, span + 1):
+                x, y = grid.center_of(col0 + dc, row0 + dr)
+                distance = math.hypot(x - cx, y - cy)
+                if radius - grid.cell <= distance <= radius + grid.cell:
+                    grid.data[grid.index(col0 + dc, row0 + dr)] = OCCUPIED
+        grid.data_version += 1
+
+        unfiltered = planner.lane_segments(grid, zone)
+        inside_unfiltered = [
+            segment for segment in unfiltered if _segment_hits_circle(segment, cx, cy, radius - 0.15)
+        ]
+        self.assertTrue(inside_unfiltered, "构造的障碍环内部本应被当成未知可割区")
+
+        grid.set_reach_seed(world.START["x"], world.START["y"])
+        filtered = planner.lane_segments(grid, zone)
+        for segment in filtered:
+            self.assertFalse(
+                _segment_hits_circle(segment, cx, cy, radius - 0.15),
+                "障碍物内部不可达，不该生成弓字线段",
+            )
+
+    def test_edge_route_mask_inset_matches_rectangle(self):
+        """规则区域腐蚀后就等价于内缩矩形：周长接近 2*(w+h-2*inset)。"""
+        world.select_map(3)
+        grid = GridMap()
+        self.assertTrue(grid.build_free_area((world.START["x"], world.START["y"])))
+        zone = grid.partition_zones()[0]
+        route = planner.edge_route_mask(grid, zone, (zone["cx"], zone["cy"]))
+        length = sum(
+            math.hypot(route[index + 1][0] - route[index][0], route[index + 1][1] - route[index][1])
+            for index in range(len(route) - 1)
+        )
+        inset = planner.EDGE_INSET + grid.cell * 0.5
+        expected = 2.0 * (zone["x1"] - zone["x0"] - 2 * inset) + 2.0 * (
+            zone["y1"] - zone["y0"] - 2 * inset
+        )
+        self.assertLess(abs(length - expected) / expected, 0.12)
+        self.assertLessEqual(max(x for x, _y in route), zone["x1"] - inset + grid.cell)
+        self.assertGreaterEqual(min(x for x, _y in route), zone["x0"] + inset - grid.cell)
+
     def test_edge_route_is_closed(self):
         grid = GridMap()
         self.assertTrue(grid.build_free_area((4.9, 6.2)))
@@ -313,6 +406,110 @@ class PlannerTest(unittest.TestCase):
         ordered = planner.order_segments(segments, (4.2, 0.0), 0.0)
         self.assertEqual(ordered[0][0], (4.0, 0.0))
         self.assertEqual(ordered[1][0], (0.0, 1.0))
+
+    def test_boundary_cells_count_only_sensable_side(self):
+        """探明率的分母只能是场地内那一半墙格：外侧格子射线永远打不到。"""
+        for map_id in (1, 3, 5):
+            world.select_map(map_id)
+            cells = world.boundary_cells()
+            self.assertTrue(cells)
+            for col, row in cells:
+                x, y = (col + 0.5) * world.CELL, (row + 0.5) * world.CELL
+                self.assertTrue(
+                    world.point_in_polygon(x, y),
+                    "边界统计包含场地外的格子 ({:.2f}, {:.2f})".format(x, y),
+                )
+
+    def test_boundary_gaps_only_reports_unknown_wall_cells(self):
+        world.select_map(1)
+        grid = GridMap()
+        self.assertTrue(world.boundary_cells())
+        gaps = grid.boundary_gaps()
+        self.assertTrue(gaps)
+        for gap in gaps:
+            self.assertGreater(gap["run_m"], 0.0)
+            self.assertGreater(gap["cells"], 0)
+
+    def test_verified_footprint_never_turns_into_obstacle(self):
+        """车体压过的格子是"一定能走"的硬证据，后续盖章不能再写成障碍。"""
+        world.select_map(1)
+        grid = GridMap()
+        x = 8.5 * world.MAP_SCALE - 0.70
+        y = 2.0 * world.MAP_SCALE
+        col, row = grid.cell_of(x, y)
+        grid.update_from_scan((x, y, 0.0), [], world.VISION_RANGE)
+        self.assertTrue(grid.verified_free[grid.index(col, row)])
+        grid.mark_occupied(col, row)
+        self.assertNotEqual(grid.data[grid.index(col, row)], OCCUPIED)
+        self.assertEqual(grid.blocked[grid.index(col, row)], 0)
+
+    def test_wall_pending_matches_full_scan(self):
+        """增量维护的"未探明墙格"必须和逐格重算的结果完全一致。"""
+        world.select_map(1)
+        grid = GridMap()
+        robot_x, robot_y = world.START["x"], world.START["y"]
+        for step in range(120):
+            angle = step * 0.31
+            pose = (
+                robot_x + 0.6 * math.cos(angle),
+                robot_y + 0.6 * math.sin(angle),
+                angle,
+            )
+            grid.update_from_scan(pose, world.vision_scan(*pose), world.VISION_RANGE)
+            if step % 20:
+                continue
+            cols, rows, data = grid.cols, grid.rows, grid.data
+            full = set()
+            for col, row in grid.wall_cells:
+                index = row * cols + col
+                if data[index] != UNKNOWN:
+                    continue
+                seen = False
+                for dc in (-1, 0, 1):
+                    for dr in (-1, 0, 1):
+                        c2, r2 = col + dc, row + dr
+                        if 0 <= c2 < cols and 0 <= r2 < rows:
+                            if data[r2 * cols + c2] == OCCUPIED:
+                                seen = True
+                if not seen:
+                    full.add(index)
+            self.assertEqual(set(grid._wall_pending_set()), full)
+            self.assertAlmostEqual(
+                grid.boundary_discovery(),
+                1.0 - len(full) / float(len(grid.wall_cells)),
+                places=6,
+            )
+
+    def test_raycast_matches_brute_force(self):
+        """分桶 + 按格缓存后的射线求交结果必须与逐段暴力求交一致。"""
+        for map_id in (1, 5):
+            world.select_map(map_id)
+            samples = [
+                (2.0, 2.0, 0.3),
+                (world.WIDTH * 0.5, world.HEIGHT * 0.5, 1.1),
+                (1.0, world.HEIGHT - 1.0, -0.7),
+                (world.WIDTH - 1.0, 1.2, 2.4),
+            ]
+            for x, y, angle in samples:
+                expected = world.VISION_RANGE
+                dx, dy = math.cos(angle), math.sin(angle)
+                for ax, ay, bx, by in (
+                    world.POLYGON_SEGMENTS + world.OBSTACLE_SEGMENTS
+                ):
+                    ex, ey = bx - ax, by - ay
+                    denom = dx * ey - dy * ex
+                    if -1e-9 < denom < 1e-9:
+                        continue
+                    qx, qy = ax - x, ay - y
+                    t = (qx * ey - qy * ex) / denom
+                    if t <= 1e-6 or t >= expected:
+                        continue
+                    u = (qx * dy - qy * dx) / denom
+                    if -1e-9 <= u <= 1.0 + 1e-9:
+                        expected = t
+                self.assertAlmostEqual(
+                    world.raycast(x, y, angle), expected, places=9
+                )
 
     def test_ring_route_does_not_intersect_obstacle(self):
         circle = {"x": 5.0, "y": 4.5, "r": 0.35}

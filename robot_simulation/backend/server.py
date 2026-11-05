@@ -4,6 +4,7 @@ import argparse
 import base64
 import hashlib
 import json
+import gzip
 import os
 import sys
 import tempfile
@@ -18,8 +19,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bag_reader  # noqa: E402
 import config  # noqa: E402
 import map_import  # noqa: E402
-import nav_bus  # noqa: E402
-import nav_bridge  # noqa: E402
 import world  # noqa: E402
 from grid_map import GridMap  # noqa: E402
 from robot_car import RobotCar  # noqa: E402
@@ -314,7 +313,12 @@ class Simulator(threading.Thread):
             self.manager = manager
 
     def step_size(self):
-        """按倍速自适应积分步长：高倍速时用更大步长，避免每个 20 ms 都跑一遍全量计算。"""
+        """按倍速自适应积分步长：高倍速时用更大步长，避免每个 20 ms 都跑一遍全量计算。
+
+        一步的算量几乎固定（41 条视觉射线 + 栅格写入），所以倍速能跑到多少
+        基本取决于步长。实测步长再放大到 0.04 s 会让窄走廊里频繁撞墙
+        （导入地图整场碰撞上千次），0.033 s 是安全上限。
+        """
         if self.speed <= 4:
             return self.tick_size
         if self.speed <= 16:
@@ -349,8 +353,12 @@ class Simulator(threading.Thread):
                     self.on_cycle()
                 except Exception:
                     traceback.print_exc()
-            # 1 ms 节拍：保证高倍速时每轮累积的仿真时间足以跨过一步，不会因节拍太粗掉速
-            self._stop_event.wait(0.001)
+            # 只在"攒不够下一步的仿真时间"时才睡，且按还差多少墙钟时间精确睡。
+            # 原来固定睡 1 ms：光睡眠就让每轮至少 1 ms，一轮又只跑一步 33 ms 仿真，
+            # 32 倍速下实测只能跑到十几倍（大实景地图更慢），倍速形同虚设。
+            if accumulator < tick:
+                wait = (tick - accumulator) / float(max(1, self.speed))
+                self._stop_event.wait(min(0.004, max(0.0002, wait)))
 
     def stop(self):
         self._stop_event.set()
@@ -369,12 +377,6 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
             self._send_json(self._state(include_map=with_map))
         elif path == "/api/world":
             self._send_json(world.world_dict())
-        elif path == "/api/nav/config":
-            nav = self.server.manager.nav
-            self._send_json(nav.static_summary() if nav is not None else {"loaded": False})
-        elif path == "/api/nav":
-            nav = self.server.manager.nav
-            self._send_json(nav.snapshot() if nav is not None else {"error": "导航节点未启用"})
         elif path == "/api/bag":
             manager = self.server.manager
             entries = list_bag_entries(self.server)
@@ -474,12 +476,10 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                     world.select_map(map_id)
                     robot = RobotCar()
                     grid = GridMap()
-                    manager, nav = build_manager(robot, grid)
-                    nav.set_enabled(getattr(self.server.nav, "enabled", True))
+                    manager = build_manager(robot, grid)
                     self.server.robot = robot
                     self.server.grid = grid
                     self.server.manager = manager
-                    self.server.nav = nav
                     self.server.simulator.manager = manager
             elif path == "/api/map/edit":
                 action = str(payload.get("action") or "")
@@ -549,12 +549,10 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                         world.select_map(1)
                         robot = RobotCar()
                         grid = GridMap()
-                        manager, nav = build_manager(robot, grid)
-                        nav.set_enabled(getattr(self.server.nav, "enabled", True))
+                        manager = build_manager(robot, grid)
                         self.server.robot = robot
                         self.server.grid = grid
                         self.server.manager = manager
-                        self.server.nav = nav
                         self.server.simulator.manager = manager
             elif path == "/api/map/import":
                 source = str(payload.get("path") or "").strip()
@@ -575,12 +573,10 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                     world.select_map(map_id)
                     robot = RobotCar()
                     grid = GridMap()
-                    manager, nav = build_manager(robot, grid)
-                    nav.set_enabled(getattr(self.server.nav, "enabled", True))
+                    manager = build_manager(robot, grid)
                     self.server.robot = robot
                     self.server.grid = grid
                     self.server.manager = manager
-                    self.server.nav = nav
                     self.server.simulator.manager = manager
             elif path == "/api/map/upload":
                 max_extent = payload.get("max_extent", 40.0)
@@ -599,12 +595,10 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                     world.select_map(map_id)
                     robot = RobotCar()
                     grid = GridMap()
-                    manager, nav = build_manager(robot, grid)
-                    nav.set_enabled(getattr(self.server.nav, "enabled", True))
+                    manager = build_manager(robot, grid)
                     self.server.robot = robot
                     self.server.grid = grid
                     self.server.manager = manager
-                    self.server.nav = nav
                     self.server.simulator.manager = manager
             elif path == "/api/config":
                 if manager.task is not None and manager.phase not in ("idle", "done", "stopped"):
@@ -619,32 +613,6 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                     raise ValueError("请先暂停或结束任务，再重置参数")
                 config.reset()
                 manager.mowing_mode = config.settings.mowing_mode
-            elif path == "/api/nav/config":
-                nav = manager.nav
-                if nav is None:
-                    raise ValueError("导航节点未启用")
-                summary = nav.apply_static_config(payload.get("path") or None)
-                self._send_json(summary)
-                return
-            elif path == "/api/nav/mode":
-                nav = manager.nav
-                if nav is None:
-                    raise ValueError("导航节点未启用")
-                enabled = payload.get("enabled")
-                if enabled is None:
-                    raise ValueError("缺少 enabled 字段")
-                nav.set_enabled(bool(enabled))
-            elif path == "/api/nav/action":
-                nav = manager.nav
-                if nav is None:
-                    raise ValueError("导航节点未启用")
-                action = str(payload.get("action") or "nav_task_action")
-                goal = payload.get("goal") or {}
-                request = {"cmd": int(payload.get("cmd", nav_bus.ACTION_START)), "goal": goal}
-                response = nav.call_action(str(payload.get("node") or "planner"), action, request)
-                if response.get("error"):
-                    raise ValueError(response["error"])
-                self._apply_nav_side_effects(manager, action, request["cmd"], goal, response)
             elif path.startswith("/api/bag/"):
                 action = path[len("/api/bag/"):]
                 if action == "load":
@@ -737,34 +705,12 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
         self._send_json(self._state())
 
     # --------------------------------------------------------------- 工具
-    def _apply_nav_side_effects(self, manager, action, cmd, goal, response):
-        """把节点动作命令翻译成仿真任务控制（节点 → 仿真的下行链路）。"""
-        if response.get("status") != nav_bus.RESULT_SUCCEED:
-            return
-        if action == "autodock_action" and cmd == nav_bus.ACTION_START:
-            manager.request_charge()
-        elif action == "leave_dock_action" and cmd == nav_bus.ACTION_START:
-            manager.request_resume()
-        elif action == "nav_task_action":
-            mode = int(goal.get("mode", 0) or 0)
-            if cmd == nav_bus.ACTION_START and mode == nav_bus.MODE_COVERAGE:
-                zones = goal.get("path_name") or goal.get("zones")
-                manager.start_mowing(zones, goal.get("mow_mode"))
-            elif cmd == nav_bus.ACTION_PAUSE:
-                manager.stop_task("planner 节点请求暂停")
-            elif cmd == nav_bus.ACTION_CONTINUE:
-                manager.request_resume()
-            elif cmd in (nav_bus.ACTION_CANCEL, nav_bus.ACTION_FINISHED):
-                manager.stop_task("planner 节点请求结束任务", resumable=False)
-
     def _state(self, include_map=True):
         state = self.server.manager.get_state(include_map=include_map)
         state["speed"] = self.server.simulator.speed
         state["map_id"] = world.MAP_ID
         state["map_name"] = world.MAP_NAME
         state["config"] = dict(config.settings.__dict__)
-        nav = self.server.manager.nav if self.server.manager else None
-        state["nav"] = nav.snapshot() if nav is not None else None
         state["bag"] = self.server.manager.replay_state()
         return state
 
@@ -788,10 +734,23 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, payload, status=200):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        encoding = None
+        # 大实景地图的 /api/state 有 300+ KB（栅格是 15 万格的字符画），
+        # 高倍速时前端几十毫秒轮询一次，光传输和 JSON.parse 就把两边都拖住。
+        # 栅格字符画压缩率极高（300 KB → 4 KB），开 gzip 后轮询几乎不占带宽。
+        if len(body) > 2048 and "gzip" in (self.headers.get("Accept-Encoding") or ""):
+            # 级别 1 就够：栅格字符画重复度极高，1 级的体积和 6 级差不多，
+            # 但 CPU 只要十分之一，高倍速轮询时不跟仿真线程抢 GIL。
+            # 注意必须是 gzip 流（zlib.compress 带的是 zlib 头，浏览器会解码失败）。
+            body = gzip.compress(body, 1)
+            encoding = "gzip"
         self.send_response(status)
         self.send_header("Content-Type", CONTENT_TYPES[".json"])
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+            self.send_header("Vary", "Accept-Encoding")
         self.end_headers()
         self.wfile.write(body)
 
@@ -855,13 +814,8 @@ class RobotHTTPServer(ThreadingHTTPServer):
 
 
 def build_manager(robot, grid):
-    """创建任务管理器，并接入 planner / dock / region_manager / trajectory_map 四个节点。"""
-    nav = nav_bridge.NavBridge(robot, grid)
-    try:
-        nav.apply_static_config()
-    except Exception as exc:  # static_config 缺失时保持默认参数
-        print("static_config 未导入：{}".format(exc))
-    return TaskManager(robot, grid, nav=nav), nav
+    """创建任务管理器（纯 Python 规划/控制）。"""
+    return TaskManager(robot, grid)
 
 
 def rebuild_system(httpd, definition=None):
@@ -871,13 +825,11 @@ def rebuild_system(httpd, definition=None):
         world.select_map(map_id)
     robot = RobotCar()
     grid = GridMap()
-    manager, nav = build_manager(robot, grid)
-    nav.set_enabled(getattr(httpd.nav, "enabled", True))
+    manager = build_manager(robot, grid)
     with httpd.simulator.lock:
         httpd.robot = robot
         httpd.grid = grid
         httpd.manager = manager
-        httpd.nav = nav
         httpd.simulator.replace_manager(manager)
     return manager
 
@@ -886,12 +838,11 @@ def create_server(host="127.0.0.1", port=8000):
     world.select_map(1)
     robot = RobotCar()
     grid = GridMap()
-    manager, nav = build_manager(robot, grid)
+    manager = build_manager(robot, grid)
     httpd = RobotHTTPServer((host, port), RobotRequestHandler)
     httpd.robot = robot
     httpd.grid = grid
     httpd.manager = manager
-    httpd.nav = nav
     httpd.bag_roots = [BAG_DIR]
     httpd.bag_queue = None
     httpd.simulator = Simulator(manager)

@@ -17,7 +17,7 @@ ANGULAR_ACCEL = 4.5
 
 CHARGE_RATE = 8.0
 IDLE_DRAIN = 0.02
-DRAIN_FACTOR = 0.6
+DRAIN_FACTOR = 0.2
 # 原地待机（停机不耗驱动）时按正常运行功耗的 10% 计。
 IDLE_DRAIN_SCALE = 0.1
 

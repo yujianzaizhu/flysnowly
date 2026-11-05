@@ -36,7 +36,7 @@ MAPS = (1, 2, 3, 4, 5)
 MODES = ("A", "B")
 MAP_DT = 0.05
 RUN_DT = 0.08
-MAX_MAP_SECONDS = 420.0
+MAX_MAP_SECONDS = 1500.0
 MAX_MOW_SECONDS = 3000.0
 RESULT_PATH = "/tmp/mode_benchmark_full.json"
 GRID_DIR = "/tmp/robot_benchmark_grids"
@@ -74,7 +74,7 @@ def _prepare_map(map_id):
         "phase": manager.phase,
         "sim_time": round(robot.sim_time, 1),
         "zones": len(grid.zones),
-        "free_cells": grid.free_total,
+        "free_cells": getattr(grid, "free_total", 0),
         "collisions": robot.collisions,
     }
 

@@ -729,37 +729,6 @@ body {
   display: block;
 }
 
-.dock-pane[data-dock-pane="nodes"] {
-  max-height: 300px;
-  overflow-y: auto;
-  overflow-x: hidden;
-}
-
-/* 导航节点内容按列排布，宽屏下一屏看全 */
-.nav-columns {
-  display: grid;
-  grid-template-columns: minmax(200px, 1fr) minmax(150px, 0.78fr) minmax(210px, 1.1fr);
-  gap: 12px;
-  align-items: start;
-  margin-top: 8px;
-}
-
-.nav-columns > * {
-  min-width: 0;
-}
-
-.nav-columns .nav-topic-list--col {
-  margin-top: 0;
-  padding-top: 0;
-  border-top: 0;
-}
-
-@media (max-width: 620px) {
-  .nav-columns {
-    grid-template-columns: 1fr;
-  }
-}
-
 /* ------------------------------------------------------------- 日志播放器 */
 .dock-pane[data-dock-pane="bag"] {
   /* 播放栏 + 导入 + 列表 + 右侧话题/指标一屏放得下 */
@@ -1330,6 +1299,44 @@ body {
   flex-wrap: wrap;
 }
 
+.mission-row--head {
+  gap: 10px;
+}
+
+.mission-head-title {
+  font-size: 10.5px;
+  letter-spacing: 1.2px;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.mission-fold {
+  margin-left: auto;
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(var(--panel-soft-rgb), 0.6);
+  color: var(--muted);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.mission-fold:hover {
+  color: var(--cyan);
+  border-color: rgba(var(--cyan-rgb), 0.5);
+}
+
+/* 收起任务操作：只留标题行，把地图区域让出来 */
+.mission.is-folded .mission-row--controls,
+.mission.is-folded .mission-row--status {
+  display: none;
+}
+
+.mission.is-folded {
+  padding: 6px 12px;
+  gap: 0;
+}
+
 .mission-row--status {
   gap: 10px;
   font-size: 11px;
@@ -1831,157 +1838,6 @@ body {
   color: var(--cyan);
   border-color: rgba(var(--cyan-rgb), 0.6);
   background: rgba(var(--cyan-rgb), 0.16);
-}
-
-.nav-mode-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 8px;
-  padding: 5px 8px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: rgba(var(--green-rgb), 0.08);
-}
-
-.nav-mode-row .task-btn {
-  margin-left: auto;
-  padding: 4px 10px;
-  font-size: 10px;
-}
-
-.nav-mode-row .nav-mode-hint:last-child {
-  text-align: right;
-}
-
-.nav-mode {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 11px;
-  color: var(--text);
-  cursor: pointer;
-}
-
-.nav-mode input {
-  accent-color: var(--green);
-}
-
-.nav-mode-hint {
-  font-size: 9.5px;
-  color: rgba(var(--muted-rgb), 0.9);
-  text-align: right;
-}
-
-.nav-mode-hint.is-off {
-  color: var(--amber);
-}
-
-.nav-static-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 9px 0 6px;
-}
-
-.nav-static-row .task-btn {
-  flex: 0 0 auto;
-  padding: 5px 9px;
-  font-size: 10px;
-}
-
-.nav-node-list {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-
-.nav-node {
-  padding: 5px 8px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  background: rgba(var(--panel-soft-rgb), 0.55);
-}
-
-.nav-node-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  font-size: 11px;
-  color: var(--text);
-}
-
-.nav-node-head strong {
-  font-weight: 600;
-  letter-spacing: 0.2px;
-}
-
-.nav-state {
-  padding: 1px 7px;
-  border-radius: 999px;
-  font-size: 9.5px;
-  border: 1px solid var(--line-strong);
-  color: var(--muted);
-  white-space: nowrap;
-}
-
-.nav-state--running { color: var(--green); border-color: rgba(var(--green-rgb), 0.55); }
-.nav-state--pause { color: var(--amber); border-color: rgba(var(--amber-rgb), 0.55); }
-.nav-state--fail { color: var(--red); border-color: rgba(var(--red-rgb), 0.55); }
-
-.nav-action {
-  margin-top: 2px;
-  font-size: 9.5px;
-  color: rgba(var(--muted-rgb), 0.85);
-  font-variant-numeric: tabular-nums;
-  overflow-wrap: anywhere;
-}
-
-.nav-topic-list {
-  margin-top: 8px;
-  padding-top: 7px;
-  border-top: 1px dashed var(--line);
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  font-size: 9.5px;
-  color: rgba(var(--muted-rgb), 0.8);
-}
-
-.nav-topic-title {
-  font-size: 9.5px;
-  letter-spacing: 0.6px;
-  color: var(--muted);
-  text-transform: uppercase;
-}
-
-.nav-topic {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.nav-topic-name {
-  color: var(--cyan);
-  min-width: 0;
-  flex: 1 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.nav-topic em {
-  font-style: normal;
-  color: rgba(var(--muted-rgb), 0.85);
-  white-space: nowrap;
-  flex: 0 0 auto;
-  max-width: 64%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-variant-numeric: tabular-nums;
 }
 
 /* ------------------------------------------------------------- 模块菜单 / 可拖动面板 */

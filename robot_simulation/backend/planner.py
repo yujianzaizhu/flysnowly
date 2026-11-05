@@ -5,8 +5,9 @@ import math
 import world
 
 LANE_SPACING = 0.30
-EDGE_INSET = 0.22
+EDGE_INSET = 0.02
 RING_MARGIN = 0.34
+SQRT2 = math.sqrt(2.0)
 
 
 def _polygon_area(points):
@@ -64,95 +65,116 @@ def edge_route(zone, start_xy, inset=None):
     return route
 
 
-def edge_route_grid(grid, zone, start_xy, clearance=None):
-    """沿区域自由区边界（内缩 clearance）生成闭合巡边路径。"""
-    # 路径中心离开边界约一个车体半径即可；割草宽度半幅略大于该距离，
-    # 保证刀盘覆盖到区域边界/障碍物边界的最后一小条草。
-    clearance = (
-        max(0.12, min(EDGE_INSET, world.ROBOT_RADIUS - 0.04))
-        if clearance is None
-        else clearance
-    )
-    from collections import deque
-
+def _zone_free_cells(grid, zone):
+    """区域矩形框 ∩ 建图自由区：区域内属于该区域、且建图时判为自由的栅格。"""
     zone_id = zone["id"]
     cols = grid.cols
-    rows = grid.rows
     zone_map = grid.zone_id_map
-    cells = []
+    free = grid.free_mask
+    cells = set()
     for index, assigned in enumerate(zone_map):
-        if assigned != zone_id or not grid.free_mask[index]:
-            continue
-        col = index % cols
-        row = index // cols
-        cells.append((col, row))
-    if len(cells) < 20:
-        return edge_route(zone, start_xy)
+        if assigned == zone_id and free[index]:
+            cells.add((index % cols, index // cols))
+    return cells
 
-    # 在区域栅格内做一次多源 BFS，距离边界 >= 2 格的内部栅格即为安全巡边带，
-    # 比逐格 12 方向采样快一个数量级。
-    distance = [-1] * (cols * rows)
-    queue = deque()
+
+def _chamfer_distance(cells, cols, c0, c1, r0, r1, grid_rows=None):
+    """bbox 内到最近"非掩膜格"的距离（格），4/8 邻域权重 1 与 √2 的两遍扫描。
+
+    等价于"以掩膜为前景做欧氏腐蚀"的距离场，比逐格多方向采样快得多。
+    """
+    inf = float("inf")
+    grid_rows = cols if grid_rows is None else grid_rows
+    width = c1 - c0 + 1
+    height = r1 - r0 + 1
+    dist = [0.0] * (width * height)
     for col, row in cells:
-        index = row * cols + col
-        boundary_cell = False
-        for dc, dr in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            nc, nr = col + dc, row + dr
-            if not grid.in_bounds(nc, nr) or zone_map[nr * cols + nc] != zone_id:
-                boundary_cell = True
-                break
-        if boundary_cell:
-            distance[index] = 0
-            queue.append((col, row))
-    while queue:
-        col, row = queue.popleft()
-        index = row * cols + col
-        for dc, dr in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            nc, nr = col + dc, row + dr
-            if not grid.in_bounds(nc, nr):
-                continue
-            nindex = nr * cols + nc
-            if zone_map[nindex] != zone_id or distance[nindex] >= 0:
-                continue
-            distance[nindex] = distance[index] + 1
-            queue.append((nc, nr))
-
-    safe = set()
+        if c0 <= col <= c1 and r0 <= row <= r1:
+            dist[(row - r0) * width + (col - c0)] = inf
+    # 栅格图之外按"边界外"处理：贴着画面边缘的自由格距离记 1 格，
+    # 否则整幅地图都是自由区时（掩膜铺满整张图）算不出边界，腐蚀会失效。
     for col, row in cells:
-        index = row * cols + col
-        if distance[index] < 2:
-            continue
-        x, y = grid.center_of(col, row)
-        ok = True
-        # 地图边界：巡边带离外墙至少 车体半径 + 0.10 m（与区域边界内缩一起考虑）
-        if world.boundary_distance(x, y) < world.ROBOT_RADIUS + 0.10:
-            ok = False
-        if ok:
-            for polygon in world.OBSTACLE_POLYGONS:
-                if (
-                    world.point_in_polygon(x, y, polygon)
-                    or world.boundary_distance(x, y, polygon)
-                    < world.ROBOT_RADIUS + 0.05
-                ):
-                    ok = False
-                    break
-        if ok:
-            for ox, oy, radius in world.OBSTACLES:
-                if math.hypot(x - ox, y - oy) < radius + world.ROBOT_RADIUS + 0.05:
-                    ok = False
-                    break
-        if ok:
-            safe.add((col, row))
-    if len(safe) < 8:
-        return edge_route(zone, start_xy)
+        if c0 <= col <= c1 and r0 <= row <= r1:
+            if col in (0, cols - 1) or row in (0, grid_rows - 1):
+                dist[(row - r0) * width + (col - c0)] = 1.0
+    for row in range(height):
+        base = row * width
+        for col in range(width):
+            index = base + col
+            if dist[index] == 0.0:
+                continue
+            best = dist[index]
+            if col > 0:
+                left = dist[index - 1] + 1.0
+                if left < best:
+                    best = left
+            if row > 0:
+                up = index - width
+                value = dist[up] + 1.0
+                if value < best:
+                    best = value
+                if col > 0:
+                    value = dist[up - 1] + SQRT2
+                    if value < best:
+                        best = value
+                if col + 1 < width:
+                    value = dist[up + 1] + SQRT2
+                    if value < best:
+                        best = value
+            dist[index] = best
+    for row in range(height - 1, -1, -1):
+        base = row * width
+        for col in range(width - 1, -1, -1):
+            index = base + col
+            if dist[index] == 0.0:
+                continue
+            best = dist[index]
+            if col + 1 < width:
+                right = dist[index + 1] + 1.0
+                if right < best:
+                    best = right
+            if row + 1 < height:
+                down = index + width
+                value = dist[down] + 1.0
+                if value < best:
+                    best = value
+                if col > 0:
+                    value = dist[down - 1] + SQRT2
+                    if value < best:
+                        best = value
+                if col + 1 < width:
+                    value = dist[down + 1] + SQRT2
+                    if value < best:
+                        best = value
+            dist[index] = best
+    return dist, width, c0, r0
 
-    boundary = []
-    for col, row in safe:
+
+def _erode(cells, dist, width, c0, r0, threshold):
+    """按距离阈值腐蚀：距离 >= threshold 格的点保留。"""
+    result = set()
+    for cell in cells:
+        col, row = cell
+        value = dist[(row - r0) * width + (col - c0)]
+        if value >= threshold:
+            result.add(cell)
+    return result
+
+
+def _mask_border(cells):
+    """掩膜边界格：4 邻域有任一格不在掩膜内。"""
+    border = []
+    for col, row in cells:
         for dc, dr in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            if (col + dc, row + dr) not in safe:
-                boundary.append((col, row))
+            if (col + dc, row + dr) not in cells:
+                border.append((col, row))
                 break
-    unvisited = set(boundary)
+    return border
+
+
+def _components_8(cells):
+    """8 邻域连通分量。"""
+    unvisited = set(cells)
     components = []
     while unvisited:
         seed = unvisited.pop()
@@ -170,64 +192,101 @@ def edge_route_grid(grid, zone, start_xy, clearance=None):
                         stack.append(neighbour)
                         component.append(neighbour)
         components.append(component)
-    def walk_component(component):
-        loop_cells = set(component)
-        start_cell = min(
-            loop_cells,
-            key=lambda cell: math.hypot(
-                grid.center_of(*cell)[0] - start_xy[0],
-                grid.center_of(*cell)[1] - start_xy[1],
-            ),
-        )
-        walk = [start_cell]
-        visited = {start_cell}
-        current = start_cell
-        previous = None
-        while True:
-            candidates = []
-            for dc in (-1, 0, 1):
-                for dr in (-1, 0, 1):
-                    if dc == 0 and dr == 0:
-                        continue
-                    neighbour = (current[0] + dc, current[1] + dr)
-                    if neighbour in loop_cells and neighbour not in visited:
-                        candidates.append(neighbour)
-            if not candidates:
-                break
-            if previous is None:
-                chosen = min(
-                    candidates,
-                    key=lambda cell: abs(cell[0] - current[0])
-                    + abs(cell[1] - current[1]),
-                )
-            else:
-                previous_heading = math.atan2(
-                    current[1] - previous[1], current[0] - previous[0]
-                )
+    return components
 
-                def score(cell):
-                    heading = math.atan2(
-                        cell[1] - current[1], cell[0] - current[0]
-                    )
-                    turn = abs(world.wrap_angle(heading - previous_heading))
-                    diagonal = abs(cell[0] - current[0]) + abs(cell[1] - current[1]) > 1
-                    return turn + (0.45 if diagonal else 0.0)
 
-                chosen = min(candidates, key=score)
-            walk.append(chosen)
-            visited.add(chosen)
-            previous, current = current, chosen
-        points = [grid.center_of(col, row) for col, row in walk]
-        if len(points) < 2:
-            return []
-        points.append(points[0])
-        return points
+def _trace_loop(grid, component, start_xy):
+    """在 1 格厚的边界环上，从离机器人最近的格起按最小转向走一圈。"""
+    loop_cells = set(component)
+    start_cell = min(
+        loop_cells,
+        key=lambda cell: math.hypot(
+            grid.center_of(*cell)[0] - start_xy[0],
+            grid.center_of(*cell)[1] - start_xy[1],
+        ),
+    )
+    walk = [start_cell]
+    visited = {start_cell}
+    current = start_cell
+    previous = None
+    while True:
+        candidates = []
+        for dc in (-1, 0, 1):
+            for dr in (-1, 0, 1):
+                if dc == 0 and dr == 0:
+                    continue
+                neighbour = (current[0] + dc, current[1] + dr)
+                if neighbour in loop_cells and neighbour not in visited:
+                    candidates.append(neighbour)
+        if not candidates:
+            break
+        if previous is None:
+            chosen = min(
+                candidates,
+                key=lambda cell: abs(cell[0] - current[0]) + abs(cell[1] - current[1]),
+            )
+        else:
+            previous_heading = math.atan2(
+                current[1] - previous[1], current[0] - previous[0]
+            )
+
+            def score(cell):
+                heading = math.atan2(cell[1] - current[1], cell[0] - current[0])
+                turn = abs(world.wrap_angle(heading - previous_heading))
+                diagonal = abs(cell[0] - current[0]) + abs(cell[1] - current[1]) > 1
+                return turn + (0.45 if diagonal else 0.0)
+
+            chosen = min(candidates, key=score)
+        walk.append(chosen)
+        visited.add(chosen)
+        previous, current = current, chosen
+    points = [grid.center_of(col, row) for col, row in walk]
+    if len(points) < 2:
+        return []
+    points.append(points[0])
+    return points
+
+
+def edge_route_mask(grid, zone, start_xy, inset=None):
+    """沿边轨迹 = 腐蚀后的「区域矩形框 ∩ 建图自由区」的外轮廓。
+
+    - 交集：只保留该区域内、建图时判为自由的栅格，天然满足"不出区域、不进占据/场外"；
+    - 腐蚀：按 inset 做欧氏腐蚀（默认 EDGE_INSET），把路径压到离边界一个车体半径量级的位置，
+      让刀盘能盖住最后一条草、又不会贴墙；
+    - 轮廓：取腐蚀后掩膜的外轮廓并按最小转向闭合，最后按 0.16 m 加密。
+
+    规则矩形区域腐蚀后仍是一个内缩矩形（拐角变圆，对后驱小车更平滑），
+    不规则区域则自动贴合真实边界，因此不需要再用"填充率"去判形状。
+    """
+    inset = EDGE_INSET if inset is None else inset
+    cells = _zone_free_cells(grid, zone)
+    if len(cells) < 20:
+        return edge_route(zone, start_xy)
+    cell = grid.cell
+    c0, r0 = grid.cell_of(zone["x0"], zone["y0"])
+    c1, r1 = grid.cell_of(zone["x1"], zone["y1"])
+    c0 = max(0, c0 - 1)
+    r0 = max(0, r0 - 1)
+    c1 = min(grid.cols - 1, c1 + 1)
+    r1 = min(grid.rows - 1, r1 + 1)
+    dist, width, _, _ = _chamfer_distance(cells, grid.cols, c0, c1, r0, r1, grid.rows)
+    # 距离场量的是"格心"，真实边界在格心外半格，这里补上半个格
+    threshold = max(0.5, (float(inset) + 0.5 * cell) / max(1e-6, cell))
+    eroded = set()
+    # 窄通道里腐蚀过头会让掩膜消失，逐级放缓而不是直接放弃
+    for _ in range(5):
+        eroded = _erode(cells, dist, width, c0, r0, threshold)
+        if len(eroded) >= 20:
+            break
+        threshold = max(1.0, threshold - 0.5)
+    if len(eroded) < 20:
+        return edge_route(zone, start_xy)
 
     loops = []
-    for component in components:
+    for component in _components_8(_mask_border(eroded)):
         if len(component) < 8:
             continue
-        points = walk_component(component)
+        points = _trace_loop(grid, component, start_xy)
         if len(points) < 3:
             continue
         if _polygon_area(points) < 0.0:
@@ -236,36 +295,19 @@ def edge_route_grid(grid, zone, start_xy, clearance=None):
     if not loops:
         return edge_route(zone, start_xy)
     loops.sort(key=lambda points: -_path_length(points))
-    # 外边界先由沿边阶段完成；区域内部障碍由后续环形补割按实体边界处理，
-    # 避免在沿边路径中插入长距离切换造成碰撞。
-    loops = loops[:1]
-
-    route = []
-    current = start_xy
-    for loop in loops:
-        if len(loop) < 3:
-            continue
-        entry_index = min(
-            range(len(loop) - 1),
-            key=lambda index: math.hypot(
-                loop[index][0] - current[0], loop[index][1] - current[1]
-            ),
-        )
-        loop = loop[entry_index:-1] + loop[:entry_index] + [loop[entry_index]]
-        if not route:
-            route = list(loop)
-        else:
-            if grid.line_clear(current, loop[0]):
-                bridge = [current, loop[0]]
-            else:
-                bridge = grid.plan(current, loop[0], time_budget=0.08)
-            if bridge and len(bridge) > 1:
-                route.extend(bridge[1:])
-            route.extend(loop[1:])
-        current = route[-1]
-    if len(route) < 2:
-        return edge_route(zone, start_xy)
+    # 外边界先由沿边阶段完成；区域内部障碍交给后续环形补割
+    loop = loops[0]
+    entry = min(
+        range(len(loop) - 1),
+        key=lambda index: math.hypot(loop[index][0] - start_xy[0], loop[index][1] - start_xy[1]),
+    )
+    route = loop[entry:-1] + loop[:entry] + [loop[entry]]
     return _densify(route)
+
+
+def edge_route_grid(grid, zone, start_xy, clearance=None):
+    """兼容旧名字：现在统一走「交集 + 腐蚀」的掩膜方案。"""
+    return edge_route_mask(grid, zone, start_xy, inset=clearance)
 
 
 def lane_segments(grid, zone, spacing=None, axis="h"):
@@ -348,6 +390,65 @@ def order_segments(segments, start_xy, heading=0.0):
         x, y = end
         current_heading = math.atan2(end[1] - start[1], end[0] - start[0])
     return ordered
+
+
+def unknown_lane_segments(grid, spacing=None, axis="h", min_run=0.60):
+    """还没建过图的内部区域 → 扫描弓字线段（建图兜底用）。
+
+    只有外墙都找不到、边界探明率上不去的时候才会用到：正常场地绕完外墙就
+    100% 了，不该为了"看内部"多跑一趟。
+    """
+    from grid_map import UNKNOWN
+
+    spacing = LANE_SPACING + 0.15 if spacing is None else spacing
+    inside = world.polygon_mask(grid.cols, grid.rows, grid.cell)
+    cols, rows = grid.cols, grid.rows
+    data = grid.data
+    blocked = grid.blocked
+
+    def unknown(col, row):
+        index = row * cols + col
+        return inside[index] and data[index] == UNKNOWN and not blocked[index]
+
+    segments = []
+    cell = grid.cell
+    if axis == "v":
+        index_max, run_max = cols, rows
+    else:
+        index_max, run_max = rows, cols
+    fixed = cell
+    while fixed <= index_max * cell - cell * 0.5:
+        index_fixed = int(fixed / cell)
+        run = None
+        gap = 0
+        for step in range(run_max):
+            col, row = (index_fixed, step) if axis == "v" else (step, index_fixed)
+            if unknown(col, row):
+                if run is None:
+                    run = [step, step]
+                else:
+                    run[1] = step
+                gap = 0
+            elif run is not None:
+                gap += 1
+                if gap > 2:
+                    if (run[1] - run[0] + 1) * cell >= min_run:
+                        segments.append(_segment_for(axis, index_fixed, run, cell))
+                    run = None
+                    gap = 0
+        if run is not None and (run[1] - run[0] + 1) * cell >= min_run:
+            segments.append(_segment_for(axis, index_fixed, run, cell))
+        fixed += spacing
+    start = (cols * cell * 0.5, rows * cell * 0.5)
+    return order_segments(segments, start, 0.0)
+
+
+def _segment_for(axis, index_fixed, run, cell):
+    a = (run[0] + 0.5) * cell
+    b = (run[1] + 0.5) * cell
+    if axis == "v":
+        return ((index_fixed + 0.5) * cell, a), ((index_fixed + 0.5) * cell, b)
+    return (a, (index_fixed + 0.5) * cell), (b, (index_fixed + 0.5) * cell)
 
 
 def _lane_runs(grid, start, end, fixed, vertical=False, zone_id=None):

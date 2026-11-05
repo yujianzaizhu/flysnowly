@@ -158,33 +158,66 @@ _WORLD_CACHE = {}
 
 
 SEG_BUCKET = 1.5
+# 线段池：(ax, ay, ex, ey)，ex/ey 是方向分量，省掉射线求交时的两次减法。
+# 分桶存的是池下标，同一条线只落在它真正穿过的桶里（实景地图有 300+ 顶点、
+# 单条斜墙的包围盒能盖住几百个桶，按包围盒入桶会让每条射线重复测十几遍）。
+_SEG_POOL = []
 _SEG_BUCKETS = {}
+_EDGE_POOL = []
+_EDGE_BUCKETS = {}
+_SEG_CELL_CACHE = {}
+_SEG_CACHE_RANGE = 0.0
+_EDGE_CELL_CACHE = {}
 
 
 def _bucket_index(x, y):
     return int(math.floor(x / SEG_BUCKET)), int(math.floor(y / SEG_BUCKET))
 
 
-def _index_segment(buckets, segment):
+def _bucket_cells(ax, ay, bx, by):
+    """线段穿过的桶（按 0.4 桶长采样，斜墙也不会漏桶）。"""
+    length = math.hypot(bx - ax, by - ay)
+    steps = max(1, int(length / (SEG_BUCKET * 0.4)) + 1)
+    cells = []
+    last = None
+    for step in range(steps + 1):
+        t = step / float(steps)
+        cell = _bucket_index(ax + (bx - ax) * t, ay + (by - ay) * t)
+        if cell != last:
+            cells.append(cell)
+            last = cell
+    return cells
+
+
+def _index_segment(buckets, pool, segment):
     ax, ay, bx, by = segment
-    i0 = int(math.floor(min(ax, bx) / SEG_BUCKET))
-    i1 = int(math.floor(max(ax, bx) / SEG_BUCKET))
-    j0 = int(math.floor(min(ay, by) / SEG_BUCKET))
-    j1 = int(math.floor(max(ay, by) / SEG_BUCKET))
-    for i in range(i0, i1 + 1):
-        for j in range(j0, j1 + 1):
-            buckets.setdefault((i, j), []).append(segment)
+    index = len(pool)
+    pool.append((ax, ay, bx - ax, by - ay))
+    for cell in _bucket_cells(ax, ay, bx, by):
+        buckets.setdefault(cell, []).append(index)
+    return index
 
 
 def _rebuild_segment_index():
     """把外墙/障碍物线段按 1.5 m 方格分桶，射线与墙面距离只查邻近桶。"""
-    global _SEG_BUCKETS
+    global _SEG_BUCKETS, _EDGE_BUCKETS, _SEG_POOL, _EDGE_POOL, _SEG_CACHE_RANGE
+    pool = []
     buckets = {}
+    edge_pool = []
+    edge_buckets = {}
     for segment in POLYGON_SEGMENTS:
-        _index_segment(buckets, segment)
+        index = _index_segment(buckets, pool, segment)
+        _index_segment(edge_buckets, edge_pool, segment)
     for segment in OBSTACLE_SEGMENTS:
-        _index_segment(buckets, segment)
+        _index_segment(buckets, pool, segment)
+    _SEG_POOL = pool
     _SEG_BUCKETS = buckets
+    _EDGE_POOL = edge_pool
+    _EDGE_BUCKETS = edge_buckets
+    _SEG_CELL_CACHE.clear()
+    _EDGE_CELL_CACHE.clear()
+    # 按格缓存只有在查询半径不超过视觉量程时才成立（缓存按量程建桶）
+    _SEG_CACHE_RANGE = VISION_RANGE + 1e-9
 
 
 def clamp(value, low, high):
@@ -506,6 +539,11 @@ def remove_edit(kind, item_id):
     return item_id
 
 
+def static_edits():
+    """用户手动添加的静态障碍快照（重建栅格后要重新写回去）。"""
+    return [dict(item) for item in _edit_bucket()["static"]]
+
+
 def clear_edits(kind=None):
     kinds = EDIT_KINDS if kind is None else (kind,)
     if kind is not None and kind not in EDIT_KINDS:
@@ -634,23 +672,26 @@ def _segments(polygon):
 def boundary_distance(x, y, polygon=None):
     if polygon is None or polygon is POLYGON:
         # 快速路径：只算邻近分桶里的外墙线段（远距离查询回退全量）
-        buckets = _SEG_BUCKETS
+        buckets = _EDGE_BUCKETS
+        pool = _EDGE_POOL
         if buckets:
-            i, j = _bucket_index(x, y)
+            cell = _bucket_index(x, y)
+            cands = _EDGE_CELL_CACHE.get(cell)
+            if cands is None:
+                found = set()
+                for jj in (cell[1] - 1, cell[1], cell[1] + 1):
+                    for ii in (cell[0] - 1, cell[0], cell[0] + 1):
+                        row = buckets.get((ii, jj))
+                        if row:
+                            found.update(row)
+                cands = tuple(found)
+                _EDGE_CELL_CACHE[cell] = cands
             best = 1e9
-            for di in (-1, 0, 1):
-                row = buckets.get((i + di, j))
-                for segment in row or ():
-                    distance = _segment_distance(x, y, *segment)
-                    if distance < best:
-                        best = distance
-            for jj in (j - 1, j + 1):
-                for di in (-1, 0, 1):
-                    col = buckets.get((i + di, jj))
-                    for segment in col or ():
-                        distance = _segment_distance(x, y, *segment)
-                        if distance < best:
-                            best = distance
+            for index in cands:
+                ax, ay, ex, ey = pool[index]
+                distance = _segment_distance(x, y, ax, ay, ax + ex, ay + ey)
+                if distance < best:
+                    best = distance
             if best <= SEG_BUCKET:
                 return best
     polygon = POLYGON if polygon is None else polygon
@@ -699,35 +740,76 @@ def raycast(x, y, angle, max_range=None):
     dx = math.cos(angle)
     dy = math.sin(angle)
     best = limit
-    # 墙面线段（只查射线覆盖范围内的分桶）
-    buckets = _SEG_BUCKETS
-    if buckets:
+    # 墙面线段（只查射线覆盖范围内的分桶；同一条线可能落在多个桶里，用戳记去重）
+    pool = _SEG_POOL
+    if pool and limit <= _SEG_CACHE_RANGE:
+        # 一次查表拿到"这一格附近可能命中的全部线段"（以格为单位缓存），
+        # 省掉每条射线 9 次分桶查找与去重戳记：视觉 41 条射线 × 每 tick 都算，
+        # 这里省下来的就是倍速上限。
+        cell = (int(math.floor(x / SEG_BUCKET)), int(math.floor(y / SEG_BUCKET)))
+        cands = _SEG_CELL_CACHE.get(cell)
+        if cands is None:
+            i, j = cell
+            found = set()
+            for ii in range(i - 1, i + 2):
+                for jj in range(j - 1, j + 2):
+                    row = _SEG_BUCKETS.get((ii, jj))
+                    if row:
+                        found.update(row)
+            cands = tuple(found)
+            _SEG_CELL_CACHE[cell] = cands
+        for index in cands:
+            ax, ay, ex, ey = pool[index]
+            denom = dx * ey - dy * ex
+            if denom > -1e-9 and denom < 1e-9:
+                continue
+            qx = ax - x
+            qy = ay - y
+            t = (qx * ey - qy * ex) / denom
+            if t <= 1e-6 or t >= best:
+                continue
+            u = (qx * dy - qy * dx) / denom
+            if -1e-9 <= u <= 1.0 + 1e-9:
+                best = t
+    elif pool:
+        buckets = _SEG_BUCKETS
         i0 = int(math.floor((x - limit) / SEG_BUCKET))
         i1 = int(math.floor((x + limit) / SEG_BUCKET))
         j0 = int(math.floor((y - limit) / SEG_BUCKET))
         j1 = int(math.floor((y + limit) / SEG_BUCKET))
-        segments = []
         for i in range(i0, i1 + 1):
             for j in range(j0, j1 + 1):
                 row = buckets.get((i, j))
-                if row:
-                    segments.extend(row)
+                if not row:
+                    continue
+                for index in row:
+                    ax, ay, ex, ey = pool[index]
+                    denom = dx * ey - dy * ex
+                    if denom > -1e-9 and denom < 1e-9:
+                        continue
+                    qx = ax - x
+                    qy = ay - y
+                    t = (qx * ey - qy * ex) / denom
+                    if t <= 1e-6 or t >= best:
+                        continue
+                    u = (qx * dy - qy * dx) / denom
+                    if -1e-9 <= u <= 1.0 + 1e-9:
+                        best = t
     else:
-        segments = POLYGON_SEGMENTS + OBSTACLE_SEGMENTS
-    for ax, ay, bx, by in segments:
-        ex = bx - ax
-        ey = by - ay
-        denom = dx * ey - dy * ex
-        if denom > -1e-9 and denom < 1e-9:
-            continue
-        qx = ax - x
-        qy = ay - y
-        t = (qx * ey - qy * ex) / denom
-        if t <= 1e-6 or t >= best:
-            continue
-        u = (qx * dy - qy * dx) / denom
-        if -1e-9 <= u <= 1.0 + 1e-9:
-            best = t
+        for ax, ay, bx, by in POLYGON_SEGMENTS + OBSTACLE_SEGMENTS:
+            ex = bx - ax
+            ey = by - ay
+            denom = dx * ey - dy * ex
+            if denom > -1e-9 and denom < 1e-9:
+                continue
+            qx = ax - x
+            qy = ay - y
+            t = (qx * ey - qy * ex) / denom
+            if t <= 1e-6 or t >= best:
+                continue
+            u = (qx * dy - qy * dx) / denom
+            if -1e-9 <= u <= 1.0 + 1e-9:
+                best = t
     # 障碍物圆
     for ox, oy, radius in OBSTACLES:
         fx = x - ox
@@ -829,7 +911,12 @@ def polygon_mask(cols, rows, cell=None):
 
 
 def boundary_cells():
-    """多边形边界附近的栅格集合，用于建图进度统计。"""
+    """多边形边界附近的栅格集合，用于建图进度统计。
+
+    只收中心点落在场地内的格子。射线永远命中墙面内侧，所以边界线外侧那一圈
+    格子根本不可能被传感器写入；把它们算进分母会让探明率永远差一半，还会在
+    补扫时把机器人派到永远补不上的"缺口"上。
+    """
     cells = set()
     count = len(POLYGON)
     for index in range(count):
@@ -845,6 +932,8 @@ def boundary_cells():
                 for dr in (-1, 0, 1):
                     col = int(clamp((x / CELL) + dc, 0, COLS - 1))
                     row = int(clamp((y / CELL) + dr, 0, ROWS - 1))
+                    if not point_in_polygon((col + 0.5) * CELL, (row + 0.5) * CELL):
+                        continue
                     cells.add((col, row))
     return cells
 

@@ -24,7 +24,7 @@ class Settings(object):
         self.battery_low = 30.0
         self.battery_resume = 80.0
         self.charge_rate = 8.0
-        self.battery_drain_factor = 0.6
+        self.battery_drain_factor = 0.2
         self.dock_radius = 0.70
         # 割草
         self.mowing_mode = "A"

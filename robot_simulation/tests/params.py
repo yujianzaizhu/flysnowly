@@ -31,7 +31,7 @@ BATTERY_PARAMS = {
     "battery_low": 30.0,
     "battery_resume": 80.0,
     "charge_rate": 8.0,
-    "battery_drain_factor": 0.6,
+    "battery_drain_factor": 0.2,
     "dock_radius": 0.70,
 }
 

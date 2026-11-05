@@ -2,8 +2,21 @@
   "use strict";
 
   const POLL_MS = 100;
-  const POLL_MS_FAST = 50;
+  // 倍速越高，轮询越稀：仿真线程是单核满负荷跑，前端每轮要 JSON.parse
+  // 上百 KB 状态并重绘，轮询太密会把服务端仿真线程（同一进程，GIL）一起拖慢。
+  const POLL_TIERS = [
+    [16, 150],
+    [8, 120],
+    [4, 80],
+  ];
   let interpMs = POLL_MS;
+
+  function pollInterval(speed) {
+    for (let index = 0; index < POLL_TIERS.length; index += 1) {
+      if (speed >= POLL_TIERS[index][0]) return POLL_TIERS[index][1];
+    }
+    return POLL_MS;
+  }
   const TRAIL_LIMIT = 700;
   const ROBOT_RADIUS = 0.18;
 
@@ -35,13 +48,6 @@
     leftWheel: document.getElementById("leftWheel"),
     rightWheel: document.getElementById("rightWheel"),
     zoneList: document.getElementById("zoneList"),
-    navModeToggle: document.getElementById("navModeToggle"),
-    navModeHint: document.getElementById("navModeHint"),
-    navNodeList: document.getElementById("navNodeList"),
-    navStaticBtn: document.getElementById("navStaticBtn"),
-    navStaticHint: document.getElementById("navStaticHint"),
-    navStaticList: document.getElementById("navStaticList"),
-    navTopicList: document.getElementById("navTopicList"),
     log: document.getElementById("log"),
     phaseChip: document.getElementById("phaseChip"),
     zoneChip: document.getElementById("zoneChip"),
@@ -94,6 +100,8 @@
     bagQueueBtn: document.getElementById("bagQueueBtn"),
     bagQueueInfo: document.getElementById("bagQueueInfo"),
     sidebarToggleBtn: document.getElementById("sidebarToggleBtn"),
+    missionPanel: document.querySelector(".mission"),
+    missionFoldBtn: document.getElementById("missionFoldBtn"),
     sidebarHandle: document.getElementById("sidebarHandle"),
     sidebarTab: document.getElementById("sidebarTab"),
     bagSelectAll: document.getElementById("bagSelectAll"),
@@ -397,10 +405,11 @@
   async function poll() {
     if (shuttingDown) return;
     const speed = current && current.speed ? current.speed : 1;
-    const fast = speed >= 4;
-    // 高倍速时位图 71 KB，隔几次轮询取一次，其余只取状态
+    const wait = pollInterval(speed);
+    // 大实景地图的栅格位图有 300+ KB，隔几次轮询取一次，其余只取状态
     mapPollTick += 1;
-    const withMap = !fast || mapPollTick % 4 === 0;
+    const mapEvery = speed >= 8 ? 8 : 4;
+    const withMap = speed < 4 || mapPollTick % mapEvery === 0;
     try {
       const state = await request("/api/state" + (withMap ? "" : "?map=0"));
       ingest(state);
@@ -408,8 +417,8 @@
     } catch (error) {
       setConnected(false);
     }
-    interpMs = fast ? POLL_MS_FAST : POLL_MS;
-    window.setTimeout(poll, fast ? POLL_MS_FAST : POLL_MS);
+    interpMs = wait;
+    window.setTimeout(poll, wait);
   }
 
   async function send(path, body) {
@@ -882,160 +891,9 @@
 
     updateVision(state.vision || {});
     updateZones(state.zones || []);
-    renderNav(state.nav);
     updateMission(task, state);
 
     renderLog(state.log);
-  }
-
-  const NAV_LABELS = { planner: "规划节点", dock: "沿边回充节点" };
-  const NAV_STATE_LABELS = { RUNNING: "运行", PAUSE: "暂停", FAIL: "失败", NONE: "空闲" };
-  const ACTION_LABELS = {
-    nav_task_action: "导航任务",
-    autodock_action: "自动回充",
-    leave_dock_action: "离桩",
-    visual_egway_action: "视觉沿边",
-    egway_coverage_action: "沿边覆盖",
-  };
-  let navSignature = "";
-
-  let navModeTouched = false;
-
-  function syncNavMode(nav) {
-    if (!els.navModeToggle || !nav) return;
-    const enabled = nav.enabled !== false;
-    if (!navModeTouched) els.navModeToggle.checked = enabled;
-    els.navModeHint.textContent = enabled
-      ? "规划与控制由节点处理"
-      : "使用系统内置算法";
-    els.navModeHint.classList.toggle("is-off", !enabled);
-  }
-
-  function renderNav(nav) {
-    if (!els.navNodeList) return;
-    syncNavMode(nav);
-    if (!nav) {
-      if (navSignature === "off") return;
-      navSignature = "off";
-      els.navNodeList.textContent = "导航节点未启用";
-      els.navTopicList.textContent = "";
-      return;
-    }
-    const nodes = nav.nodes || [];
-    const topics = nav.topics || [];
-    const signature = JSON.stringify([
-      nodes.map((node) => [
-        node.name,
-        node.main_state_name,
-        node.sub_state_name,
-        (node.actions || []).map((action) => [action.name, action.state, action.last_result]),
-      ]),
-      topics.map((topic) => [topic.name, topic.messages, topic.last]),
-    ]);
-    if (signature === navSignature) return;
-    navSignature = signature;
-
-    els.navNodeList.textContent = "";
-    nodes.forEach((node) => {
-      const row = document.createElement("div");
-      row.className = "nav-node";
-      const head = document.createElement("div");
-      head.className = "nav-node-head";
-      const title = document.createElement("strong");
-      title.textContent =
-        (NAV_LABELS[node.name] || node.name) + " · " + String(node.heartbeat_id);
-      const state = document.createElement("span");
-      const mainState = node.main_state_name || "NONE";
-      state.className = "nav-state nav-state--" + mainState.toLowerCase();
-      state.textContent =
-        (NAV_STATE_LABELS[mainState] || mainState) +
-        (node.sub_state_name && node.sub_state_name !== "NONE" ? " / " + node.sub_state_name : "");
-      head.append(title, state);
-      row.append(head);
-      (node.actions || []).forEach((action) => {
-        const line = document.createElement("div");
-        line.className = "nav-action";
-        const label = ACTION_LABELS[action.name] || action.name;
-        line.textContent =
-          label +
-          " @" +
-          action.port +
-          " · " +
-          action.state +
-          (action.last_result ? " · " + action.last_result : "");
-        row.append(line);
-      });
-      els.navNodeList.append(row);
-    });
-
-    renderNavStatic(nav.static_config);
-
-    els.navTopicList.textContent = "";
-    const title = document.createElement("div");
-    title.className = "nav-topic-title";
-    title.textContent = "话题 " + (nav.topic_total || topics.length) + " 路";
-    els.navTopicList.append(title);
-    topics.slice(0, 18).forEach((topic) => {
-      const line = document.createElement("div");
-      line.className = "nav-topic";
-      const name = document.createElement("span");
-      name.className = "nav-topic-name";
-      name.textContent = topic.name;
-      const meta = document.createElement("em");
-      meta.textContent = topic.messages + " · " + topic.last;
-      line.append(name, meta);
-      els.navTopicList.append(line);
-    });
-  }
-
-  const STATIC_LABELS = {
-    nav_speed: "导航速度",
-    mow_speed: "弓字速度",
-    edge_speed: "沿边速度",
-    max_linear: "最大线速度",
-    max_angular: "最大角速度",
-    coverage_speed: "覆盖速度",
-    record_interval: "记录间距",
-    xy_goal_tolerance: "到点容差",
-    region_dilate_size: "区域膨胀",
-    ipa_robot_radius: "规划半径",
-  };
-  let navStaticSignature = "";
-
-  function renderNavStatic(staticConfig) {
-    if (!els.navStaticList) return;
-    const loaded = !!(staticConfig && staticConfig.loaded);
-    const params = (staticConfig && staticConfig.params) || {};
-    const signature = JSON.stringify([loaded, staticConfig && staticConfig.source, params]);
-    if (signature === navStaticSignature) return;
-    navStaticSignature = signature;
-
-    if (els.navStaticHint) {
-      els.navStaticHint.textContent = loaded
-        ? "已导入 " + (staticConfig.topic_count || 0) + " 话题 / " +
-          (staticConfig.service_count || 0) + " 服务"
-        : "未导入";
-      els.navStaticHint.classList.toggle("is-off", !loaded);
-    }
-    els.navStaticList.textContent = "";
-    if (!loaded) return;
-    const title = document.createElement("div");
-    title.className = "nav-topic-title";
-    title.textContent = "static_config 参数";
-    els.navStaticList.append(title);
-    Object.keys(params)
-      .filter((key) => STATIC_LABELS[key])
-      .forEach((key) => {
-        const line = document.createElement("div");
-        line.className = "nav-topic";
-        const name = document.createElement("span");
-        name.className = "nav-topic-name";
-        name.textContent = STATIC_LABELS[key];
-        const meta = document.createElement("em");
-        meta.textContent = String(params[key]);
-        line.append(name, meta);
-        els.navStaticList.append(line);
-      });
   }
 
   function updateVision(vision) {
@@ -2365,6 +2223,38 @@
   if (els.sidebarHandle) els.sidebarHandle.addEventListener("click", toggleSidebar);
   if (els.sidebarTab) els.sidebarTab.addEventListener("click", toggleSidebar);
 
+  // ------------------------------------------------------------- 任务操作收起
+  const MISSION_KEY = "mowerMissionFoldedV1";
+  let missionFolded = false;
+  try {
+    missionFolded = localStorage.getItem(MISSION_KEY) === "1";
+  } catch (error) {
+    missionFolded = false;
+  }
+
+  function applyMissionFolded(folded) {
+    if (els.missionPanel) {
+      els.missionPanel.classList.toggle("is-folded", !!folded);
+    }
+    if (els.missionFoldBtn) {
+      els.missionFoldBtn.textContent = folded ? "展开" : "收起";
+      els.missionFoldBtn.setAttribute("aria-expanded", folded ? "false" : "true");
+    }
+    try {
+      localStorage.setItem(MISSION_KEY, folded ? "1" : "0");
+    } catch (error) {
+      /* ignore */
+    }
+  }
+
+  applyMissionFolded(missionFolded);
+  if (els.missionFoldBtn) {
+    els.missionFoldBtn.addEventListener("click", () => {
+      missionFolded = !missionFolded;
+      applyMissionFolded(missionFolded);
+    });
+  }
+
   // ------------------------------------------------------------- 独立窗口（弹窗）
   const POPUP_CSS = [
     "html,body{margin:0;height:100%;background:var(--bg);color:var(--text);",
@@ -3081,7 +2971,6 @@
     zones: true,
     events: true,
     params: true,
-    nodes: true,
   };
   let moduleState = Object.assign({}, moduleDefaults);
   try {
@@ -3155,7 +3044,7 @@
 
   Object.keys(modulePanels).forEach((key) => initDrag(modulePanels[key]));
 
-  // 底部面板页签：事件日志 / 导航节点 切换显示
+  // 底部面板页签：事件日志 / 日志播放 切换显示
   const DOCK_TAB_KEY = "mowerDockTabV1";
   let dockTab = "events";
   try {
@@ -3165,7 +3054,7 @@
   }
 
   function selectDockTab(name, persist) {
-    dockTab = ["nodes", "bag"].includes(name) ? name : "events";
+    dockTab = name === "bag" ? "bag" : "events";
     els.dockTabs.forEach((tab) => {
       const active = tab.dataset.dockTab === dockTab;
       tab.classList.toggle("is-active", active);
@@ -3194,12 +3083,6 @@
     checkbox.addEventListener("change", () => {
       const key = checkbox.dataset.moduleToggle;
       moduleState[key] = checkbox.checked;
-      if (key === "nodes") {
-        moduleState.events = true;
-        const eventsToggle = document.querySelector('[data-module-toggle="events"]');
-        if (eventsToggle) eventsToggle.checked = true;
-        selectDockTab(checkbox.checked ? "nodes" : "events");
-      }
       localStorage.setItem(MODULE_KEY, JSON.stringify(moduleState));
       applyModuleState();
     });
@@ -3508,43 +3391,6 @@
       }
     });
   }
-  if (els.navStaticBtn) {
-    els.navStaticBtn.addEventListener("click", async () => {
-      els.navStaticBtn.disabled = true;
-      try {
-        const summary = await request("/api/nav/config", {});
-        navStaticSignature = "";
-        if (els.navStaticHint) {
-          els.navStaticHint.textContent = summary.loaded
-            ? "已导入 " + (summary.source || "")
-            : "未找到 static_config";
-        }
-        const state = await request("/api/state", null);
-        ingest(state);
-      } catch (error) {
-        if (els.navStaticHint) els.navStaticHint.textContent = "导入失败：" + error.message;
-      } finally {
-        els.navStaticBtn.disabled = false;
-      }
-    });
-  }
-  if (els.navModeToggle) {
-    els.navModeToggle.addEventListener("change", async () => {
-      navModeTouched = true;
-      const enabled = els.navModeToggle.checked;
-      if (els.navModeHint) {
-        els.navModeHint.textContent = enabled ? "规划与控制由节点处理" : "使用系统内置算法";
-      }
-      try {
-        const state = await request("/api/nav/mode", { enabled });
-        ingest(state);
-      } catch (error) {
-        els.navModeHint.textContent = "切换失败：" + error.message;
-      } finally {
-        navModeTouched = false;
-      }
-    });
-  }
   if (els.themeSelect) {
     els.themeSelect.addEventListener("change", () => {
       applyTheme(els.themeSelect.value);
@@ -3558,8 +3404,17 @@
   }
   applyTheme(savedTheme);
 
+  // 高倍速时不必 60 fps 重绘：前端渲染和同进程的仿真线程抢 CPU，
+  // 把帧率降到 30 fps 能让仿真多吃一半的 CPU 时间。
+  let lastFrameAt = 0;
+
   function frame(now) {
-    draw(now);
+    const speed = current && current.speed ? current.speed : 1;
+    const minGap = speed >= 8 ? 1000 / 30 : 0;
+    if (!minGap || now - lastFrameAt >= minGap) {
+      lastFrameAt = now;
+      draw(now);
+    }
     requestAnimationFrame(frame);
   }
 

@@ -10,11 +10,19 @@ UNKNOWN = 0
 FREE = 1
 OCCUPIED = 2
 
-INFLATE_CELLS = 2
+# 导航膨胀：mark_occupied 会写 (1 + INFLATE_CELLS) 圈，1 圈 = 0.25 m，
+# 够一个半径 0.18 m 的车体通过；再大就会把 1 m 宽的走廊整条封死。
+INFLATE_CELLS = 1
 MOW_INFLATE_CELLS = 1
 # 已确认障碍物的盖章余量：刀盘/车体都要真的绕开，留 2 格（0.2 m），
 # 比整片涂抹小得多，又能避免弓字线贴着障碍物蹭过去发生碰撞。
 STAMP_INFLATE_CELLS = 2
+# 墙面占据格往墙外侧偏移多远：占据带画在场地外轮廓线之外，墙内侧不被吃掉
+SURFACE_STAMP_OUTSET = 0.08
+# 车体实际压过的格子半径：这是"这里一定能走"的硬证据。
+# 只认车体中心那一格（半径远小于车体半径），目的是防止视觉盖章把机器人自己
+# 走过的通道糊成障碍；不敢顺带放开更多导航膨胀，否则规划会贴着墙走。
+VERIFY_RADIUS = 0.06
 LARGE_OBSTACLE_EXTENT = 0.85
 LARGE_OBSTACLE_AREA = 5.0
 MAX_OBSTACLE_CELLS = 1200
@@ -35,6 +43,18 @@ class GridMap(object):
         self._circle_cache = []
         self._boundary_cache_version = -1
         self._boundary_cache = 0.0
+        self._wall_known = []
+        self._wall_known_version = -1
+        # 还没探明的墙格索引集合。增量维护：传感器一旦把某个格子写成已知，
+        # 就把该格（以及写了占据格时的 8 邻域）从集合里摘掉；为 None 表示需要
+        # 全量重建（复位/换图之后）。以前每 tick 全量扫一遍 wall_cells，
+        # 332 顶点的实景地图上一趟就是 8 ms，高倍速下整个仿真被它拖住。
+        self._wall_pending = None
+        # 从车当前位置出发的连通可达区：绕障绕完一圈后，障碍物内部那些"没见过的
+        # 未知格"会被已探明占据环封住，不属于可达连通域，不能再当成可割点生成弓字。
+        self.reach_mask = bytearray(self.cols * self.rows)
+        self._reach_seed = None
+        self._reach_version = -1
         self.wall_cells = world.boundary_cells()
         self.zones = []
         self.zone_totals = {}
@@ -48,11 +68,14 @@ class GridMap(object):
     def _reset_arrays(self):
         self.data_version = getattr(self, "data_version", 0) + 1
         self._obstacle_baseline = None
+        self._wall_pending = None
+        self._reach_version = -1
         self.data = bytearray(self.cols * self.rows)
         self.mowed = bytearray(self.cols * self.rows)
         self.blocked = bytearray(self.cols * self.rows)
         self.mow_blocked = bytearray(self.cols * self.rows)
         self.dyn_blocked = bytearray(self.cols * self.rows)
+        self.verified_free = bytearray(self.cols * self.rows)
         self.free_mask = bytearray(self.cols * self.rows)
         self.mask_ready = False
         self.zones = []
@@ -61,7 +84,14 @@ class GridMap(object):
 
     def reset_map(self):
         self._reset_arrays()
+        # 用户手动添加的障碍物不属于传感器建图，重建栅格后要原样写回去
+        self.apply_static_edits(world.static_edits())
         self.version += 1
+
+    def apply_static_edits(self, items):
+        """把用户添加的静态障碍写进占据/膨胀层（圆形：中心 + 半径）。"""
+        for item in items or []:
+            self.stamp_obstacle(float(item["x"]), float(item["y"]), float(item["r"]))
 
     def reset_mowed(self):
         self.mowed = bytearray(self.cols * self.rows)
@@ -86,6 +116,7 @@ class GridMap(object):
         self.data = bytearray(baseline[0])
         self.blocked = bytearray(baseline[1])
         self.mow_blocked = bytearray(baseline[2])
+        self._wall_pending = None
         self.data_version += 1
         self.version += 1
         return True
@@ -196,16 +227,85 @@ class GridMap(object):
                 changed = True
         return changed
 
-    def mark_occupied(self, col, row):
+    def mark_occupied(self, col, row, data_col=None, data_row=None):
+        """写入墙面命中点。
+
+        ``col/row`` 是墙面实际位置，导航/刀盘膨胀按它算；``data_col/data_row`` 是
+        占据格要画的位置（默认同一个格子）。实景建图时占据格会画到墙的外侧，
+        这样界面上的墙体带落在外轮廓线之外，不会把可割区域啃掉一圈。
+        """
         if not self.in_bounds(col, row):
             return
+        dcol = col if data_col is None else data_col
+        drow = row if data_row is None else data_row
+        if not self.in_bounds(dcol, drow):
+            dcol, drow = col, row
         # 3×3 占据块 + 对应膨胀：按行切片写入（等价于原来逐格 9×(5×5) 的写法）
-        changed = self._fill_rows(self.data, col, row, 1, OCCUPIED)
+        changed = self._fill_rows(self.data, dcol, drow, 1, OCCUPIED)
+        if self._wall_pending:
+            self._note_known(drow * self.cols + dcol, spread=2)
         self._fill_rows(self.blocked, col, row, 1 + INFLATE_CELLS)
         self._fill_rows(self.mow_blocked, col, row, 1 + MOW_INFLATE_CELLS)
+        if self._restore_verified(dcol, drow, 1):
+            changed = True
+        if self._restore_verified(col, row, 1 + INFLATE_CELLS):
+            changed = True
         self.version += 1
         if changed:
             self.data_version += 1
+
+    def _verify_footprint(self, x, y):
+        """把车体当前压住的格子标成"确实能走"。
+
+        视觉盖章（凸包填充、3×3 抹笔画）会把 1 m 级的窄通道糊成障碍，机器人
+        自己把门口封死之后就再也规划不出去。车体此刻正压在这些格子上，是最硬的
+        证据：这些格子必须是自由格、不能有导航膨胀，之后也不许再被写成障碍。
+        """
+        cell = self.cell
+        radius = max(VERIFY_RADIUS, cell * 0.5)
+        col0, row0 = self.cell_of(x - radius, y - radius)
+        col1, row1 = self.cell_of(x + radius, y + radius)
+        changed = False
+        for row in range(row0, row1 + 1):
+            for col in range(col0, col1 + 1):
+                cx, cy = self.center_of(col, row)
+                if math.hypot(cx - x, cy - y) > radius:
+                    continue
+                index = self.index(col, row)
+                if not self.verified_free[index]:
+                    self.verified_free[index] = 1
+                if self.data[index] == OCCUPIED:
+                    self.data[index] = FREE
+                    changed = True
+                if self.data[index] != UNKNOWN:
+                    self._note_known(index)
+                if self.blocked[index]:
+                    self.blocked[index] = 0
+        if changed:
+            self.data_version += 1
+            self.version += 1
+
+    def _restore_verified(self, col, row, half):
+        """盖章之后把车体压过的格子还原成自由格（它们不可能真的是障碍）。"""
+        changed = False
+        col0 = max(0, col - half)
+        col1 = min(self.cols - 1, col + half)
+        row0 = max(0, row - half)
+        row1 = min(self.rows - 1, row + half)
+        for rr in range(row0, row1 + 1):
+            base = rr * self.cols
+            for cc in range(col0, col1 + 1):
+                index = base + cc
+                if not self.verified_free[index]:
+                    continue
+                if self.data[index] == OCCUPIED:
+                    self.data[index] = FREE
+                    changed = True
+                if self.data[index] != UNKNOWN:
+                    self._note_known(index)
+                if self.blocked[index]:
+                    self.blocked[index] = 0
+        return changed
 
     def _block_around(self, col, row):
         self._fill_rows(self.blocked, col, row, INFLATE_CELLS)
@@ -234,6 +334,7 @@ class GridMap(object):
                     if self.data[index] != OCCUPIED:
                         self.data[index] = OCCUPIED
                         changed = True
+                        self._note_known(index, spread=1)
                 if distance <= r_mow:
                     self.mow_blocked[index] = 1
                 if distance <= r_block:
@@ -326,9 +427,13 @@ class GridMap(object):
             hi = min(col1, int(math.ceil(span[1])))
             for col in range(lo, hi + 1):
                 index = self.index(col, row)
+                if self.verified_free[index]:
+                    # 车体压过的格子不可能是障碍：凸包填充在窄通道里会糊死通道
+                    continue
                 if self.data[index] != OCCUPIED:
                     self.data[index] = OCCUPIED
                     changed = True
+                    self._note_known(index, spread=1)
                 self._fill_rows(self.blocked, col, row, INFLATE_CELLS)
                 self._fill_rows(self.mow_blocked, col, row, STAMP_INFLATE_CELLS)
                 total += 1
@@ -339,11 +444,13 @@ class GridMap(object):
 
     def update_from_scan(self, pose, readings, max_range):
         x, y, theta = pose
+        self._verify_footprint(x, y)
         cell = self.cell
         cols = self.cols
         rows = self.rows
         data = self.data
         changed_data = False
+        pending = self._wall_pending
 
         # 自由区采样：内联 + 步进累加，避免每条射线每格都调用一次函数（建图期占一半开销）
         need_free = not self.mask_ready
@@ -355,6 +462,7 @@ class GridMap(object):
                 if data[index] == UNKNOWN:
                     data[index] = FREE
                     changed_data = True
+                    self._note_known(index)
         step = cell
         limit = max_range - 1e-6
         for relative, distance in readings:
@@ -378,94 +486,207 @@ class GridMap(object):
                             if data[index] == UNKNOWN:
                                 data[index] = FREE
                                 changed_data = True
+                                if pending is not None:
+                                    pending.discard(index)
             if distance < limit:
-                px = x + dx * max(0.0, distance - 0.02)
-                py = y + dy * max(0.0, distance - 0.02)
+                # 命中点在墙面上：膨胀按这里算，占据格画到墙外侧半格多一点，
+                # 让墙线画在场界线的外侧（墙内侧一格都不吃）。
+                px = x + dx * distance
+                py = y + dy * distance
                 if world.in_dynamic_obstacle(px, py, 0.08):
                     # 动态障碍物是移动物体，只进临时层，不能写进建图数据
                     continue
+                out = distance + SURFACE_STAMP_OUTSET
                 before = self.data_version
-                self.mark_occupied(int(px / cell), int(py / cell))
+                self.mark_occupied(
+                    int(px / cell),
+                    int(py / cell),
+                    int((x + dx * out) / cell),
+                    int((y + dy * out) / cell),
+                )
                 changed_data = changed_data or self.data_version != before
         if changed_data:
             self.data_version += 1
         self.version += 1
+
+    def unknown_wall_cells(self):
+        """还没探明的墙格。
+
+        判定"探明"不只看自己那一格有没有被写过：占据格现在画在墙的外侧
+        （`SURFACE_STAMP_OUTSET`），墙内侧那一格常常还是未知，但隔壁就是探到的
+        墙面，说明这段墙已经看到了。所以只要 3×3 邻域里有占据格也算探明，
+        否则探明率会永远差最后一格。
+        """
+        if not self.wall_cells:
+            return []
+        pending = self._wall_pending_set()
+        if self._wall_known_version == self.data_version:
+            return list(self._wall_known)
+        cols = self.cols
+        unknown = [(index % cols, index // cols) for index in pending]
+        unknown.sort()
+        self._wall_known = unknown
+        self._wall_known_version = self.data_version
+        return list(unknown)
+
+    def _wall_pending_set(self):
+        """尚未探明的墙格索引集合（全量重建只在复位/换图之后发生一次）。"""
+        pending = self._wall_pending
+        if pending is not None:
+            return pending
+        cols = self.cols
+        rows = self.rows
+        data = self.data
+        pending = set()
+        for col, row in self.wall_cells:
+            index = row * cols + col
+            if data[index] != UNKNOWN:
+                continue
+            seen = False
+            for dc in (-1, 0, 1):
+                c2 = col + dc
+                if c2 < 0 or c2 >= cols:
+                    continue
+                for dr in (-1, 0, 1):
+                    r2 = row + dr
+                    if r2 < 0 or r2 >= rows:
+                        continue
+                    if data[r2 * cols + c2] == OCCUPIED:
+                        seen = True
+                        break
+                if seen:
+                    break
+            if not seen:
+                pending.add(index)
+        self._wall_pending = pending
+        return pending
+
+    def _note_known(self, index, spread=0):
+        """格子写成已知后把它（及 ``spread`` 半径的邻域）从待探明墙格里摘掉。
+
+        ``data`` 只会从 UNKNOWN 变成 FREE/OCCUPIED，不会退回 UNKNOWN，
+        所以这个集合只增不减，增量维护与全量扫描结果一致。
+        """
+        pending = self._wall_pending
+        if not pending:
+            return
+        pending.discard(index)
+        if spread <= 0:
+            return
+        cols = self.cols
+        rows = self.rows
+        col = index % cols
+        row = index // cols
+        for dc in range(-spread, spread + 1):
+            c2 = col + dc
+            if c2 < 0 or c2 >= cols:
+                continue
+            for dr in range(-spread, spread + 1):
+                r2 = row + dr
+                if r2 < 0 or r2 >= rows:
+                    continue
+                pending.discard(r2 * cols + c2)
 
     def boundary_discovery(self):
         if not self.wall_cells:
             return 0.0
         if self._boundary_cache_version == self.data_version:
             return self._boundary_cache
-        seen = 0
-        data = self.data
-        cols = self.cols
-        for col, row in self.wall_cells:
-            if data[row * cols + col] != UNKNOWN:
-                seen += 1
+        pending = self._wall_pending_set()
         self._boundary_cache_version = self.data_version
-        self._boundary_cache = seen / float(len(self.wall_cells))
+        self._boundary_cache = 1.0 - len(pending) / float(len(self.wall_cells))
         return self._boundary_cache
+
+    def boundary_gaps(self, max_gaps=6):
+        """未探明的墙格聚成"缺口"，按大小排序，供建图补扫定位。
+
+        只看 `wall_cells`（紧贴真实边界的栅格）里还没被传感器写入过的格子，
+        8 邻域聚簇后给出簇心、格数与沿墙跨度，跨度大的就是明显没扫到的一段墙。
+        """
+        if not self.wall_cells:
+            return []
+        unknown = set(self.unknown_wall_cells())
+        if not unknown:
+            return []
+        gaps = []
+        remaining = set(unknown)
+        while remaining:
+            seed = remaining.pop()
+            stack = [seed]
+            cluster = [seed]
+            while stack:
+                col, row = stack.pop()
+                for dc in (-1, 0, 1):
+                    for dr in (-1, 0, 1):
+                        if dc == 0 and dr == 0:
+                            continue
+                        neighbour = (col + dc, row + dr)
+                        if neighbour in remaining:
+                            remaining.remove(neighbour)
+                            stack.append(neighbour)
+                            cluster.append(neighbour)
+            cols_in = [col for col, _row in cluster]
+            rows_in = [row for _col, row in cluster]
+            span = max(max(cols_in) - min(cols_in), max(rows_in) - min(rows_in)) + 1
+            gaps.append(
+                {
+                    "cells": len(cluster),
+                    "x": round(
+                        (sum(cols_in) / float(len(cluster)) + 0.5) * self.cell, 2
+                    ),
+                    "y": round(
+                        (sum(rows_in) / float(len(cluster)) + 0.5) * self.cell, 2
+                    ),
+                    "run_m": round(span * self.cell, 2),
+                }
+            )
+        gaps.sort(key=lambda item: (-item["cells"], -item["run_m"]))
+        return gaps[:max_gaps]
 
     # ----------------------------------------------------------- 自由区与分区
     def build_free_area(self, seed):
-        """从种子点漫游出内部自由区（未知视为可通行，墙体为障碍）。"""
+        """从种子点漫游出机器人真正能走到的内部自由区。
+
+        只沿"场地内 + 非占据 + 没有导航膨胀"的格子扩散：膨胀层就是规划的通行
+        判据，用它一起算出来的自由区才和 A* 的连通性一致。之前未知格一律算自由，
+        区域里会混进一堆被膨胀封死的死角，弓字起点全都"不可达"，只能一条条跳过，
+        割草永远做不完。
+        """
         mask = bytearray(self.cols * self.rows)
         start_col, start_row = self.cell_of(seed[0], seed[1])
         if not self.in_bounds(start_col, start_row):
             return False
         cols = self.cols
-        rows = self.rows
         data = self.data
+        blocked = self.blocked
         start_index = self.index(start_col, start_row)
+        inside = world.polygon_mask(self.cols, self.rows, self.cell)
+        if not inside[start_index]:
+            return False
         stack = [start_index]
         mask[start_index] = 1
-        touched_border = col_border = False
-        if (
-            start_col == 0
-            or start_row == 0
-            or start_col == cols - 1
-            or start_row == rows - 1
-        ):
-            col_border = True
-        # 用下标而不是坐标元组做 DFS：实景图 7 万格时能省一半以上时间
+        # 用下标而不是坐标元组做 DFS：实景图 7 万格时能省一半以上开销
         offsets = (-cols - 1, -cols, -cols + 1, -1, 1, cols - 1, cols, cols + 1)
         while stack:
             current = stack.pop()
-            if not col_border:
-                col = current % cols
-                row = current // cols
-                if col == 0 or row == 0 or col == cols - 1 or row == rows - 1:
-                    touched_border = True
+            current_col = current % cols
             for offset in offsets:
                 nindex = current + offset
                 if nindex < 0 or nindex >= len(data):
                     continue
-                if mask[nindex] or data[nindex] == OCCUPIED:
+                if mask[nindex] or not inside[nindex]:
+                    continue
+                if data[nindex] == OCCUPIED or blocked[nindex]:
                     continue
                 # 行偏移会跨行，必须校验列变化
                 if offset in (-1, 1):
-                    if (current % cols) + offset < 0 or (current % cols) + offset >= cols:
+                    if current_col + offset < 0 or current_col + offset >= cols:
                         continue
                 elif offset in (-cols - 1, -cols + 1, cols - 1, cols + 1):
-                    neighbor_col = nindex % cols
-                    if abs(neighbor_col - (current % cols)) != 1:
+                    if abs((nindex % cols) - current_col) != 1:
                         continue
                 mask[nindex] = 1
                 stack.append(nindex)
-            if touched_border:
-                break
-
-        # 场地多边形按行栅格化后一次性裁剪（逐格 point_in_polygon 在实景图上要十几秒）
-        inside = world.polygon_mask(self.cols, self.rows, self.cell)
-        if touched_border or not col_border:
-            mask = bytearray(self.cols * self.rows)
-            for index in range(self.cols * self.rows):
-                if inside[index] and self.data[index] != OCCUPIED:
-                    mask[index] = 1
-        else:
-            for index in range(self.cols * self.rows):
-                if mask[index] and not inside[index]:
-                    mask[index] = 0
 
         self.free_mask = mask
         self.mask_ready = True
@@ -815,7 +1036,97 @@ class GridMap(object):
             return False
         if self.mask_ready and not self.free_mask[index]:
             return False
+        if self._reach_seed is not None:
+            if self._reach_version != self.data_version:
+                self._rebuild_reach()
+            if not self.reach_mask[index]:
+                return False
         return True
+
+    def set_reach_seed(self, x, y):
+        """指定"可达性"的起点（一般是车当前位置）。不设置时不做可达过滤。"""
+        self._reach_seed = (float(x), float(y))
+        self._reach_version = -1
+
+    def _rebuild_reach(self):
+        """从 seed 做一次连通域填充（按行扫描，几十毫秒级）。
+
+        只把"场地内 + 非占据格"当作可走：已探明障碍物形成的占据环会把障碍物
+        内部那些从没被看到的未知格封在外面，于是弓字不会再往障碍物内部铺。
+        """
+        cols = self.cols
+        rows = self.rows
+        data = self.data
+        inside = world.polygon_mask(cols, rows, self.cell)
+        walkable = bytearray(cols * rows)
+        for index in range(cols * rows):
+            if inside[index] and data[index] != OCCUPIED:
+                walkable[index] = 1
+        mask = bytearray(cols * rows)
+        seed = self._reach_seed
+        col, row = self.cell_of(seed[0], seed[1])
+        col = min(max(col, 0), cols - 1)
+        row = min(max(row, 0), rows - 1)
+        start = row * cols + col
+        if not walkable[start]:
+            start = None
+            radius = max(2, int(1.0 / self.cell))
+            for dr in range(-radius, radius + 1):
+                r2 = row + dr
+                if not (0 <= r2 < rows):
+                    continue
+                for dc in range(-radius, radius + 1):
+                    c2 = col + dc
+                    if 0 <= c2 < cols and walkable[r2 * cols + c2]:
+                        start = r2 * cols + c2
+                        break
+                if start is not None:
+                    break
+        if start is None:
+            self.reach_mask = mask
+            self._reach_version = self.data_version
+            return
+        self._fill_reach(mask, walkable, start)
+        walkable_total = sum(walkable)
+        if sum(mask) < 0.5 * walkable_total:
+            # 车被临时围在一个小角落里（视觉碎片把门口糊死）时，以充电桩所在的
+            # 连通域兜底，别因为可达区太小把整场弓字都裁掉。
+            dock_col, dock_row = self.cell_of(world.DOCK["x"], world.DOCK["y"])
+            dock_index = dock_row * cols + dock_col
+            if walkable[dock_index] and not mask[dock_index]:
+                self._fill_reach(mask, walkable, dock_index)
+        self.reach_mask = mask
+        self._reach_version = self.data_version
+
+    def _fill_reach(self, mask, walkable, start):
+        """按行扫描的连通域填充（8 邻域不必要，4 邻域足够判断"封死"）。"""
+        cols = self.cols
+        rows = self.rows
+        stack = [(start // cols, start % cols)]
+        while stack:
+            r, c = stack.pop()
+            base = r * cols
+            if not walkable[base + c] or mask[base + c]:
+                continue
+            left = c
+            while left > 0 and walkable[base + left - 1] and not mask[base + left - 1]:
+                left -= 1
+            right = c
+            while right < cols - 1 and walkable[base + right + 1] and not mask[base + right + 1]:
+                right += 1
+            for cc in range(left, right + 1):
+                mask[base + cc] = 1
+            for nr in (r - 1, r + 1):
+                if nr < 0 or nr >= rows:
+                    continue
+                nbase = nr * cols
+                cc = left
+                while cc <= right:
+                    if walkable[nbase + cc] and not mask[nbase + cc]:
+                        stack.append((nr, cc))
+                        while cc <= right and walkable[nbase + cc] and not mask[nbase + cc]:
+                            cc += 1
+                    cc += 1
 
     def apply_dynamic(self, circles):
         """动态障碍物临时占据层：每 tick 重建，不写入建图数据（否则会留下永久"拖影"）。
@@ -992,8 +1303,12 @@ class GridMap(object):
                 changed += 1
         return changed
 
-    def relax_around(self, x, y, radius=0.30):
-        """临时清除机器人所在位置的导航膨胀（机器人已证明该点可通行）。"""
+    def relax_around(self, x, y, radius=0.30, clear_occupied=False):
+        """临时清除机器人所在位置的导航膨胀（机器人已证明该点可通行）。
+
+        ``clear_occupied`` 用于充电桩这类"车确实停得下"的固定点：视觉盖章有时
+        会把桩位刷成占据格，那样规划永远到不了桩，只能把这一小片恢复成自由格。
+        """
         changed = False
         col, row = self.cell_of(x, y)
         span = max(1, int(math.ceil(radius / self.cell)))
@@ -1003,10 +1318,17 @@ class GridMap(object):
                 if not self.in_bounds(c, r):
                     continue
                 index = self.index(c, r)
-                if self.data[index] == OCCUPIED:
-                    continue
                 ox, oy = self.center_of(c, r)
-                if math.hypot(ox - x, oy - y) <= radius and self.blocked[index]:
+                if math.hypot(ox - x, oy - y) > radius:
+                    continue
+                if self.data[index] == OCCUPIED:
+                    if not clear_occupied:
+                        continue
+                    self.data[index] = FREE
+                    self.verified_free[index] = 1
+                    self.data_version += 1
+                    changed = True
+                if self.blocked[index]:
                     self.blocked[index] = 0
                     changed = True
         return changed
@@ -1206,8 +1528,19 @@ class GridMap(object):
         path.reverse()
         return self.smooth(path)
 
-    def plan_near(self, start, goal, zone_id=None, max_expansions=60000, time_budget=0.06):
-        """当目标点不可达时，规划到当前位置连通域内离目标最近的栅格。"""
+    def plan_near(
+        self,
+        start,
+        goal,
+        zone_id=None,
+        max_expansions=200000,
+        time_budget=0.35,
+    ):
+        """当目标点不可达时，规划到当前位置连通域内离目标最近的栅格。
+
+        默认给足时间和扩展次数：实景大图上连通域有 9 万格，预算给小了会中途放弃，
+        把"其实开得过去"的目标误判成不可达（外部再据此跳过整段弓字/区域）。
+        """
         from collections import deque
 
         start_col, start_row = self._nearest_open(start)

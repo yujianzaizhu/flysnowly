@@ -43,7 +43,6 @@
           <label><input type="checkbox" data-module-toggle="zones" checked /> 区域覆盖</label>
           <label><input type="checkbox" data-module-toggle="events" checked /> 底部面板</label>
           <label><input type="checkbox" data-module-toggle="params" checked /> 参数设置</label>
-          <label><input type="checkbox" data-module-toggle="nodes" checked /> 导航节点</label>
           <button id="collapseAllBtn" type="button">全部折叠</button>
           <button id="expandAllBtn" type="button">全部展开</button>
           <button id="resetLayoutBtn" type="button">重置布局</button>
@@ -230,7 +229,12 @@
 
     <div class="workspace">
       <section class="mission" aria-label="任务控制">
-        <div class="mission-row">
+        <div class="mission-row mission-row--head">
+          <span class="mission-head-title">任务操作</span>
+          <button id="missionFoldBtn" class="mission-fold" type="button"
+            aria-expanded="true" title="收起 / 展开任务操作">收起</button>
+        </div>
+        <div class="mission-row mission-row--controls">
           <label class="map-picker">地图
             <select id="mapSelect"></select>
           </label>
@@ -318,11 +322,10 @@
 
   <button id="sidebarTab" class="side-tab" type="button" title="展开左侧栏" hidden>»</button>
 
-  <section class="log-dock" data-module="events" data-drag-panel="events" aria-label="事件日志与导航节点">
+  <section class="log-dock" data-module="events" data-drag-panel="events" aria-label="事件日志与日志播放">
     <div class="log-dock-head">
       <div class="dock-tabs" role="tablist" aria-label="底部面板">
         <button class="dock-tab is-active" type="button" role="tab" data-dock-tab="events">事件日志 <span>Events</span></button>
-        <button class="dock-tab" type="button" role="tab" data-dock-tab="nodes">导航节点 <span>Nav Nodes</span></button>
         <button class="dock-tab" type="button" role="tab" data-dock-tab="bag">日志播放 <span>Bag Player</span></button>
       </div>
       <span id="logCount" class="log-dock-count">0 条</span>
@@ -330,19 +333,6 @@
     </div>
     <div class="dock-pane is-active" data-dock-pane="events">
       <ul id="log" class="log-list"></ul>
-    </div>
-    <div class="dock-pane" data-dock-pane="nodes">
-      <div class="nav-mode-row">
-        <label class="nav-mode"><input id="navModeToggle" type="checkbox" checked /> 节点仿真</label>
-        <span id="navModeHint" class="nav-mode-hint">规划与控制由节点处理</span>
-        <button id="navStaticBtn" class="task-btn task-btn--ghost" type="button">导入 static_config</button>
-        <span id="navStaticHint" class="nav-mode-hint">未导入</span>
-      </div>
-      <div class="nav-columns">
-        <div id="navNodeList" class="nav-node-list"></div>
-        <div id="navStaticList" class="nav-topic-list nav-topic-list--col"></div>
-        <div id="navTopicList" class="nav-topic-list nav-topic-list--col"></div>
-      </div>
     </div>
     <div class="dock-pane" data-dock-pane="bag">
       <div class="bag-player">
