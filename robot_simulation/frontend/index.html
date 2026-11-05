@@ -172,10 +172,6 @@
         </div>
 
         <div class="param-pane" data-param-pane="map">
-          <div class="param-grid">
-            <label>最小区块面积 (m²)<input type="number" step="1" min="8" max="100" data-config="min_zone_area" data-type="float" /></label>
-            <label>大型障碍阈值 (m²)<input type="number" step="0.5" min="1.0" max="20.0" data-config="large_obstacle_area" data-type="float" /></label>
-          </div>
           <div class="param-sub">地图编辑 · Map Edit</div>
           <div class="map-edit-row">
             <button id="editStaticBtn" class="task-btn task-btn--ghost" type="button" data-edit-kind="static">添加静态障碍</button>
@@ -194,13 +190,13 @@
             <button id="editClearBtn" class="task-btn task-btn--ghost" type="button">清空编辑</button>
           </div>
           <div class="map-import-block">
-            <button id="importFileBtn" class="task-btn task-btn--primary" type="button">选择文件</button>
-            <button id="importDirBtn" class="task-btn task-btn--primary" type="button">选择目录</button>
+            <button id="importFileBtn" class="task-btn task-btn--ghost" type="button">选择文件</button>
+            <button id="importAllMapsBtn" class="task-btn task-btn--primary" type="button">自动导入</button>
             <input id="importFileInput" type="file" accept=".pgm,.json,.yaml,.yml" multiple hidden />
-            <input id="importDirInput" type="file" webkitdirectory directory multiple hidden />
           </div>
           <p id="importMapMessage" class="hint param-message">
-            可用文件：.pgm 栅格地图（必需），path/default.json、map_info.json（可选，提供分辨率与名称），也可选择包含这些文件的目录。
+            可用文件：.pgm 栅格地图（必需），path/default.json、map_info.json（可选，提供分辨率与名称）。
+            “自动导入”会扫描服务端 data/map 下所有含 .pgm 的地图并一次性导入。
           </p>
         </div>
 

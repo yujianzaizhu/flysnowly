@@ -42,6 +42,114 @@ BAG_DIR = os.environ.get(
     ),
 )
 
+# 真实地图目录：默认仓库根的 data/map，可用环境变量 ROBOT_MAP_DIR 覆盖
+MAP_DIR = os.environ.get(
+    "ROBOT_MAP_DIR",
+    os.path.normpath(
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            os.pardir,
+            os.pardir,
+            "data",
+            "map",
+        )
+    ),
+)
+
+
+def _map_candidates(root):
+    """列出可导入的地图（含 .pgm 的目录，或直接的 .pgm 文件）。"""
+    root = os.path.abspath(os.path.expanduser(str(root or MAP_DIR)))
+    if not os.path.isdir(root):
+        raise ValueError("地图目录不存在: " + root)
+    candidates = []
+    for name in sorted(os.listdir(root)):
+        full = os.path.join(root, name)
+        if os.path.isdir(full):
+            pgms = [
+                entry
+                for entry in sorted(os.listdir(full))
+                if entry.lower().endswith(".pgm")
+            ]
+            if pgms:
+                candidates.append(full)
+        elif name.lower().endswith(".pgm"):
+            candidates.append(full)
+    return root, candidates
+
+
+def _dedupe_map_name(definition, source):
+    """data/map 里几张图的元数据常常同名（都叫 map1），重名时补上目录名。
+
+    同一个目录重复导入（编号复用）不算重名，不会反复加后缀。
+    """
+    name = definition.get("name")
+    source_path = definition.get("source_path") or os.path.abspath(str(source))
+    taken = set()
+    for other in world.MAPS.values():
+        if other is definition:
+            continue
+        if (other.get("source_path") or "") == source_path:
+            continue
+        taken.add(other.get("name"))
+    if name not in taken:
+        return
+    label = os.path.basename(str(source).rstrip(os.sep))
+    if os.path.isfile(str(source)):
+        label = os.path.splitext(label)[0]
+    candidate = "{} ({})".format(name, label)
+    suffix = 2
+    while candidate in taken:
+        candidate = "{} ({}-{})".format(name, label, suffix)
+        suffix += 1
+    definition["name"] = candidate
+
+
+def import_all_maps(httpd, root=None, max_extent=40.0, select_first=True):
+    """把 data/map 下所有可用的地图全部导入，返回导入结果摘要。
+
+    已经导入过的（source_path 相同）会复用原编号，不会重复占号。
+    """
+    root, candidates = _map_candidates(root)
+    imported = []
+    failures = []
+    for source in candidates:
+        try:
+            definition = map_import.build_map(source, None, max_extent=max_extent)
+        except (map_import.MapImportError, ValueError, OSError) as error:
+            failures.append({"source": source, "error": str(error)})
+            continue
+        with httpd.simulator.lock:
+            map_id = world.register_map(definition)
+        _dedupe_map_name(definition, source)
+        imported.append(
+            {
+                "id": map_id,
+                "name": definition.get("name"),
+                "source": source,
+                "width": round(definition.get("width", 0.0), 2),
+                "height": round(definition.get("height", 0.0), 2),
+            }
+        )
+    if select_first and imported:
+        map_id = imported[0]["id"]
+        with httpd.simulator.lock:
+            world.select_map(map_id)
+            robot = RobotCar()
+            grid = GridMap()
+            manager = build_manager(robot, grid)
+            httpd.robot = robot
+            httpd.grid = grid
+            httpd.manager = manager
+            httpd.simulator.manager = manager
+    return {
+        "directory": root,
+        "imported": imported,
+        "failures": failures,
+        "maps": world.world_dict().get("maps", []),
+    }
+
+
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
@@ -554,6 +662,24 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                         self.server.grid = grid
                         self.server.manager = manager
                         self.server.simulator.manager = manager
+            elif path == "/api/map/scan":
+                root = str(payload.get("path") or "").strip() or None
+                max_extent = payload.get("max_extent", 40.0)
+                try:
+                    max_extent = float(max_extent)
+                except (TypeError, ValueError):
+                    raise ValueError("地图最大边长必须是数字")
+                if not (8.0 <= max_extent <= 120.0):
+                    raise ValueError("地图最大边长范围 8-120 m")
+                self._send_json(
+                    import_all_maps(
+                        self.server,
+                        root,
+                        max_extent=max_extent,
+                        select_first=bool(payload.get("select_first", True)),
+                    )
+                )
+                return
             elif path == "/api/map/import":
                 source = str(payload.get("path") or "").strip()
                 if not source:

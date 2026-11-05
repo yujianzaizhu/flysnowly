@@ -77,9 +77,8 @@
     resetParamsBtn: document.getElementById("resetParamsBtn"),
     paramMessage: document.getElementById("paramMessage"),
     importFileBtn: document.getElementById("importFileBtn"),
-    importDirBtn: document.getElementById("importDirBtn"),
+    importAllMapsBtn: document.getElementById("importAllMapsBtn"),
     importFileInput: document.getElementById("importFileInput"),
-    importDirInput: document.getElementById("importDirInput"),
     importMapMessage: document.getElementById("importMapMessage"),
     zoomInBtn: document.getElementById("zoomInBtn"),
     zoomOutBtn: document.getElementById("zoomOutBtn"),
@@ -2034,10 +2033,41 @@
   }
 
   function setImportBusy(busy, message) {
-    [els.importFileBtn, els.importDirBtn].forEach((button) => {
-      button.disabled = busy;
+    [els.importFileBtn, els.importAllMapsBtn].forEach((button) => {
+      if (button) button.disabled = busy;
     });
     if (message) els.importMapMessage.textContent = message;
+  }
+
+  async function importAllMaps() {
+    setImportBusy(true, "正在扫描 data/map 并导入…");
+    try {
+      const result = await request("/api/map/scan", {});
+      const imported = result.imported || [];
+      const failures = result.failures || [];
+      trail = [];
+      mapVersion = -1;
+      viewWorldKey = "";
+      zoneAutoValue = "";
+      zoneInputDirty = false;
+      els.zoneOrder.value = "";
+      const state = await request("/api/state", null);
+      ingest(state);
+      if (!imported.length) {
+        els.importMapMessage.textContent =
+          "没找到可导入的地图（" + (result.directory || "data/map") + "）";
+        return;
+      }
+      const names = imported.map((item) => item.id + " · " + item.name).join("，");
+      els.importMapMessage.textContent =
+        "已导入 " + imported.length + " 张地图：" + names +
+        (failures.length ? "（" + failures.length + " 张失败）" : "") +
+        " · 当前使用 " + state.map_name;
+    } catch (error) {
+      els.importMapMessage.textContent = "自动导入失败：" + error.message;
+    } finally {
+      setImportBusy(false);
+    }
   }
 
   function allowedMapFile(name) {
@@ -2105,17 +2135,14 @@
   }
 
   els.importFileBtn.addEventListener("click", () => els.importFileInput.click());
-  els.importDirBtn.addEventListener("click", () => els.importDirInput.click());
   els.importFileInput.addEventListener("change", () => {
     const files = Array.from(els.importFileInput.files || []);
     els.importFileInput.value = "";
     chooseMapFiles(files);
   });
-  els.importDirInput.addEventListener("change", () => {
-    const files = Array.from(els.importDirInput.files || []);
-    els.importDirInput.value = "";
-    chooseMapFiles(files);
-  });
+  if (els.importAllMapsBtn) {
+    els.importAllMapsBtn.addEventListener("click", importAllMaps);
+  }
 
   els.zoneOrder.addEventListener("input", () => {
     zoneInputDirty = true;

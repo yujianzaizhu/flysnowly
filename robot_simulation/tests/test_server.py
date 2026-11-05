@@ -102,6 +102,39 @@ class ServerTest(unittest.TestCase):
         for key in ("overall_coverage", "distance", "duration"):
             self.assertIn(key, state["task"])
 
+    def test_map_scan_imports_all_maps_under_directory(self):
+        """自动导入：扫描指定目录下所有含 .pgm 的地图并注册，编号复用不重复占号。"""
+        root = tempfile.mkdtemp(prefix="mapscan-")
+        try:
+            for name in ("scan_a", "scan_b"):
+                folder = os.path.join(root, name)
+                os.makedirs(folder)
+                body = bytearray()
+                body += b"P5\n40 40\n255\n"
+                for row in range(40):
+                    for col in range(40):
+                        edge = row in (0, 39) or col in (0, 39)
+                        body.append(0 if edge else 254)
+                with open(os.path.join(folder, "default.pgm"), "wb") as handle:
+                    handle.write(bytes(body))
+            status, data = self.post(
+                "/api/map/scan", {"path": root, "select_first": False}
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(len(data["imported"]), 2)
+            self.assertEqual(data["failures"], [])
+            names = [item["name"] for item in data["imported"]]
+            self.assertEqual(len(names), len(set(names)), "重名地图应自动加目录后缀")
+            ids = [item["id"] for item in data["imported"]]
+            # 再扫一次：同一来源复用编号，不会重复占号
+            _, again = self.post(
+                "/api/map/scan", {"path": root, "select_first": False}
+            )
+            self.assertEqual([item["id"] for item in again["imported"]], ids)
+            self.assertEqual([item["name"] for item in again["imported"]], names)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
     def test_start_mapping(self):
         _, state = self.post("/api/task", {"task": "map"})
         self.assertEqual(state["task"]["type"], "map")
