@@ -102,8 +102,8 @@ PROGRESS_GUARD_DISTANCE = 1.0
 CHARGE_RETRY_SECONDS = 30.0
 CHARGE_RETRY_MAX = 240.0
 # 未探明的墙面超过这个长度就算"明显缺口"，必须去补扫，不能直接结束建图
-# （0.6 m 大约是 6 格墙：再小的缺口补一趟的油钱比收益还高）
-MAP_GAP_MAX_RUN = 0.6
+# （0.3 m 大约是 3 格墙：再短的缺口肉眼几乎看不出来，可以放过）
+MAP_GAP_MAX_RUN = 0.3
 # 同一轮建图最多补扫几次，避免在不可达缺口上无限绕
 MAP_GAP_ATTEMPTS = 4
 # 边界还没探明就想收工时，最多"再找一轮"几次（每次放开周边膨胀重新探索）
@@ -137,10 +137,25 @@ MAP_GAP_PLAN_BUDGET = 0.40
 # 补扫时停在缺口内侧多远的位置观察
 MAP_GAP_VIEW_OFFSET = 0.55
 MAP_DONE_DISCOVERY = 0.85
-# 收工时允许残留的未探明墙面总长（m）：低于它就算"边界找齐了"，高于它就再绕一圈
-MAP_DONE_RESIDUAL = 0.6
+# 收工时允许残留的未探明墙面总长（m）：低于它就算"边界找齐了"，高于它就再绕一圈。
+# 之前给 0.6 m，收工时地图边上总会留一小段没涂抹，看着像"建图漏了一点"。
+MAP_DONE_RESIDUAL = 0.25
 # 最多绕几圈把最后一点墙刷上；超过就收工（不再无限找缺口）
 MAP_CLOSE_MAX_LAPS = 2
+# 绕障过程中允许擦碰 / 卡滞多少次还继续绕（绕障半径贴着障碍物时蹭到是常态，
+# 一碰就放弃会让障碍物后面留一条没割的带子）
+RING_BUMP_LIMIT = 5
+# 绕障弧段连续被挡住多少次才退化成"贴面绕行"（以前一卡就跳过弧段，绕障断得很随意）
+RING_PROBE_LIMIT = 8
+# 退化 / 卡滞后仍绕不过去时，允许连续几次改成贴面绕行
+RING_FALLBACK_LIMIT = 3
+# 贴面绕障（沿障碍物表面绕）允许的行程与越界余量：
+# 障碍物贴在区域边上时，绕行轨迹必然要探出区域框一点点，卡太死会一走就"绕障中断"
+DETOUR_MAX_DISTANCE = 14.0
+DETOUR_ZONE_SLACK = 0.35
+# 一次绕障里最多停下来"花瓣式"找几次小障碍物（路径本身是几何算好的，
+# 看不见也可以照着绕，扫太多次会把绕障拖到超时）
+RING_SCAN_LIMIT = 3
 # 寻找未探明边界连续卡住几次就结束建图回桩
 MAP_SEEK_STUCK_LIMIT = 3
 # 建图阶段累计活动时间（不含充电/回桩）上限：超过就收工。实景图上有些墙角
@@ -251,7 +266,10 @@ class TaskManager(object):
         self.resume_requested = False
         self.zone_plan_passes = 0
         self.failed_segments = set()
+        # lane_axis 是当前要用的弓字方向；main_lane_axis 是本区域的主方向，
+        # 补割时可以换成另一个方向，但主覆盖阶段不再来回跳。
         self.lane_axis = "h"
+        self.main_lane_axis = "h"
         self.rings_done = False
         self.mowing_mode = DEFAULT_MOWING_MODE
         self.edge_done = False
@@ -284,6 +302,16 @@ class TaskManager(object):
         self.coverage_retry_best = 0.0
         self.ring_clipped = False
         self.ring_lost_time = 0.0
+        self.ring_bumps = 0
+        self.ring_scan_count = 0
+        self.ring_stuck = 0
+        self.ring_time_limit = 35.0
+        self.ring_probe = 0
+        self.ring_surface_tries = 0
+        self.ring_origin = None
+        self.ring_radius = 0.0
+        self.detour_ring_after = None
+        self.bypass_skip_count = 0
         self.ring_scan_time = 0.0
         self.ring_scan_heading = 0.0
         self.task_start_sim = None
@@ -485,6 +513,7 @@ class TaskManager(object):
             self.zone_index = 0
             self.zone_id = order[0]
             self.grid.set_reach_seed(*self._pose()[:2])
+            self.ring_surface_tries = 0
             self.phase = "to_zone"
             self._log(
                 "event",
@@ -917,9 +946,9 @@ class TaskManager(object):
         if self.phase == "no_go_ring" and self.phase_time > 25.0:
             self._log("warn", "绕禁区超时，结束绕行并继续任务")
             self._finish_no_go_ring()
-        if self.phase == "ring" and self.phase_time > 35.0:
-            self._log("warn", "绕障超时，结束本次绕障并重新规划")
-            self._finish_ring()
+        if self.phase == "ring" and self.phase_time > self.ring_time_limit:
+            self._log("warn", "绕障超时，改用贴面绕行收尾")
+            self._ring_to_surface("超时 {:.0f} s".format(self.phase_time))
         if (
             self.phase == "zone_edge"
             and self.edge_start_sim is not None
@@ -1027,9 +1056,22 @@ class TaskManager(object):
         if phase == "no_go_ring":
             self._finish_no_go_ring()
         elif phase == "ring":
-            if self._ring_skip_ahead():
+            self.ring_stuck += 1
+            if self.ring_stuck <= 3:
+                released = self.grid.release_blocked_disc(
+                    self._pose()[0], self._pose()[1], 0.55
+                )
+                self._ring_push_out(0.12)
+                self._ring_tight_target()
+                self._log(
+                    "info",
+                    "绕障卡滞（第 {} 次），放开周边 {} 格膨胀、弧段外推后继续绕行".format(
+                        self.ring_stuck, released
+                    ),
+                )
                 return
-            self._finish_ring()
+            # 几何弧段确实走不通：改成贴面绕行，别直接把绕障判死
+            self._ring_to_surface("卡滞 {} 次".format(self.ring_stuck))
         elif phase == "detour":
             self._finish_detour()
         elif phase == "zone_edge":
@@ -1678,7 +1720,10 @@ class TaskManager(object):
         都补不上的就记下来，避免在不可达的缺口上无限绕、建图永远完不成。
         """
         discovery = self.grid.boundary_discovery()
-        if discovery >= MAP_DONE_DISCOVERY_NOW:
+        if (
+            discovery >= MAP_DONE_DISCOVERY_NOW
+            and self._map_residual_length() <= MAP_DONE_RESIDUAL
+        ):
             return True
         if self.map_gap_done:
             return True
@@ -2319,6 +2364,18 @@ class TaskManager(object):
             result.append((x, y))
         return result
 
+    def _preferred_lane_axis(self, zone):
+        """整个区域的主弓字方向：沿着区域长边走。
+
+        以前固定从横向开始，区域是"竖长"的时候横向弓字又短又多，割不完还得再
+        转一遍纵向补割，同一片地上会先横后竖、看起来方向乱跳。现在进区域时按
+        长边定一次方向，整个主覆盖阶段都用它（含绕障后的重规划）；只有漏扫补割
+        可以换方向。
+        """
+        width = float(zone.get("x1", 0.0)) - float(zone.get("x0", 0.0))
+        height = float(zone.get("y1", 0.0)) - float(zone.get("y0", 0.0))
+        return "h" if width >= height else "v"
+
     def _node_lanes(self, zone, mode, axis=None):
         """区域内还没割到的弓字线段（蛇形顺序）。"""
         axis = axis or self.lane_axis
@@ -2345,6 +2402,7 @@ class TaskManager(object):
         self.coverage_retry_best = 0.0
         self.failed_segments = set()
         self.lane_axis = "h"
+        self.main_lane_axis = "h"
         self.rings_done = False
         self.edge_done = False
         self.segment_reversed = False
@@ -2357,6 +2415,7 @@ class TaskManager(object):
             self.phase = "zone_plan"
             return
         self._reset_zone_progress()
+        self.lane_axis = self.main_lane_axis = self._preferred_lane_axis(zone)
         if self.mowing_mode == "B":
             self.zone_stage = "stripes"
             self.phase = "zone_plan"
@@ -2375,6 +2434,7 @@ class TaskManager(object):
             self.phase = "zone_plan"
             return
         self._reset_zone_progress()
+        self.lane_axis = self.main_lane_axis = self._preferred_lane_axis(zone)
         self.edge_done = True
         self.zone_stage = "stripes"
         self.phase = "zone_plan"
@@ -2693,6 +2753,13 @@ class TaskManager(object):
         self.ring_clipped = len(points) < planner.RING_STEPS
         self.ring_lost_time = 0.0
         self.ring_scan_time = 0.0
+        self.ring_bumps = 0
+        self.ring_scan_count = 0
+        self.ring_stuck = 0
+        self.ring_probe = 0
+        self.ring_origin = (x, y)
+        self.ring_radius = self._ring_nominal_radius(points, circle)
+        self.ring_time_limit = 20.0 + 0.7 * len(points)
         self.phase = "ring"
         self.route = []
         self.stats["rings"] += 1
@@ -2878,10 +2945,10 @@ class TaskManager(object):
         if self.zone_plan_passes > MAX_ZONE_PLAN_PASSES or self.zone_total_plans > 400:
             self._finish_zone_coverage()
             return
-        if not self.segments and self.lane_axis == "h":
+        if not self.segments and self.lane_axis == self.main_lane_axis:
             coverage = self.grid.zone_coverage(self.zone_id)
             if coverage < 0.93:
-                self.lane_axis = "v"
+                self.lane_axis = "v" if self.main_lane_axis == "h" else "h"
                 self.zone_plan_passes = 0
                 vertical = self._node_lanes(zone, "COVERAGE", axis="v")
                 filtered = [
@@ -2925,7 +2992,7 @@ class TaskManager(object):
             else:
                 self._complete_zone()
             return
-        if self.lane_axis == "v" and self._plan_rings():
+        if self.lane_axis != self.main_lane_axis and self._plan_rings():
             return
         self._complete_zone()
 
@@ -3213,6 +3280,17 @@ class TaskManager(object):
         circle = self._nearest_circle(x, y, 1.0)
 
         if circle is not None and self._is_bypassed(circle):
+            self.bypass_skip_count += 1
+            if self.bypass_skip_count in (3, 6, 12):
+                # 反复挡在同一条线上：把障碍物盖章进栅格，让弓字线真的绕开它，
+                # 否则会"重新规划→又撞上→再跳过"地空转
+                self.grid.stamp_footprint(circle["x"], circle["y"], circle["r"])
+                self._log(
+                    "info",
+                    "同一障碍物已连续 {} 次挡路，写入栅格后重新规划".format(
+                        self.bypass_skip_count
+                    ),
+                )
             self._log("info", "该障碍物已绕行过，跳过二次绕障并重新规划")
             if source in ("edge", "zone_edge"):
                 # 已绕过的障碍仍挡在预瞄方向时，一次推进到该障碍后的
@@ -3264,6 +3342,14 @@ class TaskManager(object):
             self.ring_clipped = len(points) < planner.RING_STEPS
             self.ring_lost_time = 0.0
             self.ring_scan_time = 0.0
+            self.ring_bumps = 0
+            self.ring_scan_count = 0
+            self.ring_stuck = 0
+            self.ring_probe = 0
+            self.ring_origin = (x, y)
+            self.ring_radius = self._ring_nominal_radius(points, circle)
+            # 弧越长给的越宽松：30 个点 ≈ 6 m ≈ 20 s，留足余量
+            self.ring_time_limit = 20.0 + 0.7 * len(points)
             self.phase = "ring"
             self.route = []
             self.stats["rings"] += 1
@@ -3520,8 +3606,9 @@ class TaskManager(object):
                 self.ring_lost_time = 0.0
             else:
                 self.ring_lost_time += dt
-                if self.ring_lost_time > 0.5:
+                if self.ring_lost_time > 0.5 and self.ring_scan_count < RING_SCAN_LIMIT:
                     self.ring_lost_time = 0.0
+                    self.ring_scan_count += 1
                     self.ring_scan_time = 0.8
                     self.ring_scan_heading = math.atan2(circle["y"] - y, circle["x"] - x)
                     self._log("info", "小障碍物进入视觉盲区，花瓣式旋转探明后继续绕障")
@@ -3533,7 +3620,39 @@ class TaskManager(object):
             if abs(err) > 0.30:
                 return 0.0, world.clamp(2.0 * err, -1.5, 1.5)
             self.ring_started = True
+        # 车被挤到绕障圆内侧时，目标点会跑到侧后方，照直开就会一头顶在障碍物上：
+        # 先把车沿半径方向推回圆弧，再继续沿弧绕
+        circle = self.ring_circle
+        if circle is not None and self.ring_radius:
+            cx, cy = circle["x"], circle["y"]
+            radius = math.hypot(x - cx, y - cy)
+            if 0.05 < radius < self.ring_radius - 0.08:
+                out_x = cx + (x - cx) / radius * (self.ring_radius + 0.06)
+                out_y = cy + (y - cy) / radius * (self.ring_radius + 0.06)
+                err_out = world.wrap_angle(math.atan2(out_y - y, out_x - x) - theta)
+                if abs(err_out) < 2.2:
+                    return self._wall_guard(
+                        0.26 * max(0.25, 1.0 - abs(err_out) / 1.6),
+                        world.clamp(2.4 * err_out, -1.4, 1.4),
+                    )
         target = self.ring_points[self.ring_index]
+        if not self.grid.line_clear((x, y), target) and math.hypot(
+            target[0] - x, target[1] - y
+        ) > 0.35:
+            # 弧段被挡住时按"外推 → 收紧预瞄 → 跳过弧点 → 贴面绕行"逐级降级，
+            # 以前一卡就跳过 6 个点，绕障动不动就断在半路
+            self.ring_probe += 1
+            self._ring_push_out(0.06 + 0.02 * min(self.ring_probe, 8))
+            tighter = self._ring_tight_target()
+            if tighter is not None:
+                target = tighter
+            elif self.ring_probe % 4 == 0 and self._ring_skip_ahead():
+                target = self.ring_points[self.ring_index]
+            if self.ring_probe >= RING_PROBE_LIMIT:
+                self._ring_to_surface("弧段连续受阻 {} 次".format(self.ring_probe))
+                return 0.0, 0.0
+        else:
+            self.ring_probe = 0
         if math.hypot(target[0] - x, target[1] - y) < 0.15:
             self.ring_index += 1
             if self.ring_index >= len(self.ring_points):
@@ -3545,7 +3664,99 @@ class TaskManager(object):
         w = world.clamp(2.2 * err, -1.4, 1.4)
         return self._wall_guard(v, w)
 
+    @staticmethod
+    def _ring_nominal_radius(points, circle):
+        """绕障弧段的标称半径（各点到障碍物中心的距离中位数）。"""
+        if not points or circle is None:
+            return 0.0
+        values = sorted(
+            math.hypot(point[0] - circle["x"], point[1] - circle["y"]) for point in points
+        )
+        return values[len(values) // 2]
+
+    def _ring_tight_target(self, prefer=0.45):
+        """弧段被挡时改用"离车最近、且直达"的弧点做预瞄（弦更短，贴着障碍物走）。"""
+        x, y, _ = self._pose()
+        points = self.ring_points
+        if not points:
+            return None
+        best = None
+        best_distance = 1e9
+        for index in range(self.ring_index, len(points)):
+            px, py = points[index]
+            distance = math.hypot(px - x, py - y)
+            if distance < 0.18:
+                continue
+            if distance > prefer + 0.35:
+                break
+            if not self.grid.line_clear((x, y), (px, py)):
+                continue
+            if best is None or distance < best_distance:
+                best = index
+                best_distance = distance
+        if best is None:
+            return None
+        self.ring_index = best
+        return points[best]
+
+    def _ring_to_surface(self, reason):
+        """几何弧段实在走不通：改成贴面绕行继续绕，而不是直接结束绕障。"""
+        circle = self.ring_circle
+        after = self.ring_after
+        if self.ring_surface_tries >= RING_FALLBACK_LIMIT:
+            self._log("warn", "绕障受阻（{}），跳过该障碍并重新规划".format(reason))
+            if circle is not None and not self._is_bypassed(circle):
+                self.bypassed_circles.append(dict(circle))
+            self.ring_circle = None
+            self.ring_points = []
+            self.ring_index = 0
+            self.ring_after = None
+            if after == "rings":
+                self._next_ring()
+                return
+            if self.detour_source == "stripes" and self.segment is not None:
+                self.failed_segments.add(_segment_key(self.segment_plan or self.segment))
+            self._finish_detour()
+            return
+        self.ring_surface_tries += 1
+        if circle is not None and not self._is_bypassed(circle):
+            self.bypassed_circles.append(dict(circle))
+        self.ring_circle = None
+        self.ring_points = []
+        self.ring_index = 0
+        self.ring_after = None
+        # 从"绕障起点"开始量回来，走到起点附近才算绕完一圈
+        self.detour_start = self.ring_origin or self._pose()[:2]
+        self.detour_distance = 0.0
+        self.detour_source = self.detour_source or "edge"
+        self.detour_ring_after = after
+        self.phase = "detour"
+        self.route = []
+        self._log(
+            "info",
+            "绕障弧段走不通（{}），改用贴面绕行继续绕（第 {} 次）".format(
+                reason, self.ring_surface_tries
+            ),
+        )
+
     RING_SKIP_POINTS = 6
+
+    def _ring_push_out(self, amount=0.14):
+        """把还没走到的弧段整体往外推一点：蹭到障碍物说明绕障半径压得太紧。"""
+        circle = self.ring_circle
+        if circle is None or not self.ring_points:
+            return 0
+        cx, cy = circle["x"], circle["y"]
+        moved = 0
+        for index in range(self.ring_index, len(self.ring_points)):
+            x, y = self.ring_points[index]
+            distance = math.hypot(x - cx, y - cy)
+            if distance < 1e-6:
+                continue
+            scale = (distance + amount) / distance
+            self.ring_points[index] = (cx + (x - cx) * scale, cy + (y - cy) * scale)
+            moved += 1
+        return moved
 
     def _ring_skip_ahead(self):
         """绕障被挡住时先跳过弧段上的几个点，别一卡就直接结束整圈绕障。
@@ -3579,6 +3790,7 @@ class TaskManager(object):
         self.ring_points = []
         self.ring_index = 0
         self.ring_started = False
+        self.ring_probe = 0
         after = self.ring_after
         self.ring_after = None
         if self.ring_circle is not None:
@@ -3591,6 +3803,10 @@ class TaskManager(object):
         if after == "detour":
             if clipped:
                 self._log("info", "绕障在区域边界结束，沿区域边界继续任务")
+            if self.detour_source == "stripes" and self.segment is not None:
+                # 这条弓字线绕不过去：作废它，剩下的区域重新规划，
+                # 否则规划器会再排一条同样的线，车又撞回同一个障碍物
+                self.failed_segments.add(_segment_key(self.segment_plan or self.segment))
             self._finish_detour()
         elif after == "rings":
             self._next_ring()
@@ -3602,21 +3818,23 @@ class TaskManager(object):
         v, w = self._follow_surface(0.32, 0.45, front_limit=0.55)
         x, y, _ = self._pose()
         zone = self._zone()
+        slack = DETOUR_ZONE_SLACK
         if zone is not None and not (
-            zone["x0"] + 0.05 <= x <= zone["x1"] - 0.05
-            and zone["y0"] + 0.05 <= y <= zone["y1"] - 0.05
+            zone["x0"] - slack <= x <= zone["x1"] + slack
+            and zone["y0"] - slack <= y <= zone["y1"] + slack
         ):
             if self.robot.sim_time - self.edge_guard_log_time > 2.0:
                 self.edge_guard_log_time = self.robot.sim_time
-                self._log("info", "沿边绕障触及区域边界，返回本区域边缘")
+                self._log("info", "沿边绕障走远了，返回本区域边缘")
             self._finish_detour()
             return 0.0, 0.0
         if self.detour_start is not None:
-            returned = math.hypot(x - self.detour_start[0], y - self.detour_start[1]) < 0.20
+            returned = math.hypot(x - self.detour_start[0], y - self.detour_start[1]) < 0.28
             if self.detour_distance > 2.2 and returned:
                 self._finish_detour()
                 return 0.0, 0.0
-        if self.detour_distance > 9.0:
+        if self.detour_distance > DETOUR_MAX_DISTANCE:
+            self._log("info", "贴面绕障走了 {:.1f} m，回到正常路径".format(self.detour_distance))
             self._finish_detour()
             return 0.0, 0.0
         return self._wall_guard(v, w)
@@ -3624,9 +3842,15 @@ class TaskManager(object):
     def _finish_detour(self):
         self._log("event", "绕障完成并回到历史路径")
         source = self.detour_source
+        ring_after = self.detour_ring_after
         self.detour_source = None
         self.detour_start = None
         self.detour_distance = 0.0
+        self.detour_ring_after = None
+        if ring_after == "rings":
+            # 本来是在给障碍物做环形补割：接着绕下一个
+            self._next_ring()
+            return
         if source == "edge" and self.edge_points:
             self._resume_edge_route()
         else:
@@ -3728,18 +3952,10 @@ class TaskManager(object):
                 self._advance_edge_after_collision(0.80)
             return
         if self.phase == "ring":
-            self._log("warn", "环形绕障受阻，跳过该障碍并重新规划")
-            if self.ring_circle is not None:
-                self.bypassed_circles.append(dict(self.ring_circle))
-                self.ring_circle = None
-            self.ring_points = []
-            self.ring_index = 0
-            if self.ring_after == "detour":
-                self._finish_detour()
-            elif self.ring_after == "rings":
-                self._next_ring()
-            else:
-                self.phase = "zone_plan"
+            # 几何圆弧被挤住（障碍贴墙、通道太窄）时改成贴面绕行：
+            # 贴面控制会跟墙面保持距离，比硬压着圆弧走稳得多，也不会一碰就收工
+            self.ring_bumps += 1
+            self._ring_to_surface("擦碰障碍物 {} 次".format(self.ring_bumps))
             return
         if self.phase == "detour":
             self._log("warn", "绕障受阻，重新贴回历史路径")
@@ -4496,6 +4712,7 @@ class TaskManager(object):
             "map_path_dist": self.map_path_dist,
             "map_islands": list(self.map_islands),
             "lane_axis": self.lane_axis,
+            "main_lane_axis": self.main_lane_axis,
             "bypassed": [dict(circle) for circle in self.bypassed_circles],
             "rings_done": self.rings_done,
             "failed_segments": list(self.failed_segments),
@@ -4570,6 +4787,7 @@ class TaskManager(object):
         if saved.get("task_start_sim") is not None:
             self.task_start_sim = saved["task_start_sim"]
         self.lane_axis = saved.get("lane_axis", "h")
+        self.main_lane_axis = saved.get("main_lane_axis", self.lane_axis)
         self.bypassed_circles = [dict(circle) for circle in saved.get("bypassed", [])]
         self.rings_done = saved.get("rings_done", False)
         self.failed_segments = set(saved.get("failed_segments", []))

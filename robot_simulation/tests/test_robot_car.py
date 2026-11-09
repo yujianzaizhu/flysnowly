@@ -57,6 +57,47 @@ class KinematicsTest(unittest.TestCase):
         self.assertAlmostEqual(car.v, 0.0, places=6)
 
 
+class ManualSpeedTest(unittest.TestCase):
+    """控制台的两个速度输入是键盘档位：只改按方向键时的速度，不会让车自己跑。"""
+
+    def setUp(self):
+        world.select_map(1)
+        self.car = RobotCar()
+
+    def test_direction_commands_use_given_speed(self):
+        self.car.handle_command("forward", linear=0.30, angular=0.50)
+        self.assertAlmostEqual(self.car.target_v, 0.30)
+        self.assertAlmostEqual(self.car.target_w, 0.0)
+
+        self.car.handle_command("backward", linear=0.30, angular=0.50)
+        self.assertAlmostEqual(self.car.target_v, -0.30)
+
+        self.car.handle_command("left", linear=0.30, angular=0.50)
+        self.assertAlmostEqual(self.car.target_v, 0.0)
+        self.assertAlmostEqual(self.car.target_w, 0.50)
+
+        self.car.handle_command("right", linear=0.30, angular=0.50)
+        self.assertAlmostEqual(self.car.target_w, -0.50)
+
+    def test_missing_speed_falls_back_to_default_command(self):
+        self.car.handle_command("forward")
+        self.assertAlmostEqual(self.car.target_v, robot_car.COMMANDS["forward"][0])
+        self.car.handle_command("left")
+        self.assertAlmostEqual(self.car.target_w, robot_car.COMMANDS["left"][1])
+
+    def test_speed_is_clamped_to_limits(self):
+        self.car.handle_command("forward", linear=5.0, angular=9.0)
+        self.assertAlmostEqual(self.car.target_v, robot_car.MAX_LINEAR)
+        self.car.handle_command("left", linear=5.0, angular=9.0)
+        self.assertAlmostEqual(self.car.target_w, robot_car.MAX_ANGULAR)
+
+    def test_stop_ignores_speed(self):
+        self.car.handle_command("forward", linear=0.40, angular=0.60)
+        self.car.handle_command("stop", linear=0.40, angular=0.60)
+        self.assertAlmostEqual(self.car.target_v, 0.0)
+        self.assertAlmostEqual(self.car.target_w, 0.0)
+
+
 class VisionTest(unittest.TestCase):
     def setUp(self):
         world.select_map(1)

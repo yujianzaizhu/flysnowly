@@ -19,6 +19,8 @@ MOW_INFLATE_CELLS = 1
 STAMP_INFLATE_CELLS = 2
 # 墙面占据格往墙外侧偏移多远：占据带画在场地外轮廓线之外，墙内侧不被吃掉
 SURFACE_STAMP_OUTSET = 0.08
+# 墙面涂抹带宽（格）：0.2 m。太宽会把墙内侧可割区啃掉一圈，也不利于看清边界
+SURFACE_STAMP_SPAN = 2
 # 车体实际压过的格子半径：这是"这里一定能走"的硬证据。
 # 只认车体中心那一格（半径远小于车体半径），目的是防止视觉盖章把机器人自己
 # 走过的通道糊成障碍；不敢顺带放开更多导航膨胀，否则规划会贴着墙走。
@@ -29,7 +31,6 @@ MAX_OBSTACLE_CELLS = 1200
 MAX_OBSTACLE_EXTENT = 4.0
 SMALL_OBSTACLE_RADIUS = 0.45
 MIN_ZONE_AREA = 20.0
-REGULAR_SOLIDITY = 0.90
 
 
 class GridMap(object):
@@ -64,6 +65,9 @@ class GridMap(object):
         self.free_mask = bytearray(self.cols * self.rows)
         self.mask_ready = False
         self._reset_arrays()
+        # 换图重建栅格时，手动障碍与通道要立刻生效
+        self.apply_static_edits(world.static_edits())
+        self.apply_passages(getattr(world, "PASSAGES", None))
 
     def _reset_arrays(self):
         self.data_version = getattr(self, "data_version", 0) + 1
@@ -74,6 +78,9 @@ class GridMap(object):
         self.mowed = bytearray(self.cols * self.rows)
         self.blocked = bytearray(self.cols * self.rows)
         self.mow_blocked = bytearray(self.cols * self.rows)
+        # 通道：只通行、不割草。这一层既不进 free_mask（不参与分区与覆盖率），
+        # 也不进 blocked（规划照常可以穿过去）
+        self.no_mow = bytearray(self.cols * self.rows)
         self.dyn_blocked = bytearray(self.cols * self.rows)
         self.verified_free = bytearray(self.cols * self.rows)
         self.free_mask = bytearray(self.cols * self.rows)
@@ -86,7 +93,59 @@ class GridMap(object):
         self._reset_arrays()
         # 用户手动添加的障碍物不属于传感器建图，重建栅格后要原样写回去
         self.apply_static_edits(world.static_edits())
+        self.apply_passages(getattr(world, "PASSAGES", None))
         self.version += 1
+
+    def apply_passages(self, passages, regions=None):
+        """把「纯通道」刷进 no_mow 层：能开车过去，但不割、也不参与分区。
+
+        通道压在区域上的那一段（同一格既在通道里、又在某个区域多边形里）
+        属于区域，照常割草；只有独属于通道的部分才不割。
+        """
+        regions = getattr(world, "REGIONS", None) if regions is None else regions
+        polygons = [
+            item.get("points") or [] for item in regions or [] if len(item.get("points") or []) >= 3
+        ]
+        cell = self.cell
+        marked = 0
+        for corridor in passages or []:
+            points = corridor.get("points") or []
+            if len(points) < 2:
+                continue
+            half = float(corridor.get("half", 0.4))
+            step = cell * 0.5
+            for index in range(len(points) - 1):
+                ax, ay = points[index][0], points[index][1]
+                bx, by = points[index + 1][0], points[index + 1][1]
+                length = math.hypot(bx - ax, by - ay)
+                count = max(1, int(length / step))
+                for step_index in range(count + 1):
+                    t = step_index / float(count)
+                    marked += self._mark_no_mow_disc(
+                        ax + (bx - ax) * t, ay + (by - ay) * t, half, polygons
+                    )
+        if marked:
+            self.version += 1
+        return marked
+
+    def _mark_no_mow_disc(self, cx, cy, radius, polygons=None):
+        cell = self.cell
+        col0, row0 = self.cell_of(cx - radius, cy - radius)
+        col1, row1 = self.cell_of(cx + radius, cy + radius)
+        marked = 0
+        for row in range(row0, row1 + 1):
+            for col in range(col0, col1 + 1):
+                x, y = self.center_of(col, row)
+                if math.hypot(x - cx, y - cy) > radius:
+                    continue
+                if polygons and any(world.point_in_polygon(x, y, item) for item in polygons):
+                    # 这一段在区域里：属于区域的部分不能漏割
+                    continue
+                index = self.index(col, row)
+                if not self.no_mow[index]:
+                    self.no_mow[index] = 1
+                    marked += 1
+        return marked
 
     def apply_static_edits(self, items):
         """把用户添加的静态障碍写进占据/膨胀层（圆形：中心 + 半径）。"""
@@ -105,6 +164,7 @@ class GridMap(object):
             bytearray(self.data),
             bytearray(self.blocked),
             bytearray(self.mow_blocked),
+            bytearray(self.no_mow),
         )
         return True
 
@@ -116,6 +176,8 @@ class GridMap(object):
         self.data = bytearray(baseline[0])
         self.blocked = bytearray(baseline[1])
         self.mow_blocked = bytearray(baseline[2])
+        if len(baseline) > 3:
+            self.no_mow = bytearray(baseline[3])
         self._wall_pending = None
         self.data_version += 1
         self.version += 1
@@ -227,6 +289,25 @@ class GridMap(object):
                 changed = True
         return changed
 
+    def _fill_rect(self, buffer, c0, r0, c1, r1, value=1):
+        """把 [c0,c1] × [r0,r1] 的矩形写进 buffer（含端点），返回是否有改动。"""
+        cols = self.cols
+        c0 = max(0, c0)
+        r0 = max(0, r0)
+        c1 = min(cols - 1, c1)
+        r1 = min(self.rows - 1, r1)
+        if c1 < c0 or r1 < r0:
+            return False
+        span = c1 - c0 + 1
+        fill = bytes((value,)) * span
+        changed = False
+        for row in range(r0, r1 + 1):
+            base = row * cols + c0
+            if buffer[base:base + span] != fill:
+                buffer[base:base + span] = fill
+                changed = True
+        return changed
+
     def mark_occupied(self, col, row, data_col=None, data_row=None):
         """写入墙面命中点。
 
@@ -240,8 +321,12 @@ class GridMap(object):
         drow = row if data_row is None else data_row
         if not self.in_bounds(dcol, drow):
             dcol, drow = col, row
-        # 3×3 占据块 + 对应膨胀：按行切片写入（等价于原来逐格 9×(5×5) 的写法）
-        changed = self._fill_rows(self.data, dcol, drow, 1, OCCUPIED)
+        # 墙面涂抹带：0.2 m，贴着墙外侧画，墙内侧不吃可割区
+        half = SURFACE_STAMP_SPAN // 2
+        changed = self._fill_rect(
+            self.data, dcol - half, drow - half, dcol + SURFACE_STAMP_SPAN - 1 - half,
+            drow + SURFACE_STAMP_SPAN - 1 - half, OCCUPIED,
+        )
         if self._wall_pending:
             self._note_known(drow * self.cols + dcol, spread=2)
         self._fill_rows(self.blocked, col, row, 1 + INFLATE_CELLS)
@@ -694,21 +779,36 @@ class GridMap(object):
         return True
 
     def partition_zones(self):
-        """按实际连通自由区划分区域；规则连通域保持整体，哑铃形才拆分。"""
+        """分区：地图里画好的区域各算一个割草区域，其余按连通域分区。
+
+        地图编辑器保存的地图自带区域多边形（`world.REGIONS`），用户画了几个区域
+        就是几个割草区域 —— 哪怕两块区域在栅格里是连着的（区域边缘相接、中间只
+        隔一条单行通道），也不能并成一块，否则割草会漏掉其中一块的沿边。
+
+        没有自带区域的地图（内置场地、导入的 PGM 实景图）仍然按连通自由区分区：
+        以前还会把"哑铃形"连通域按最远点对再拆成两块（`_split_component`），
+        于是同一片连通的草地被切成两个区域、中间多出一圈沿边，既多走路又容易
+        沿到人工分界上。现在只做"过小碎片并入相邻区域"，不再额外拆分。
+        """
         self.zones = []
         self.zone_totals = {}
         self.zone_mowed = {}
         min_zone_free = max(
             100, int(round(MIN_ZONE_AREA / (self.cell * self.cell)))
         )
-        components = self._free_components()
-        if not components:
+        zone_cells = self._region_zone_cells()
+        if zone_cells is None:
+            components = self._free_components()
+            if not components:
+                return self.zones
+            zone_cells = [set(component) for component in components]
+            zone_cells = self._merge_small_components(zone_cells, min_zone_free)
+        else:
+            # 区域多边形已经定好了分区：不再做碎片合并，否则小于最小区块面积的
+            # 区域会被并进隔壁，用户画的两个区域又回到一个。
+            zone_cells = [cells for cells in zone_cells if cells]
+        if not zone_cells:
             return self.zones
-
-        zone_cells = []
-        for component in components:
-            zone_cells.extend(self._split_component(component, min_zone_free))
-        zone_cells = self._merge_small_components(zone_cells, min_zone_free)
 
         normalized = []
         for cells in zone_cells:
@@ -823,11 +923,76 @@ class GridMap(object):
                 simplified.append((round(cur[0], 2), round(cur[1], 2)))
         return simplified if len(simplified) >= 3 else []
 
+    def _region_zone_cells(self):
+        """按地图自带的区域多边形分配自由格；没有多个区域时返回 None。
+
+        只有地图里明确画了 ≥2 个区域才走这条路：单区域（含内置/导入地图）仍旧
+        按连通域分区，这样实景图里被障碍隔开的草地不会被强行塞进一个区域。
+        """
+        polygons = [
+            item.get("points") or []
+            for item in getattr(world, "REGIONS", None) or []
+            if len(item.get("points") or []) >= 3
+        ]
+        if len(polygons) < 2:
+            return None
+        # 小区域先认领格子：区域互相重叠时，交界处的格子归小区域，大区域不会
+        # 把小区域整个吃掉
+        order = sorted(range(len(polygons)), key=lambda i: abs(_polygon_area(polygons[i])))
+        groups = [set() for _ in polygons]
+        leftover = set()
+        for index, value in enumerate(self.free_mask):
+            if not value or self.no_mow[index]:
+                # 纯通道段不割草，也不属于任何区域
+                continue
+            x, y = self.center_of(index % self.cols, index // self.cols)
+            owner = None
+            for slot in order:
+                if world.point_in_polygon(x, y, polygons[slot]):
+                    owner = slot
+                    break
+            if owner is None:
+                leftover.add(index)
+            else:
+                groups[owner].add(index)
+        if not any(groups):
+            return None
+        # 栅格中心落在区域多边形外的一圈边缘格（多边形比栅格化结果小半格）按
+        # 最近的区域补进去，免得这些格子既不割也不计覆盖
+        pending = [index for index in leftover]
+        bounds = []
+        for cells in groups:
+            if cells:
+                cols_ = [cell % self.cols for cell in cells]
+                rows_ = [cell // self.cols for cell in cells]
+                bounds.append((min(cols_), min(rows_), max(cols_), max(rows_)))
+            else:
+                bounds.append(None)
+        for index in pending:
+            col = index % self.cols
+            row = index // self.cols
+            best = None
+            for slot, box in enumerate(bounds):
+                if box is None:
+                    continue
+                dx = max(0, box[0] - col, col - box[2])
+                dy = max(0, box[1] - row, row - box[3])
+                gap = dx + dy
+                if best is None or gap < best[0]:
+                    best = (gap, slot)
+            if best is not None:
+                groups[best[1]].add(index)
+        return groups
+
     def _free_components(self):
         visited = set()
         components = []
+        no_mow = self.no_mow
         for start in range(self.cols * self.rows):
             if not self.free_mask[start] or start in visited:
+                continue
+            if no_mow[start]:
+                # 通道只通行不割草：不参与分区，否则两个区域会被通道粘成一块
                 continue
             visited.add(start)
             stack = [start]
@@ -845,90 +1010,15 @@ class GridMap(object):
                         if not self.in_bounds(nc, nr):
                             continue
                         nindex = self.index(nc, nr)
+                        if no_mow[nindex]:
+                            # 通道既不参与分区，也不作为区域的连接边
+                            visited.add(nindex)
+                            continue
                         if self.free_mask[nindex] and nindex not in visited:
                             visited.add(nindex)
                             stack.append(nindex)
             components.append(set(cells))
         return components
-
-    def _component_distances(self, start, cells):
-        from collections import deque
-
-        cols = self.cols
-        offsets = (-cols - 1, -cols, -cols + 1, -1, 1, cols - 1, cols, cols + 1)
-        size = cols * self.rows
-        distances = {start: 0}
-        queue = deque([start])
-        while queue:
-            index = queue.popleft()
-            step = distances[index] + 1
-            col = index % cols
-            for offset in offsets:
-                nindex = index + offset
-                if nindex < 0 or nindex >= size:
-                    continue
-                if offset in (-1, 1):
-                    ncol = col + offset
-                    if ncol < 0 or ncol >= cols:
-                        continue
-                elif offset in (-cols - 1, -cols + 1, cols - 1, cols + 1):
-                    if abs(nindex % cols - col) != 1:
-                        continue
-                if nindex not in cells or nindex in distances:
-                    continue
-                distances[nindex] = step
-                queue.append(nindex)
-        return distances
-
-    def _split_component(self, cells, min_zone_free):
-        if len(cells) < 2 * min_zone_free:
-            return [cells]
-        hull_area = self._convex_hull_area(cells)
-        solidity = len(cells) / max(1.0, hull_area)
-        if solidity >= REGULAR_SOLIDITY:
-            return [cells]
-
-        start = next(iter(cells))
-        first_dist = self._component_distances(start, cells)
-        endpoint_a = max(first_dist, key=first_dist.get)
-        dist_a = self._component_distances(endpoint_a, cells)
-        endpoint_b = max(dist_a, key=dist_a.get)
-        dist_b = self._component_distances(endpoint_b, cells)
-        part_a = set()
-        part_b = set()
-        for index in cells:
-            if dist_a.get(index, 1e18) <= dist_b.get(index, 1e18):
-                part_a.add(index)
-            else:
-                part_b.add(index)
-        if (
-            len(part_a) < min_zone_free
-            or len(part_b) < min_zone_free
-            or not part_a
-            or not part_b
-        ):
-            return [cells]
-        return [part_a, part_b]
-
-    def _convex_hull_area(self, cells):
-        points = set()
-        for index in cells:
-            col = index % self.cols
-            row = index // self.cols
-            boundary = False
-            for dc, dr in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                nc, nr = col + dc, row + dr
-                if not self.in_bounds(nc, nr) or self.index(nc, nr) not in cells:
-                    boundary = True
-                    break
-            if boundary:
-                points.update(
-                    ((col, row), (col + 1, row), (col, row + 1), (col + 1, row + 1))
-                )
-        points = sorted(points)
-        if len(points) < 3:
-            return float(len(cells))
-        return _polygon_area(_convex_hull(points))
 
     def _merge_small_components(self, zones, min_zone_free):
         groups = [set(cells) for cells in zones if cells]
@@ -1006,6 +1096,9 @@ class GridMap(object):
                 if (cx - x) ** 2 + (cy - y) ** 2 > radius ** 2:
                     continue
                 index = self.index(col, row)
+                if self.no_mow[index]:
+                    # 通道只用来通行，不记入割草面积
+                    continue
                 if self.mask_ready and not self.free_mask[index]:
                     continue
                 if self.mowed[index]:
@@ -1030,8 +1123,18 @@ class GridMap(object):
     def cell_blocked_mow(self, col, row):
         return bool(self.mow_blocked[self.index(col, row)])
 
+    def cell_no_mow(self, col, row):
+        """纯通道格：能走但不能割。"""
+        return bool(self.no_mow[self.index(col, row)])
+
+    def no_mow_world(self, x, y):
+        col, row = self.cell_of(x, y)
+        return bool(self.no_mow[self.index(col, row)])
+
     def cell_mowable(self, col, row):
         index = self.index(col, row)
+        if self.no_mow[index]:
+            return False
         if self.data[index] == OCCUPIED:
             return False
         if self.mask_ready and not self.free_mask[index]:
@@ -1418,6 +1521,17 @@ class GridMap(object):
                 cy = (min_y + max_y) / 2.0
                 if world.boundary_distance(cx, cy) < 0.42:
                     continue
+                # 墙面占据带是故意画到场外轮廓外侧的（见 mark_occupied），凹口/夹缝
+                # 两侧的墙带会连成一整块，质心落在场地外、半径被撑到 2 m，然后被
+                # 当成场内大障碍去绕障 —— 机器绕着墙走一圈，还把整段沿边跳掉。
+                # 只统计落在场内、而且是场内障碍物的格子。
+                if len(xs) >= 6:
+                    inside = 0
+                    for x, y in zip(xs, ys):
+                        if world.point_in_polygon(x, y):
+                            inside += 1
+                    if inside * 3 < len(xs):
+                        continue
                 radius = max(
                     math.hypot(x - cx, y - cy) for x, y in zip(xs, ys)
                 ) + 0.04
@@ -1662,7 +1776,7 @@ class GridMap(object):
     def encode(self):
         occupancy = bytes(self.data).translate(_ASCII_TABLE).decode("ascii")
         mowed = bytes(self.mowed).translate(_ASCII_TABLE).decode("ascii")
-        return {
+        payload = {
             "cell": self.cell,
             "cols": self.cols,
             "rows": self.rows,
@@ -1670,6 +1784,10 @@ class GridMap(object):
             "mowed": mowed,
             "version": self.version,
         }
+        # 纯通道层只在真的有纯通道格时才发（大多数地图没有通道 → 零开销）
+        if any(self.no_mow):
+            payload["passage"] = bytes(self.no_mow).translate(_ASCII_TABLE).decode("ascii")
+        return payload
 
 
 _ASCII_TABLE = bytes.maketrans(b"\x00\x01\x02", b"012")

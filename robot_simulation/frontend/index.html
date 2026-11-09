@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>1.0.6 机器人控制台 · Mower Console</title>
+  <title>1.0.8 机器人控制台 · Mower Console</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='26' fill='%230b1020' stroke='%2337e0a0' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='9' fill='%2337e0a0'/%3E%3C/svg%3E" />
   <script>
     try {
@@ -13,14 +13,27 @@
       document.documentElement.dataset.theme = "dark";
     }
   </script>
+  <style>
+    html { background: #050914; }
+    html[data-theme="light"] { background: #eef3f9; }
+    html[data-theme="warm"] { background: #17100a; }
+  </style>
   <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="shared/mode_switch.css?v=20261107" />
 </head>
-<body>
+<body data-sim-mode="standalone">
   <header class="topbar">
     <div class="brand">
       <span class="brand-mark" aria-hidden="true"></span>
-      <span class="brand-title">1.0.6 机器人控制台</span>
+      <span class="brand-title">1.0.8 机器人控制台</span>
       <span class="brand-sub">Vision Mower Console</span>
+      <label class="sim-mode-picker" title="选择独立运行的仿真应用">
+        仿真
+        <select id="simMode" aria-label="仿真类型">
+          <option value="standalone">内部仿真</option>
+          <option value="nav_process">接入导航进程</option>
+        </select>
+      </label>
     </div>
     <div class="status-chips">
       <span id="modeChip" class="chip chip--manual">待机</span>
@@ -41,6 +54,7 @@
           <label><input type="checkbox" data-module-toggle="telemetry" checked /> 遥测数据</label>
           <label><input type="checkbox" data-module-toggle="manual" checked /> 手动控制</label>
           <label><input type="checkbox" data-module-toggle="zones" checked /> 区域覆盖</label>
+          <label><input type="checkbox" data-module-toggle="map" checked /> 地图功能</label>
           <label><input type="checkbox" data-module-toggle="events" checked /> 底部面板</label>
           <label><input type="checkbox" data-module-toggle="params" checked /> 参数设置</label>
           <button id="collapseAllBtn" type="button">全部折叠</button>
@@ -138,7 +152,6 @@
         <div class="param-tabs" role="tablist" aria-label="参数分类">
           <button class="param-tab is-active" type="button" role="tab" data-param-tab="robot">机器人实体</button>
           <button class="param-tab" type="button" role="tab" data-param-tab="sensor">传感器</button>
-          <button class="param-tab" type="button" role="tab" data-param-tab="map">地图</button>
         </div>
 
         <div class="param-pane is-active" data-param-pane="robot">
@@ -171,24 +184,18 @@
           <p class="hint param-message">视觉为唯一感知源，只有 100° FOV / 1 m 内探明的障碍物才视为已知。</p>
         </div>
 
-        <div class="param-pane" data-param-pane="map">
-          <div class="param-sub">地图编辑 · Map Edit</div>
-          <div class="map-edit-row">
-            <button id="editStaticBtn" class="task-btn task-btn--ghost" type="button" data-edit-kind="static">添加静态障碍</button>
-            <button id="editDynamicBtn" class="task-btn task-btn--ghost" type="button" data-edit-kind="dynamic">添加动态障碍</button>
-            <button id="editNoGoBtn" class="task-btn task-btn--ghost" type="button" data-edit-kind="no_go">添加禁区</button>
-          </div>
-          <div class="param-grid">
-            <label>编辑半径 (m)<input id="editRadius" type="number" step="0.05" min="0.10" max="4.00" value="0.35" /></label>
-            <label>动态行程 (m)<input id="editSpan" type="number" step="0.1" min="0.4" max="6.00" value="1.6" /></label>
-          </div>
-          <p id="editMapMessage" class="hint param-message">
-            点“添加…”后在地图上点击放置障碍物；禁区按住左键拖出矩形框选。静态/动态障碍是实体（视觉可探测），禁区只禁止进入与切割。
-          </p>
-          <div id="mapEditList" class="edit-list"></div>
-          <div class="map-edit-actions">
-            <button id="editClearBtn" class="task-btn task-btn--ghost" type="button">清空编辑</button>
-          </div>
+        <div class="param-actions">
+          <button id="applyParamsBtn" class="task-btn task-btn--primary" type="button">应用参数</button>
+          <button id="resetParamsBtn" class="task-btn task-btn--ghost" type="button">恢复默认</button>
+        </div>
+        <p id="paramMessage" class="hint param-message">参数在待机/暂停时应用，下一次规划生效。</p>
+      </section>
+
+      <section class="panel panel--map" data-module="map" data-drag-panel="map" aria-label="地图功能">
+        <h2><span class="drag-grip" data-drag-handle title="拖动模块">⋮⋮</span>地图 <span>Map</span></h2>
+
+        <details class="map-block" open>
+          <summary>地图导入 <span>Import</span></summary>
           <div class="map-import-block">
             <button id="importFileBtn" class="task-btn task-btn--ghost" type="button">选择文件</button>
             <button id="importAllMapsBtn" class="task-btn task-btn--primary" type="button">自动导入</button>
@@ -198,13 +205,62 @@
             可用文件：.pgm 栅格地图（必需），path/default.json、map_info.json（可选，提供分辨率与名称）。
             “自动导入”会扫描服务端 data/map 下所有含 .pgm 的地图并一次性导入。
           </p>
-        </div>
+        </details>
 
-        <div class="param-actions">
-          <button id="applyParamsBtn" class="task-btn task-btn--primary" type="button">应用参数</button>
-          <button id="resetParamsBtn" class="task-btn task-btn--ghost" type="button">恢复默认</button>
-        </div>
-        <p id="paramMessage" class="hint param-message">参数在待机/暂停时应用，下一次规划生效。</p>
+        <details class="map-block" open>
+          <summary>地图编辑 <span>Map Editor</span></summary>
+
+          <div class="editor-sub">载入 / 保存</div>
+          <div class="editor-grid editor-grid--source">
+            <label class="editor-field">选择已有地图
+              <select id="editorSourceSelect"></select>
+            </label>
+            <button id="editorLoadBtn" class="task-btn task-btn--ghost" type="button">载入编辑</button>
+            <button id="editorBlankBtn" class="task-btn task-btn--primary" type="button">空白地图</button>
+          </div>
+          <div class="editor-grid editor-grid--save">
+            <label class="editor-field">地图名称
+              <input id="editorName" type="text" maxlength="24" placeholder="保存时使用的名字" />
+            </label>
+            <button id="editorSaveBtn" class="task-btn task-btn--primary" type="button">保存地图</button>
+            <button id="editorExitBtn" class="task-btn task-btn--ghost" type="button">退出编辑</button>
+          </div>
+
+          <div class="editor-sub">区域 / 通道</div>
+          <div class="editor-grid editor-grid--3">
+            <button id="editorRegionStartBtn" class="task-btn task-btn--ghost" type="button">选择区域起点</button>
+            <button id="editorRegionSaveBtn" class="task-btn" type="button">保存区域</button>
+            <button id="editorRegionCancelBtn" class="task-btn task-btn--ghost" type="button">取消区域</button>
+            <button id="editorPassageStartBtn" class="task-btn task-btn--ghost" type="button">选择通道起点</button>
+            <button id="editorPassageSaveBtn" class="task-btn" type="button">保存通道</button>
+            <button id="editorPassageCancelBtn" class="task-btn task-btn--ghost" type="button">取消通道</button>
+          </div>
+          <p class="editor-tip">通道只用来通行：压在区域上的部分照常割草，只有纯通道段不割也不分区。</p>
+
+          <div class="editor-sub">元素</div>
+          <div class="editor-grid editor-grid--4">
+            <button id="editorDeleteBtn" class="task-btn task-btn--ghost" type="button">元素删除</button>
+            <button id="editorUndoBtn" class="task-btn task-btn--ghost" type="button">撤销</button>
+            <button id="editorNoGoBtn" class="task-btn task-btn--ghost" type="button">添加禁区</button>
+            <button id="editorDockBtn" class="task-btn task-btn--ghost" type="button">添加充电桩</button>
+            <button id="editorStaticBtn" class="task-btn task-btn--ghost" type="button">添加障碍物</button>
+            <button id="editorDynamicBtn" class="task-btn task-btn--ghost" type="button">动态障碍</button>
+          </div>
+
+          <div class="editor-sub">画笔参数</div>
+          <div class="editor-fields">
+            <label>画笔半径 (m)<input id="editorRadius" type="number" step="0.05" min="0.10" max="1.20" value="0.35" /></label>
+            <label>障碍半径 (m)<input id="editorSpan" type="number" step="0.05" min="0.12" max="1.00" value="0.30" /></label>
+            <label>巡逻速度 (m/s)<input id="editorSpeed" type="number" step="0.05" min="0.05" max="0.60" value="0.15" /></label>
+            <label>桩半径 (m)<input id="editorDockRadius" type="number" step="0.05" min="0.30" max="1.20" value="0.45" /></label>
+          </div>
+
+          <p id="editorMessage" class="hint param-message">
+            点“空白地图”开始编辑，或选一张已有地图点“载入编辑”：画完区域与通道、放好充电桩后点“保存地图”。编辑期间不能开始建图或割草。
+          </p>
+          <ul id="editorProblems" class="editor-problems"></ul>
+          <div id="editorList" class="edit-list"></div>
+        </details>
       </section>
 
       <aside class="panel panel--controls" data-module="manual" data-drag-panel="manual" aria-label="手动控制">
@@ -216,6 +272,13 @@
           <button class="pad-btn pad-btn--right" data-command="right" aria-label="右转">▶</button>
           <button class="pad-btn pad-btn--down" data-command="backward" aria-label="后退">▼</button>
         </div>
+        <div class="manual-speed">
+          <label>线速度 (m/s)<input id="manualLinear" type="number" step="0.05" min="0.10" max="0.60" value="0.55" /></label>
+          <label>角速度 (rad/s)<input id="manualAngular" type="number" step="0.10" min="0.20" max="1.80" value="1.80" /></label>
+        </div>
+        <p id="manualMessage" class="hint manual-hint">
+          键盘速度：▲/W 前进、▼/S 后退按上面线速度，◀/A、▶/D 按上面角速度（正角速度=左转）。改完直接按方向键生效。
+        </p>
         <div class="mode-row">
           <button id="estopBtn" class="mode-btn" type="button">急停</button>
           <button id="resetBtn" class="mode-btn mode-btn--ghost" type="button">复位</button>
@@ -403,6 +466,7 @@
     </div>
   </section>
 
+  <script src="shared/mode_switch.js?v=20261107"></script>
   <script src="app.js"></script>
 </body>
 </html>

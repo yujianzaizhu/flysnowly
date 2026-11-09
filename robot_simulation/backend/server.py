@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import bag_reader  # noqa: E402
 import config  # noqa: E402
+import map_editor  # noqa: E402
 import map_import  # noqa: E402
 import world  # noqa: E402
 from grid_map import GridMap  # noqa: E402
@@ -555,8 +556,14 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/command":
                 if manager.task is not None:
                     manager.stop_task("手动接管，当前任务已取消", resumable=False)
-                self.server.robot.handle_command(payload.get("command"))
+                self.server.robot.handle_command(
+                    payload.get("command"),
+                    payload.get("linear"),
+                    payload.get("angular"),
+                )
             elif path == "/api/task":
+                if getattr(self.server, "editor", None) is not None:
+                    raise ValueError("地图编辑中：请先保存地图或取消编辑，再开始任务")
                 task_type = payload.get("task")
                 if task_type == "map":
                     manager.start_mapping()
@@ -577,6 +584,8 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                 self.server.grid.reset_map()
                 manager.reset()
             elif path == "/api/map":
+                if getattr(self.server, "editor", None) is not None:
+                    raise ValueError("地图编辑中：请先保存或退出编辑，再切换地图")
                 map_id = int(payload.get("map", 1))
                 if map_id not in world.MAPS:
                     raise ValueError("未知地图: {}".format(map_id))
@@ -662,6 +671,123 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                         self.server.grid = grid
                         self.server.manager = manager
                         self.server.simulator.manager = manager
+            elif path.startswith("/api/editor/"):
+                action = path[len("/api/editor/"):]
+                if action == "blank":
+                    if _editor_busy(manager):
+                        raise ValueError("任务进行中不能编辑地图，请先停止任务")
+                    draft = start_editor(
+                        self.server, payload.get("name"), payload.get("map")
+                    )
+                    self._send_json(
+                        {
+                            "draft": draft.state(),
+                            "maps": world.world_dict().get("maps", []),
+                        }
+                    )
+                    return
+                if action == "state":
+                    self._send_json({"draft": _editor_snapshot(self.server)})
+                    return
+                if action == "undo":
+                    draft = _editor_require(self.server)
+                    left = draft.undo()
+                    self._send_json({"draft": draft.state(), "remaining": left})
+                    return
+                if action == "discard":
+                    self._send_json(
+                        {
+                            "draft": close_editor(self.server),
+                            "maps": world.world_dict().get("maps", []),
+                        }
+                    )
+                    return
+                if _editor_busy(manager):
+                    raise ValueError("任务进行中不能编辑地图，请先停止任务")
+                if action == "region":
+                    draft = _editor_require(self.server)
+                    result = draft.add_region(payload.get("points") or [])
+                    self._send_json({"draft": draft.state(), "region": result})
+                    return
+                if action == "passage":
+                    draft = _editor_require(self.server)
+                    result = draft.add_passage(payload.get("points") or [])
+                    self._send_json({"draft": draft.state(), "passage": result})
+                    return
+                if action == "dock":
+                    draft = _editor_require(self.server)
+                    result = draft.add_dock(
+                        payload.get("x", 0.0), payload.get("y", 0.0), payload.get("r")
+                    )
+                    self._send_json({"draft": draft.state(), "dock": result})
+                    return
+                if action == "no_go":
+                    draft = _editor_require(self.server)
+                    result = draft.add_no_go(
+                        payload.get("x0", 0.0),
+                        payload.get("y0", 0.0),
+                        payload.get("x1", 0.0),
+                        payload.get("y1", 0.0),
+                    )
+                    self._send_json({"draft": draft.state(), "no_go": result})
+                    return
+                if action == "obstacle":
+                    draft = _editor_require(self.server)
+                    kind = str(payload.get("kind") or "static")
+                    if kind == "dynamic":
+                        added = draft.add_dynamic(
+                            payload.get("x", 0.0),
+                            payload.get("y", 0.0),
+                            payload.get("r"),
+                            payload.get("span"),
+                            payload.get("heading", 0.0),
+                            payload.get("ax"),
+                            payload.get("ay"),
+                            payload.get("bx"),
+                            payload.get("by"),
+                            payload.get("speed"),
+                        )
+                    elif kind == "polygon":
+                        added = draft.add_obstacle_polygon(payload.get("points") or [])
+                    else:
+                        added = draft.add_static(
+                            payload.get("points") or [], payload.get("r")
+                        )
+                    self._send_json({"draft": draft.state(), "added": added})
+                    return
+                if action == "dynamic":
+                    draft = _editor_require(self.server)
+                    item = draft.update_dynamic(
+                        payload.get("id"),
+                        payload.get("ax"),
+                        payload.get("ay"),
+                        payload.get("bx"),
+                        payload.get("by"),
+                        payload.get("speed"),
+                        payload.get("r"),
+                    )
+                    self._send_json({"draft": draft.state(), "dynamic": item})
+                    return
+                if action == "delete":
+                    draft = _editor_require(self.server)
+                    if payload.get("x") is not None and payload.get("y") is not None:
+                        target = draft.hit_test(payload.get("x"), payload.get("y"))
+                        if target is None:
+                            raise ValueError("这个位置没有可删除的元素")
+                    else:
+                        target = {
+                            "kind": payload.get("kind"),
+                            "id": payload.get("id"),
+                        }
+                    result = draft.delete(target["kind"], target["id"])
+                    self._send_json({"draft": draft.state(), "result": result})
+                    return
+                if action == "save":
+                    result = save_editor(self.server, payload.get("name"))
+                    result["maps"] = world.world_dict().get("maps", [])
+                    self._send_json(result)
+                    return
+                raise ValueError("未知的地图编辑动作: {}".format(action))
             elif path == "/api/map/scan":
                 root = str(payload.get("path") or "").strip() or None
                 max_extent = payload.get("max_extent", 40.0)
@@ -832,12 +958,17 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
 
     # --------------------------------------------------------------- 工具
     def _state(self, include_map=True):
+        # 编辑草稿是一块 100 × 100 m 的空场地（100 万格），栅格字符画没有意义，
+        # 也不该每几十毫秒往浏览器传一次，编辑期间直接不取栅格。
+        if getattr(self.server, "editor", None) is not None:
+            include_map = False
         state = self.server.manager.get_state(include_map=include_map)
         state["speed"] = self.server.simulator.speed
         state["map_id"] = world.MAP_ID
         state["map_name"] = world.MAP_NAME
         state["config"] = dict(config.settings.__dict__)
         state["bag"] = self.server.manager.replay_state()
+        state["draft"] = _editor_snapshot(self.server)
         return state
 
     def _read_json(self, limit=MAX_BODY_BYTES):
@@ -944,6 +1075,123 @@ def build_manager(robot, grid):
     return TaskManager(robot, grid)
 
 
+def _editor_busy(manager):
+    """任务进行中不能改地图（自动建图 / 割草 都不行）。"""
+    return manager.task is not None and manager.phase not in (
+        "idle",
+        "done",
+        "stopped",
+    )
+
+
+def _editor_require(httpd):
+    draft = getattr(httpd, "editor", None)
+    if draft is None:
+        raise ValueError("请先点击“空白地图”开始编辑")
+    return draft
+
+
+def _editor_snapshot(httpd):
+    draft = getattr(httpd, "editor", None)
+    return draft.state() if draft is not None else {"active": False}
+
+
+def start_editor(httpd, name=None, map_id=None):
+    """进入编辑模式：切到一块空白场地，原地图保持不动。
+
+    传了 ``map_id`` 就把那张已有地图的几何读进草稿，在它基础上改。
+    """
+    if _editor_busy(httpd.manager):
+        raise ValueError("任务进行中不能编辑地图，请先停止任务")
+    draft = map_editor.Draft(name or "自定义地图")
+    start = None
+    if map_id is not None:
+        source = world.MAPS.get(int(map_id))
+        if source is None:
+            raise ValueError("没有找到编号为 {} 的地图".format(map_id))
+        try:
+            draft.load_from_definition(
+                source,
+                name=name,
+                scale=1.0 if source.get("native") else world.MAP_SCALE,
+            )
+        except ValueError as error:
+            raise ValueError("这张地图读不进编辑器：{}".format(error))
+        bounds = draft.content_bounds()
+        start = ((bounds[0] + bounds[2]) * 0.5, (bounds[1] + bounds[3]) * 0.5)
+    definition = map_editor.blank_field_definition(
+        draft.width, draft.height, name=draft.name, start=start
+    )
+    with httpd.simulator.lock:
+        map_id = world.register_map(definition)
+        world.select_map(map_id)
+        robot = RobotCar()
+        grid = GridMap()
+        manager = build_manager(robot, grid)
+        httpd.robot = robot
+        httpd.grid = grid
+        httpd.manager = manager
+        httpd.simulator.manager = manager
+    draft.map_id = map_id
+    httpd.editor = draft
+    return draft
+
+
+def close_editor(httpd, fallback_map=1):
+    """退出编辑模式：删掉临时空白场地，切回一张正常地图。"""
+    draft = getattr(httpd, "editor", None)
+    httpd.editor = None
+    if draft is not None and draft.map_id is not None:
+        try:
+            world.delete_map(draft.map_id)
+        except ValueError:
+            pass
+    if world.MAP_ID not in world.MAPS or world.MAPS[int(world.MAP_ID)].get(
+        "editor_draft"
+    ):
+        target = fallback_map
+        if target not in world.MAPS:
+            target = min(world.MAPS.keys())
+        with httpd.simulator.lock:
+            world.select_map(target)
+            robot = RobotCar()
+            grid = GridMap()
+            manager = build_manager(robot, grid)
+            httpd.robot = robot
+            httpd.grid = grid
+            httpd.manager = manager
+            httpd.simulator.manager = manager
+    return _editor_snapshot(httpd)
+
+
+def save_editor(httpd, name=None):
+    draft = _editor_require(httpd)
+    definition = draft.to_definition(name)
+    with httpd.simulator.lock:
+        map_id = world.register_map(definition)
+        draft_map_id = draft.map_id
+        draft.map_id = None
+        world.select_map(map_id)
+        robot = RobotCar()
+        grid = GridMap()
+        manager = build_manager(robot, grid)
+        httpd.robot = robot
+        httpd.grid = grid
+        httpd.manager = manager
+        httpd.simulator.manager = manager
+    httpd.editor = None
+    if draft_map_id is not None:
+        try:
+            world.delete_map(draft_map_id)
+        except ValueError:
+            pass
+    return {
+        "map_id": map_id,
+        "name": definition["name"],
+        "state": httpd.manager.get_state(include_map=True),
+    }
+
+
 def rebuild_system(httpd, definition=None):
     """按给定地图定义（或当前地图）重建机器人 / 栅格 / 任务 / 节点。"""
     if definition is not None:
@@ -971,6 +1219,7 @@ def create_server(host="127.0.0.1", port=8000):
     httpd.manager = manager
     httpd.bag_roots = [BAG_DIR]
     httpd.bag_queue = None
+    httpd.editor = None
     httpd.simulator = Simulator(manager)
     httpd.simulator.on_cycle = lambda: poll_bag_queue(httpd)
     httpd.simulator.start()

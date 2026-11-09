@@ -1,0 +1,37 @@
+protoc: libprotoc 3.17.3
+source: /home5/huchenfei/work/aic_code/fibotmain/aic-common/protocol/msgs_proto
+generated: 2026-11-03 11:49:45
+
+source md5:
+fffabf287723d53736f82fcff4c2e7eb  proto_msg/actionlib_msgs.proto
+bae09bcc1481d68729eaaf2c7341902c  proto_msg/fiducial_msgs.proto
+e1dadebaf17beb202895d8cae163c0c7  proto_msg/geometry_msgs.proto
+bf24b98a04390525f549904b319dff6c  proto_msg/map_msgs.proto
+3496144caa9f4c0ffe9773c773be1580  proto_msg/move_base_msgs.proto
+02407f89d9c741eae6673069d0e6ba1d  proto_msg/nav_msgs.proto
+c5a3bf70f06dfaa6906e772aa9ee7365  proto_msg/pcl_msgs.proto
+84f78119e4c5d35c99fee47b7c2e3bd4  proto_msg/rosgraph_msgs.proto
+db475cd68f2679970eb623725ff91c99  proto_msg/sensor_msgs.proto
+04191a28a91d201204db44470b059c0c  proto_msg/shape_msgs.proto
+85fd1e43997d07a2e45c276dbd16d06c  proto_msg/std_msgs.proto
+98b3c811295dd09975b2a5efcc9bbc38  proto_msg/stereo_msgs.proto
+09b44d9fff82f04710140c315cf6f141  proto_msg/tf2_msgs.proto
+4bac89be36683af9bfa9e5422abd5f6a  proto_msg/trajectory_msgs.proto
+3de63fe354f5616f96b2003197116eba  proto_msg/uuid_msgs.proto
+acc688d0cd98d85b0b70ff1c86d60972  proto_msg/vision_msgs.proto
+56af5fabbe8d339d43239e260783589b  proto_msg/visualization_msgs.proto
+edf5c05e39623e9a48c1c6d08c3d5d5b  proto_msg/voxel_grid.proto
+00834fba2140c7b928a80dc29913d4f8  proto_usr_define/aic_app_protocol/aic_frame.proto
+6ede7e81ded99512ba92ad02be1e2877  proto_usr_define/aic_app_protocol/aic_protocol.proto
+538d8fde76976bc58d453f5b51777198  proto_usr_define/autotest_data.proto
+4928d92af6d8b30387887ab62afc6506  proto_usr_define/birdge_data.proto
+2d788f2814ff966bf3153f3aa86e9e6e  proto_usr_define/obs_label.proto
+0db7272888f0216608192077146e4b59  proto_usr_define/ota_protocol.proto
+4ee099ff0d9ec56800357d2778485e73  proto_usr_define/point_cloud_label.proto
+caa32740a12760857f8cc184324f7a3c  proto_usr_define/usr_define_actions.proto
+b7b474c44b8d7f7d051b34a565250af1  proto_usr_define/usr_define_basics.proto
+1c149df892c11e61134782af1fb1803e  proto_usr_define/usr_define_business.proto
+b4d83577219f865c3e3c046ba4599ad5  proto_usr_define/usr_define_health.proto
+8645b826421387008202f59306edfbd8  proto_usr_define/usr_define_manager.proto
+02829ba7405d23a706bcca4d19f51a80  proto_usr_define/usr_define_msgs.proto
+c93e005f4649b9c20de6d5aea644bb6a  proto_usr_define/usr_define_services.proto

@@ -85,9 +85,27 @@ class RobotCar(object):
         )
 
     # ----------------------------------------------------------- 指令
-    def handle_command(self, name):
+    def handle_command(self, name, linear=None, angular=None):
+        if name == "drive":
+            # 手动直接给线速度 / 角速度（脚本或测试用）
+            self.drive(float(linear or 0.0), float(angular or 0.0))
+            return
         if name not in COMMANDS:
             raise ValueError("未知指令: {}".format(name))
+        # 控制台"手动控制"的两个输入框是键盘档位：按方向键时把档位速度一起发
+        # 过来，方向仍由指令决定（正角速度=左转），不会让机器自己跑起来。
+        speed_v = None if linear is None else abs(float(linear))
+        speed_w = None if angular is None else abs(float(angular))
+        if speed_v is not None or speed_w is not None:
+            default_v, default_w = COMMANDS[name]
+            v = speed_v if speed_v is not None else abs(default_v)
+            w = speed_w if speed_w is not None else abs(default_w)
+            v = min(v, MAX_LINEAR)
+            w = min(w, MAX_ANGULAR)
+            with self.lock:
+                self.target_v = math.copysign(v, default_v) if default_v else 0.0
+                self.target_w = math.copysign(w, default_w) if default_w else 0.0
+            return
         with self.lock:
             self.target_v, self.target_w = COMMANDS[name]
 

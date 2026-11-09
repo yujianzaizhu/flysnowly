@@ -446,6 +446,29 @@ def build_map(source, name=None, max_extent=40.0):
     )
 
 
+def build_map_from_mask(
+    width, height, mask, name="自定义地图", max_extent=200.0, source_path=None
+):
+    """编辑器保存用：直接给 0/1 可走掩膜（每格 = world.CELL）生成场地定义。"""
+    width = int(width)
+    height = int(height)
+    if width <= 0 or height <= 0 or len(mask) < width * height:
+        raise MapImportError("地图掩膜数据不完整")
+    raw = bytearray(width * height)
+    for index in range(width * height):
+        raw[index] = 254 if mask[index] else 0
+    return _definition(
+        width,
+        height,
+        raw,
+        world.CELL,
+        name,
+        source_path=source_path,
+        map_file=name,
+        max_extent=max_extent,
+    )
+
+
 def build_map_from_grid(
     resolution, width, height, data, grid_origin=(0.0, 0.0), name="日志地图", max_extent=40.0
 ):

@@ -1758,19 +1758,6 @@ body {
 }
 
 /* ------------------------------------------------------------- 导航节点 */
-.map-edit-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 8px;
-}
-
-.map-edit-actions {
-  display: flex;
-  gap: 6px;
-  margin-top: 6px;
-}
-
 .edit-list {
   display: flex;
   flex-direction: column;
@@ -2233,4 +2220,295 @@ body {
 .param-message {
   margin-top: 7px;
   text-align: left;
+}
+
+/* ------------------------------------------------------------- 地图面板（与日志播放同界面） */
+.panel--map .map-block + .map-block {
+  margin-top: 7px;
+}
+
+.map-block {
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: rgba(var(--well-rgb), 0.32);
+  padding: 6px 10px 9px;
+}
+
+.map-block > summary {
+  cursor: pointer;
+  padding: 3px 0;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  color: var(--text);
+  list-style: none;
+}
+
+.map-block > summary::-webkit-details-marker {
+  display: none;
+}
+
+.map-block > summary::before {
+  content: "▸";
+  display: inline-block;
+  width: 12px;
+  color: rgba(var(--muted-rgb), 0.8);
+  transition: transform 0.12s ease;
+}
+
+.map-block[open] > summary::before {
+  content: "▾";
+}
+
+.map-block > summary span {
+  margin-left: 6px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 1px;
+  color: rgba(var(--muted-rgb), 0.55);
+}
+
+.map-block .hint {
+  margin-top: 7px;
+  text-align: left;
+}
+
+.editor-sub {
+  margin: 9px 0 4px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: rgba(var(--muted-rgb), 0.85);
+}
+
+.editor-sub:first-of-type {
+  margin-top: 4px;
+}
+
+.editor-grid {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 2px;
+}
+
+.editor-grid--source,
+.editor-grid--save {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: end;
+}
+
+.editor-grid--3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.editor-grid--4 {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.editor-grid--4 .task-btn:nth-child(n + 5) {
+  grid-column: span 1;
+}
+
+.editor-grid .task-btn {
+  width: 100%;
+  padding: 5px 3px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.editor-grid--4 .task-btn {
+  font-size: 9.5px;
+}
+
+.editor-grid--source .task-btn,
+.editor-grid--save .task-btn {
+  padding: 5px 10px;
+}
+
+.editor-tip {
+  margin: 4px 0 2px;
+  font-size: 9.5px;
+  line-height: 1.45;
+  color: rgba(var(--muted-rgb), 0.72);
+}
+
+.editor-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.editor-row:last-of-type {
+  margin-bottom: 0;
+}
+
+.editor-row .task-btn {
+  flex: 1 1 auto;
+  padding: 5px 7px;
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.editor-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 8px 0 2px;
+}
+
+.editor-fields label {
+  flex: 1 1 96px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 9.5px;
+  letter-spacing: 0.2px;
+}
+
+.editor-fields input {
+  width: 100%;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(var(--well-rgb), 0.8);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+}
+
+.editor-fields input:focus {
+  outline: none;
+  border-color: rgba(var(--cyan-rgb), 0.55);
+}
+
+.editor-problems {
+  margin: 7px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.editor-problems:empty {
+  display: none;
+}
+
+.editor-problems li {
+  font-size: 10px;
+  line-height: 1.35;
+  color: var(--red);
+}
+
+.editor-problems li::before {
+  content: "• ";
+}
+
+.editor-problems li.is-ok {
+  color: var(--green);
+}
+
+#editorMessage.is-bad {
+  color: var(--red);
+}
+
+#editorMessage.is-ok {
+  color: var(--green);
+}
+
+/* ------------------------------------------------------------- 地图面板（侧栏） */
+.panel--map .map-block {
+  padding: 4px 8px 8px;
+}
+
+.panel--map .map-block > summary {
+  font-size: 11px;
+}
+
+.editor-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 9.5px;
+  letter-spacing: 0.2px;
+}
+
+.editor-field--grow {
+  flex: 1 1 120px;
+  min-width: 96px;
+}
+
+.editor-field select,
+.editor-field input {
+  width: 100%;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(var(--well-rgb), 0.8);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+}
+
+.editor-field select:focus,
+.editor-field input:focus {
+  outline: none;
+  border-color: rgba(var(--cyan-rgb), 0.55);
+}
+
+.editor-row .task-btn {
+  flex: 1 1 auto;
+  padding: 4px 6px;
+  font-size: 10px;
+}
+
+.panel--map .editor-row {
+  gap: 5px;
+  margin-bottom: 5px;
+}
+
+.panel--map .editor-fields label {
+  flex: 1 1 88px;
+}
+
+/* ------------------------------------------------------------- 手动控制：速度输入 */
+.manual-speed {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.manual-speed label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 9.5px;
+  letter-spacing: 0.2px;
+}
+
+.manual-speed input {
+  width: 100%;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(var(--well-rgb), 0.8);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+}
+
+.manual-speed input:focus {
+  outline: none;
+  border-color: rgba(var(--cyan-rgb), 0.55);
+}
+
+.manual-hint {
+  margin: 6px 0 0;
+  text-align: left;
+  line-height: 1.45;
 }

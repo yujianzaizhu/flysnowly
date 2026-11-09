@@ -145,6 +145,11 @@ NEXT_EDIT_ID = 1
 BASE_SHAPES = []
 DYNAMIC = []
 NO_GO = []
+# 通道（只通行、不割草）：来自地图定义，select_map 时按缩放系数换算
+PASSAGES = []
+# 地图定义里保存的区域多边形（米）：用来区分"通道与区域重叠的部分"和
+# "纯通道部分"——重叠部分照常割草，只有纯通道不割
+REGIONS = []
 DYNAMIC_SPEED = 0.15
 # 面积阈值：小于该面积的障碍物按“小型”处理
 LARGE_OBSTACLE_AREA = 5.0
@@ -233,7 +238,7 @@ def select_map(map_id):
     global MAP_ID, MAP_NAME, WIDTH, HEIGHT, COLS, ROWS, ACTIVE_SCALE
     global POLYGON, POLYGON_SEGMENTS, OBSTACLE_SEGMENTS
     global OBSTACLE_SHAPES, OBSTACLE_OUTLINES, OBSTACLES, OBSTACLE_POLYGONS, DOCK, START
-    global BASE_SHAPES, DYNAMIC, NO_GO
+    global BASE_SHAPES, DYNAMIC, NO_GO, PASSAGES, REGIONS
     definition = MAPS[int(map_id)]
     MAP_ID = definition["id"]
     MAP_NAME = definition["name"]
@@ -265,6 +270,29 @@ def select_map(map_id):
         entry["t"] = 0.0
         DYNAMIC.append(entry)
     NO_GO = [dict(item) for item in bucket["no_go"]]
+    PASSAGES = [
+        {
+            # 老地图/导入地图可能没写 id：按顺序补一个，界面标注就不会出现 #undefined
+            "id": item.get("id") if item.get("id") is not None else index + 1,
+            "points": [(x * scale, y * scale) for x, y in item.get("points") or []],
+            "half": float(item.get("half", 0.4)) * scale,
+            "from": item.get("from"),
+            "to": item.get("to"),
+        }
+        for index, item in enumerate(definition.get("passages") or [])
+        if len(item.get("points") or []) >= 2
+    ]
+    REGIONS = [
+        {
+            "id": item.get("id"),
+            "points": [(x * scale, y * scale) for x, y in item.get("points") or []],
+        }
+        for item in definition.get("regions") or []
+        if len(item.get("points") or []) >= 3
+    ]
+    if not REGIONS:
+        # 老地图没有存区域列表：整块场地就是一个区域
+        REGIONS = [{"id": 1, "points": list(POLYGON)}]
     _rebuild_static_geometry()
     _mark_world_dirty()
     DOCK = {
@@ -283,7 +311,28 @@ def _edit_bucket(map_id=None):
     map_id = MAP_ID if map_id is None else int(map_id)
     bucket = EDIT_STATE.get(map_id)
     if bucket is None:
-        bucket = {"static": [], "dynamic": [], "no_go": []}
+        # 地图定义里自带的动态障碍与禁区（编辑器保存的地图会写进来）先搬进
+        # 编辑桶，之后用户再怎么改/删都走同一套接口
+        dynamic = []
+        for item in MAPS.get(map_id, {}).get("dynamic") or []:
+            entry = {
+                "id": _next_edit_id(),
+                "x": round(float(item.get("x", item.get("ax", 0.0))), 2),
+                "y": round(float(item.get("y", item.get("ay", 0.0))), 2),
+                "r": round(float(item.get("r", 0.30)), 2),
+                "ax": round(float(item.get("ax", item.get("x", 0.0))), 2),
+                "ay": round(float(item.get("ay", item.get("y", 0.0))), 2),
+                "bx": round(float(item.get("bx", item.get("x", 0.0))), 2),
+                "by": round(float(item.get("by", item.get("y", 0.0))), 2),
+                "speed": clamp(float(item.get("speed", DYNAMIC_SPEED)), 0.05, 0.60),
+            }
+            dynamic.append(entry)
+        no_go = []
+        for item in MAPS.get(map_id, {}).get("no_go") or []:
+            entry = dict(item)
+            entry["id"] = _next_edit_id()
+            no_go.append(entry)
+        bucket = {"static": [], "dynamic": dynamic, "no_go": no_go}
         EDIT_STATE[map_id] = bucket
     return bucket
 
@@ -368,7 +417,7 @@ def add_static_obstacle(x, y, radius=0.35):
     return item
 
 
-def add_dynamic_obstacle(x, y, radius=0.30, span=1.6, heading=0.0):
+def add_dynamic_obstacle(x, y, radius=0.30, span=1.6, heading=0.0, speed=None):
     x, y = float(x), float(y)
     if not _inside_field(x, y):
         raise ValueError("请把障碍物放在场地内部")
@@ -388,7 +437,9 @@ def add_dynamic_obstacle(x, y, radius=0.30, span=1.6, heading=0.0):
         "ay": round(ay, 2),
         "bx": round(bx, 2),
         "by": round(by, 2),
-        "speed": DYNAMIC_SPEED,
+        "speed": clamp(
+            DYNAMIC_SPEED if speed is None else float(speed), 0.05, 0.60
+        ),
     }
     _edit_bucket()["dynamic"].append(item)
     entry = dict(item)
@@ -631,8 +682,11 @@ def map_list():
                 1,
             ),
             "imported": bool(definition.get("imported")),
+            "editor": bool(definition.get("editor_built")),
         }
         for definition in sorted(MAPS.values(), key=lambda item: item["id"])
+        # 编辑中的临时"空白地图"不进地图列表，保存后才会作为新地图出现
+        if not definition.get("editor_draft")
     ]
 
 
@@ -667,6 +721,30 @@ def _segments(polygon):
         (polygon[index][0], polygon[index][1], polygon[(index + 1) % count][0], polygon[(index + 1) % count][1])
         for index in range(count)
     ]
+
+
+def nearest_boundary_point(x, y, polygon=None):
+    """外墙折线上离 (x, y) 最近的点；用来把沿边路线压到离墙固定距离。"""
+    polygon = POLYGON if polygon is None else polygon
+    count = len(polygon)
+    best = None
+    for index in range(count):
+        ax, ay = polygon[index]
+        bx, by = polygon[(index + 1) % count]
+        vx, vy = bx - ax, by - ay
+        length_sq = vx * vx + vy * vy
+        if length_sq <= 1e-12:
+            t = 0.0
+        else:
+            t = clamp(((x - ax) * vx + (y - ay) * vy) / length_sq, 0.0, 1.0)
+        px = ax + vx * t
+        py = ay + vy * t
+        distance = math.hypot(x - px, y - py)
+        if best is None or distance < best[0]:
+            best = (distance, px, py)
+    if best is None:
+        return (x, y, 0.0)
+    return (best[1], best[2], best[0])
 
 
 def boundary_distance(x, y, polygon=None):
@@ -997,6 +1075,23 @@ def world_dict():
         for item in DYNAMIC
     ]
     result["no_go"] = [dict(item) for item in NO_GO]
+    result["regions"] = [
+        {
+            "id": item.get("id"),
+            "points": [[round(x, 3), round(y, 3)] for x, y in item["points"]],
+        }
+        for item in REGIONS
+    ]
+    result["passages"] = [
+        {
+            "id": item.get("id"),
+            "points": [[round(x, 2), round(y, 2)] for x, y in item["points"]],
+            "half": round(item["half"], 3),
+            "from": item.get("from"),
+            "to": item.get("to"),
+        }
+        for item in PASSAGES
+    ]
     result["edits"] = edit_dict()
     return result
 

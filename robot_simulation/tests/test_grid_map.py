@@ -63,7 +63,7 @@ class MappingTest(unittest.TestCase):
             area = (zone["x1"] - zone["x0"]) * (zone["y1"] - zone["y0"])
             self.assertGreater(zone["free"] / max(area, 1e-6), 0.30)
 
-    def test_partition_splits_dumbbell_but_keeps_regular_component(self):
+    def test_partition_keeps_one_zone_per_connected_area(self):
         grid = GridMap()
         grid.mask_ready = True
         for row in range(20, 71):
@@ -75,9 +75,9 @@ class MappingTest(unittest.TestCase):
             for col in range(61, 95):
                 grid.free_mask[grid.index(col, row)] = 1
         zones = grid.partition_zones()
-        self.assertEqual(len(zones), 2)
-        for zone in zones:
-            self.assertGreaterEqual(zone["free"] * grid.cell * grid.cell, 20.0)
+        # 哑铃形的连通域也是"一个区域"：不再按最远点对额外拆成两块
+        self.assertEqual(len(zones), 1)
+        self.assertGreaterEqual(zones[0]["free"] * grid.cell * grid.cell, 40.0)
 
         grid = GridMap()
         grid.mask_ready = True
@@ -237,6 +237,50 @@ class MappingTest(unittest.TestCase):
         self.assertAlmostEqual(circle["y"], 4.5, delta=0.15)
         self.assertGreaterEqual(circle["r"], 0.30)
 
+    def test_wall_band_outside_field_is_not_an_obstacle(self):
+        """画在场外轮廓外侧的墙面占据带不能被聚成场内障碍。
+
+        `mark_occupied` 故意把占据格画到墙外侧，凹口/夹缝两侧的墙带会连成一整块，
+        质心落在场地外、半径撑到 2 m；以前会把它当成场内大障碍，机器人绕着墙走
+        一圈，整段沿边被跳过。
+        """
+        world.select_map(3)
+        grid = GridMap()
+        outside = None
+        for row in range(grid.rows):
+            for col in range(grid.cols):
+                x, y = grid.center_of(col, row)
+                if not world.point_in_polygon(x, y) and world.boundary_distance(x, y) > 0.7:
+                    outside = (col, row)
+                    break
+            if outside:
+                break
+        self.assertIsNotNone(outside, "这张地图没有场外区域可测")
+        col, row = outside
+        for dc in range(-2, 2):
+            for dr in range(-4, 4):
+                index = grid.index(col + dc, row + dr)
+                grid.data[index] = 2
+        grid.data_version += 1
+        self.assertEqual(grid.obstacle_circles(None), [], "场外墙面带被当成了场内障碍")
+
+        # 场内同样大小的一块仍然要能被认出来
+        inside = None
+        for r in range(grid.rows):
+            for c in range(grid.cols):
+                x, y = grid.center_of(c, r)
+                if world.point_in_polygon(x, y) and world.boundary_distance(x, y) > 1.2:
+                    inside = (c, r)
+                    break
+            if inside:
+                break
+        c0, r0 = inside
+        for dc in range(-2, 2):
+            for dr in range(-4, 4):
+                grid.data[grid.index(c0 + dc, r0 + dr)] = 2
+        grid.data_version += 1
+        self.assertTrue(grid.obstacle_circles(None), "场内障碍应该被识别")
+
 
 class PlannerTest(unittest.TestCase):
     def setUp(self):
@@ -307,8 +351,14 @@ class PlannerTest(unittest.TestCase):
         ]
         self.assertLess(max(jumps), 0.25)
 
-    def test_edge_route_mask_stays_inside_zone(self):
-        """新规则：区域矩形框 ∩ 自由区 → 腐蚀 → 轮廓，路径必须整段落在该区域内。"""
+    def test_edge_route_mask_stays_inside_field(self):
+        """沿边路线必须整段落在场地内，并且离墙不小于车体半径。
+
+        以前断言"每个点都在该区域的自由格里"，但自由格本身就被导航膨胀吃掉了
+        一圈（离墙 0.2 m 以上），按那个做沿边墙边一整条割不到。现在路线会主动
+        贴到离墙 `ROBOT_RADIUS + EDGE_WALL_CLEARANCE`，所以改成按"在场地内 +
+        不撞墙 + 闭合 + 加密"来约束。
+        """
         for map_id in (1, 3, 5):
             world.select_map(map_id)
             grid = GridMap()
@@ -316,12 +366,24 @@ class PlannerTest(unittest.TestCase):
             for zone in grid.partition_zones():
                 route = planner.edge_route_mask(grid, zone, (zone["cx"], zone["cy"]))
                 self.assertGreater(len(route), 20)
-                inside = sum(
-                    1
-                    for x, y in route
-                    if grid.cell_in_zone(*grid.cell_of(x, y), zone["id"])
+                outside = [point for point in route if not world.point_in_polygon(*point)]
+                self.assertFalse(outside, "区域 %d 的沿边点跑出场地外" % zone["id"])
+                too_close = [
+                    point
+                    for point in route
+                    if world.boundary_distance(*point) < world.ROBOT_RADIUS - 0.03
+                ]
+                self.assertEqual(
+                    too_close, [], "区域 %d 的沿边点离墙太近（会撞墙）" % zone["id"]
                 )
-                self.assertEqual(inside, len(route), "区域 %d 的沿边点跑出区域外" % zone["id"])
+                # 贴在墙边：绝大多数点应该落在设计离墙距离附近
+                clearances = sorted(world.boundary_distance(*point) for point in route)
+                median = clearances[len(clearances) // 2]
+                self.assertAlmostEqual(
+                    median,
+                    world.ROBOT_RADIUS + planner.EDGE_WALL_CLEARANCE,
+                    delta=0.06,
+                )
                 # 闭合
                 self.assertLess(math.hypot(route[0][0] - route[-1][0], route[0][1] - route[-1][1]), 1e-6)
                 # 加密到 <= 0.16 m
@@ -370,24 +432,21 @@ class PlannerTest(unittest.TestCase):
                 "障碍物内部不可达，不该生成弓字线段",
             )
 
-    def test_edge_route_mask_inset_matches_rectangle(self):
-        """规则区域腐蚀后就等价于内缩矩形：周长接近 2*(w+h-2*inset)。"""
+    def test_edge_route_keeps_uniform_wall_clearance(self):
+        """整条沿边到墙的距离要基本一致：不能一段贴着墙、一段离墙半米。"""
         world.select_map(3)
         grid = GridMap()
         self.assertTrue(grid.build_free_area((world.START["x"], world.START["y"])))
         zone = grid.partition_zones()[0]
         route = planner.edge_route_mask(grid, zone, (zone["cx"], zone["cy"]))
-        length = sum(
-            math.hypot(route[index + 1][0] - route[index][0], route[index + 1][1] - route[index][1])
-            for index in range(len(route) - 1)
-        )
-        inset = planner.EDGE_INSET + grid.cell * 0.5
-        expected = 2.0 * (zone["x1"] - zone["x0"] - 2 * inset) + 2.0 * (
-            zone["y1"] - zone["y0"] - 2 * inset
-        )
-        self.assertLess(abs(length - expected) / expected, 0.12)
-        self.assertLessEqual(max(x for x, _y in route), zone["x1"] - inset + grid.cell)
-        self.assertGreaterEqual(min(x for x, _y in route), zone["x0"] + inset - grid.cell)
+        clearances = [world.boundary_distance(x, y) for x, y in route]
+        target = world.ROBOT_RADIUS + planner.EDGE_WALL_CLEARANCE
+        self.assertGreater(min(clearances), world.ROBOT_RADIUS - 0.03)
+        # 离墙太远的点（> 0.6 m）不该多：那是"沿边没贴墙、墙边漏扫"的来源
+        far = [value for value in clearances if value > 0.60]
+        self.assertLess(len(far), max(4, len(clearances) // 50))
+        near = [value for value in clearances if abs(value - target) < 0.08]
+        self.assertGreater(len(near), len(clearances) * 0.8)
 
     def test_edge_route_is_closed(self):
         grid = GridMap()

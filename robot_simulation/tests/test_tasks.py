@@ -9,6 +9,7 @@ BACKEND_DIR = os.path.join(
 sys.path.insert(0, BACKEND_DIR)
 
 import config  # noqa: E402
+import map_editor  # noqa: E402
 import world  # noqa: E402
 from grid_map import GridMap  # noqa: E402
 from robot_car import RobotCar  # noqa: E402
@@ -41,6 +42,31 @@ def advance(manager, seconds, stop=("done",), phases=None, poses=None, keep_batt
 def map_field(robot, grid, manager):
     manager.start_mapping()
     advance(manager, 1400.0)
+
+
+def square(cx, cy, half):
+    return [
+        (cx - half, cy - half),
+        (cx + half, cy - half),
+        (cx + half, cy + half),
+        (cx - half, cy + half),
+        (cx - half, cy - half),
+    ]
+
+
+def two_region_map(name="双区测试"):
+    """注册一张"两个不相交区域 + 一条单行通道"的地图，返回地图编号。
+
+    分区只按连通区域算，通道格子（纯通道段）既不割草也不并区，所以两边各成
+    一个区域，正好用来验证多区域的割草顺序。
+    """
+    world.select_map(1)
+    draft = map_editor.Draft(name)
+    draft.add_region(square(7.0, 7.0, 2.6))
+    draft.add_region(square(22.0, 7.0, 2.6))
+    draft.add_dock(5.2, 7.0, 0.45)
+    draft.add_passage([(5.0, 7.0), (23.0, 7.0)])
+    return world.register_map(draft.to_definition(name))
 
 
 class MappingTaskTest(unittest.TestCase):
@@ -285,28 +311,39 @@ class MowingTaskTest(unittest.TestCase):
         self.assertGreaterEqual(grid.zone_coverage(1), 0.85)
 
     def test_zone_order_and_multiple_zones(self):
-        robot, grid, manager = make_system(3)
-        map_field(robot, grid, manager)
-        robot.battery = 100.0
-        self.assertGreaterEqual(len(grid.zones), 2)
-        smallest = sorted(grid.zones, key=lambda zone: zone["free"])[:2]
-        order = [smallest[1]["id"], smallest[0]["id"]]
-        manager.start_mowing(order)
-        self.assertEqual(manager.zone_order, order)
-        advance(manager, 1400.0, stop=("done", "to_dock"), keep_battery=True)
-        self.assertIn(manager.phase, ("to_dock", "done"))
-        for zone_id in order:
-            self.assertGreaterEqual(grid.zone_coverage(zone_id), 0.83)
-        messages = [entry["message"] for entry in robot.events]
-        positions = [
-            next(
-                index
-                for index, message in enumerate(messages)
-                if "区域 {} 割草完成".format(zone_id) in message
-            )
-            for zone_id in order
-        ]
-        self.assertLess(positions[0], positions[1])
+        """两个区域经通道相连：按给定顺序先割完一个，穿通道过去再割下一个。"""
+        map_id = two_region_map()
+        try:
+            world.select_map(map_id)
+            robot = RobotCar()
+            grid = GridMap()
+            manager = TaskManager(robot, grid)
+            self.assertTrue(grid.build_free_area((robot.pose[0], robot.pose[1])))
+            grid.partition_zones()
+            robot.battery = 100.0
+            self.assertGreaterEqual(len(grid.zones), 2)
+            order = [grid.zones[1]["id"], grid.zones[0]["id"]]
+            manager.start_mowing(order)
+            self.assertEqual(manager.zone_order, order)
+            advance(manager, 1600.0, stop=("done", "to_dock"), keep_battery=True)
+            self.assertIn(manager.phase, ("to_dock", "done"))
+            for zone_id in order:
+                self.assertGreaterEqual(grid.zone_coverage(zone_id), 0.83)
+            messages = [entry["message"] for entry in robot.events]
+            positions = [
+                next(
+                    index
+                    for index, message in enumerate(messages)
+                    if "区域 {} 割草完成".format(zone_id) in message
+                )
+                for zone_id in order
+            ]
+            self.assertLess(positions[0], positions[1])
+            self.assertEqual(robot.collisions, 0)
+        finally:
+            if map_id in world.MAPS:
+                world.delete_map(map_id)
+            world.select_map(3)
 
     def test_stop_task_returns_to_idle(self):
         robot, grid, manager = make_system(3)
@@ -333,6 +370,113 @@ class MowingTaskTest(unittest.TestCase):
         advance(manager, 900.0)
         self.assertEqual(manager.phase, "done")
         self.assertGreaterEqual(grid.zone_coverage(1), 0.80)
+
+
+class EditedMapZoneFlowTest(unittest.TestCase):
+    """地图编辑器保存的地图：每个区域自己走完沿边 → 弓字 → 补割，再去下一个。"""
+
+    def setUp(self):
+        config.configure(
+            max_linear=1.5,
+            nav_speed=1.0,
+            map_speed=1.0,
+            mow_speed=1.3,
+            edge_speed=0.85,
+        )
+        world.select_map(1)
+        draft = map_editor.Draft("双区流程")
+        draft.add_region(square(10.0, 10.0, 4.0))
+        draft.add_region(square(20.0, 10.0, 4.0))
+        draft.add_dock(7.0, 10.0, 0.45)
+        draft.add_passage([(13.0, 10.0), (17.0, 10.0)])
+        self.map_id = world.register_map(draft.to_definition("双区流程"))
+        world.select_map(self.map_id)
+        self.robot = RobotCar()
+        self.grid = GridMap()
+        self.manager = TaskManager(self.robot, self.grid)
+
+    def tearDown(self):
+        config.reset()
+        if self.map_id in world.MAPS:
+            world.delete_map(self.map_id)
+        world.select_map(3)
+
+    def test_each_region_runs_full_flow_before_next(self):
+        self.manager.start_mapping()
+        advance(self.manager, 900.0)
+        self.assertEqual(self.manager.phase, "done")
+        self.assertEqual(len(self.grid.zones), 2, "编辑器画的两个区域应各算一个区域")
+
+        self.robot.battery = 100.0
+        order = [2, 1]
+        self.manager.start_mowing(order, "A")
+        advance(self.manager, 2400.0, stop=("done", "to_dock"), keep_battery=True)
+        self.assertIn(self.manager.phase, ("to_dock", "done"))
+        for zone_id in order:
+            # 两个区域都要基本割完：沿边被"墙外占据带"冒充的障碍打断时这里会掉到 94%
+            self.assertGreaterEqual(self.grid.zone_coverage(zone_id), 0.97)
+
+        messages = [entry["message"] for entry in self.robot.events]
+        marks = []
+        for zone_id in order:
+            marks.append(
+                next(
+                    index
+                    for index, message in enumerate(messages)
+                    if "区域 {} 割草完成".format(zone_id) in message
+                )
+            )
+        self.assertLess(marks[0], marks[1])
+        # 第二个区域开始之前，第一个区域必须已经走完沿边 + 弓字（+ 补割）
+        first_zone_events = [
+            message for message in messages[: marks[0]] if "区域 2" in message
+        ]
+        self.assertTrue(any("沿边缘割草一周" in message for message in first_zone_events))
+        self.assertTrue(any("规划弓字线段" in message for message in first_zone_events))
+
+
+class LaneAxisTest(unittest.TestCase):
+    """主弓字方向：进区域时按长边定一次，主覆盖阶段里不再来回换。"""
+
+    def setUp(self):
+        self.robot, self.grid, self.manager = make_system(3)
+        self.grid.build_free_area((self.robot.pose[0], self.robot.pose[1]))
+        self.grid.partition_zones()
+        self.manager.zone_id = 1
+        self.manager.task = {"type": "mow"}
+
+    def test_preferred_axis_follows_long_side(self):
+        axis = self.manager._preferred_lane_axis
+        self.assertEqual(axis({"x0": 0.0, "x1": 12.0, "y0": 0.0, "y1": 6.0}), "h")
+        self.assertEqual(axis({"x0": 0.0, "x1": 6.0, "y0": 0.0, "y1": 12.0}), "v")
+        self.assertEqual(axis({"x0": 0.0, "x1": 6.0, "y0": 0.0, "y1": 6.0}), "h")
+
+    def test_main_axis_survives_replan(self):
+        manager = self.manager
+        manager.zone_stage = "stripes"
+        manager.lane_axis = "v"
+        manager.main_lane_axis = "v"
+        manager.segments = []
+        manager._node_lanes = lambda zone, mode, axis=None: []
+        self.grid.zone_coverage = lambda zone_id: 0.5
+        manager._finish_zone_coverage = lambda: None
+        manager._plan_stripes()
+        # 主方向用尽后允许换成另一个方向做补割，但“主方向”本身不变
+        self.assertEqual(manager.lane_axis, "h")
+        self.assertEqual(manager.main_lane_axis, "v")
+        manager._plan_stripes()
+        self.assertEqual(manager.lane_axis, "h", "补割方向也不该再翻回来")
+        self.assertEqual(manager.main_lane_axis, "v")
+
+    def test_wide_zone_starts_with_horizontal_lanes(self):
+        zone = self.grid.zones[0]
+        wide = dict(zone)
+        wide["x0"], wide["x1"] = 0.0, 18.0
+        wide["y0"], wide["y1"] = 0.0, 8.0
+        self.assertEqual(self.manager._preferred_lane_axis(wide), "h")
+        self.manager.zone_id = zone["id"]
+        self.manager._enter_zone()
+        self.assertEqual(self.manager.lane_axis, self.manager.main_lane_axis)
 
 
 if __name__ == "__main__":

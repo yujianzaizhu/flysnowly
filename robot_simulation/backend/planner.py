@@ -6,6 +6,12 @@ import world
 
 LANE_SPACING = 0.30
 EDGE_INSET = 0.02
+# 沿边掩膜先沿非占据格外扩几格再腐蚀：把"导航膨胀"吃掉的那一圈找回来，
+# 否则沿边路线离真墙 0.5 m 以上，墙边一整条割不到
+EDGE_GROW_CELLS = 2
+# 沿边路线离外墙保持的距离（在车体半径之上再加这么多）
+EDGE_WALL_CLEARANCE = 0.12
+OCCUPIED_VALUE = 2
 RING_MARGIN = 0.34
 SQRT2 = math.sqrt(2.0)
 
@@ -248,20 +254,26 @@ def _trace_loop(grid, component, start_xy):
 
 
 def edge_route_mask(grid, zone, start_xy, inset=None):
-    """沿边轨迹 = 腐蚀后的「区域矩形框 ∩ 建图自由区」的外轮廓。
+    """沿边轨迹 = 贴墙吸附后的「区域矩形框 ∩ 建图自由区」外轮廓。
 
     - 交集：只保留该区域内、建图时判为自由的栅格，天然满足"不出区域、不进占据/场外"；
-    - 腐蚀：按 inset 做欧氏腐蚀（默认 EDGE_INSET），把路径压到离边界一个车体半径量级的位置，
-      让刀盘能盖住最后一条草、又不会贴墙；
-    - 轮廓：取腐蚀后掩膜的外轮廓并按最小转向闭合，最后按 0.16 m 加密。
+    - 外扩：自由区已被导航膨胀吃掉一圈，先沿非占据格外扩 `EDGE_GROW_CELLS` 格回墙根；
+    - 腐蚀：按 inset 做欧氏腐蚀（默认 EDGE_INSET），把折线压到离边界一个车体半径量级；
+    - 轮廓：取腐蚀后掩膜的外轮廓并按最小转向闭合；
+    - 吸附：`_snap_route_to_wall` 把每点放到离墙 `ROBOT_RADIUS + EDGE_WALL_CLEARANCE`，
+      最后按 0.16 m 加密。
 
-    规则矩形区域腐蚀后仍是一个内缩矩形（拐角变圆，对后驱小车更平滑），
+    规则矩形区域吸附后仍是一个等距内缩矩形（拐角变圆，对后驱小车更平滑），
     不规则区域则自动贴合真实边界，因此不需要再用"填充率"去判形状。
     """
     inset = EDGE_INSET if inset is None else inset
     cells = _zone_free_cells(grid, zone)
     if len(cells) < 20:
         return edge_route(zone, start_xy)
+    # 区域的自由区边界离真墙还差一圈导航膨胀（`blocked` 2 格 ≈ 0.2 m）：直接用
+    # 它腐蚀出来的沿边离墙 0.5 m 以上，墙边整条割不到。先把掩膜沿"非占据格"外扩
+    # 回墙根，再按 inset 腐蚀，路线才会真正贴着墙走。
+    cells = _grow_into_open(grid, cells, steps=EDGE_GROW_CELLS)
     cell = grid.cell
     c0, r0 = grid.cell_of(zone["x0"], zone["y0"])
     c1, r1 = grid.cell_of(zone["x1"], zone["y1"])
@@ -302,7 +314,118 @@ def edge_route_mask(grid, zone, start_xy, inset=None):
         key=lambda index: math.hypot(loop[index][0] - start_xy[0], loop[index][1] - start_xy[1]),
     )
     route = loop[entry:-1] + loop[:entry] + [loop[entry]]
+    centre = None
+    if zone is not None:
+        centre = (
+            zone.get("cx", (zone["x0"] + zone["x1"]) * 0.5),
+            zone.get("cy", (zone["y0"] + zone["y1"]) * 0.5),
+        )
+    route = _snap_route_to_wall(grid, route, centre=centre)
     return _densify(route)
+
+
+def _grow_into_open(grid, cells, steps=2):
+    """把区域掩膜向外扩几格，但只扩进"未占据"的格子。
+
+    掩膜里的坐标是 (col, row)。外扩之后掩膜边界落到真实墙体上（而不是导航
+    膨胀的边缘），腐蚀出来的沿边路线才会贴着墙走。
+    """
+    if steps <= 0 or not cells:
+        return set(cells)
+    data = grid.data
+    cols = grid.cols
+    rows = grid.rows
+    no_mow = grid.no_mow
+    grown = set(cells)
+    frontier = set(cells)
+    for _ in range(steps):
+        nxt = set()
+        for col, row in frontier:
+            for dc, dr in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nc = col + dc
+                nr = row + dr
+                if nc < 0 or nc >= cols or nr < 0 or nr >= rows:
+                    continue
+                if (nc, nr) in grown:
+                    continue
+                index = nr * cols + nc
+                if data[index] == OCCUPIED_VALUE:
+                    continue
+                if no_mow[index]:
+                    continue
+                # 场外是"未知格"，不判占据：必须显式限制在场地多边形内，
+                # 否则掩膜会从墙缝里扩到场外，腐蚀出来的路线跑到场外去
+                cell_x = (nc + 0.5) * grid.cell
+                cell_y = (nr + 0.5) * grid.cell
+                if not world.point_in_polygon(cell_x, cell_y):
+                    continue
+                grown.add((nc, nr))
+                nxt.add((nc, nr))
+        frontier = nxt
+        if not frontier:
+            break
+    return grown
+
+
+def _snap_route_to_wall(grid, points, target=None, reach=0.90, centre=None):
+    """把沿边路线统一压到"离外墙固定距离"。
+
+    掩膜腐蚀的结果受占据带厚度影响很大：有时离墙 0.5 m（墙边一整条割不到），
+    有时几乎贴着墙（车体蹭墙）。这里对离墙 `reach` 以内的点，沿"最近墙点 →
+    当前点"的射线放到 `target` 处，既往里收也往外推；推不动（落进占据格 / 出了
+    场地 / 凹角处法线不对）就朝区域中心退，直到离墙够远为止。
+    """
+    if not points:
+        return points
+    # 目标离墙距离：车体半径 + 12 cm。刀盘半径 0.22 时仍能割到离墙 5 cm 以内，
+    # 而车体与墙之间留出 12 cm 余量，纯跟踪拐弯时不会一碰墙就被判"卡住"。
+    target = (
+        world.ROBOT_RADIUS + EDGE_WALL_CLEARANCE
+        if target is None
+        else float(target)
+    )
+    floor = world.ROBOT_RADIUS + 0.02
+    if centre is None:
+        cx = sum(point[0] for point in points) / len(points)
+        cy = sum(point[1] for point in points) / len(points)
+    else:
+        cx, cy = centre
+
+    def usable(px, py):
+        if not world.point_in_polygon(px, py):
+            return False
+        if world.boundary_distance(px, py) < floor:
+            return False
+        col, row = grid.cell_of(px, py)
+        return grid.data[grid.index(col, row)] != OCCUPIED_VALUE
+
+    result = []
+    for x, y in points:
+        wx, wy, distance = world.nearest_boundary_point(x, y)
+        if 1e-6 < distance <= reach and abs(distance - target) > 1e-3:
+            ux = (x - wx) / distance
+            uy = (y - wy) / distance
+            nx = wx + ux * target
+            ny = wy + uy * target
+            if usable(nx, ny):
+                x, y = nx, ny
+            elif distance < target:
+                # 法线方向被凹角/贴墙碎障碍挡住：朝区域中心退到离墙够远
+                dx, dy = cx - x, cy - y
+                length = math.hypot(dx, dy)
+                if length > 1e-6:
+                    for step in (0.10, 0.20, 0.30, 0.45, 0.60):
+                        px = x + dx / length * step
+                        py = y + dy / length * step
+                        if usable(px, py):
+                            x, y = px, py
+                            break
+        if world.boundary_distance(x, y) < floor and result and len(result) > 1:
+            # 凹角处既推不出去也退不进来：直接丢掉这个点（相邻点会拉一条短弦过去），
+            # 别把车带到离墙不到车体半径的地方
+            continue
+        result.append((x, y))
+    return result
 
 
 def edge_route_grid(grid, zone, start_xy, clearance=None):

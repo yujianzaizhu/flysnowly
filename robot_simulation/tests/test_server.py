@@ -19,6 +19,7 @@ BACKEND_DIR = os.path.join(
 )
 sys.path.insert(0, BACKEND_DIR)
 
+import map_editor  # noqa: E402
 import server  # noqa: E402
 import world  # noqa: E402
 
@@ -41,6 +42,16 @@ def _find_real_map_dir():
 
 
 REAL_MAP_DIR = _find_real_map_dir()
+
+
+def square(cx, cy, half):
+    return [
+        (cx - half, cy - half),
+        (cx + half, cy - half),
+        (cx + half, cy + half),
+        (cx - half, cy + half),
+        (cx - half, cy - half),
+    ]
 
 
 class ServerTest(unittest.TestCase):
@@ -141,23 +152,37 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(state["task"]["phase"].startswith("map"))
 
     def test_start_mowing_with_order(self):
-        self.post("/api/map", {"map": 3})
-        with self.httpd.simulator.lock:
-            manager = self.httpd.manager
-            manager.grid.build_free_area(
-                (manager.robot.pose[0], manager.robot.pose[1])
+        # 分区只按连通区域算，内置图都只有一块，所以这里用"两个区域 + 单行
+        # 通道"的地图来验证多区域顺序。
+        draft = map_editor.Draft("双区服务测试")
+        draft.add_region(square(7.0, 7.0, 2.6))
+        draft.add_region(square(22.0, 7.0, 2.6))
+        draft.add_dock(5.2, 7.0, 0.45)
+        draft.add_passage([(5.0, 7.0), (23.0, 7.0)])
+        map_id = world.register_map(draft.to_definition("双区服务测试"))
+        try:
+            self.post("/api/map", {"map": map_id})
+            with self.httpd.simulator.lock:
+                manager = self.httpd.manager
+                manager.grid.build_free_area(
+                    (manager.robot.pose[0], manager.robot.pose[1])
+                )
+                zones = manager.grid.partition_zones()
+            self.assertGreaterEqual(len(zones), 2)
+            order = [zones[1]["id"], zones[0]["id"]]
+            _, state = self.post(
+                "/api/task", {"task": "mow", "zones": order, "mode": "B"}
             )
-            zones = manager.grid.partition_zones()
-        self.assertGreaterEqual(len(zones), 2)
-        order = [zones[1]["id"], zones[0]["id"]]
-        _, state = self.post(
-            "/api/task", {"task": "mow", "zones": order, "mode": "B"}
-        )
-        self.assertEqual(state["task"]["type"], "mow")
-        self.assertEqual(state["task"]["zone_order"], order)
-        self.assertEqual(state["task"]["current_zone"], order[0])
-        self.assertEqual(state["task"]["mode"], "B")
-        self.assertEqual(state["mowing_mode"], "B")
+            self.assertEqual(state["task"]["type"], "mow")
+            self.assertEqual(state["task"]["zone_order"], order)
+            self.assertEqual(state["task"]["current_zone"], order[0])
+            self.assertEqual(state["task"]["mode"], "B")
+            self.assertEqual(state["mowing_mode"], "B")
+        finally:
+            self.post("/api/stop", {})
+            if map_id in world.MAPS:
+                world.delete_map(map_id)
+            self.post("/api/map", {"map": 1})
 
     def test_mowing_without_map_is_rejected(self):
         self.post("/api/map", {"map": 2})
