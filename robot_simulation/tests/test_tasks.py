@@ -1,6 +1,7 @@
 import math
 import os
 import sys
+import tempfile
 import unittest
 
 BACKEND_DIR = os.path.join(
@@ -10,12 +11,17 @@ sys.path.insert(0, BACKEND_DIR)
 
 import config  # noqa: E402
 import map_editor  # noqa: E402
+import mow_report  # noqa: E402
 import world  # noqa: E402
 from grid_map import GridMap  # noqa: E402
 from robot_car import RobotCar  # noqa: E402
-from tasks import TaskManager  # noqa: E402
+import tasks  # noqa: E402
+from tasks import PLAN_STUCK_LIMIT, TaskManager  # noqa: E402
 
 DT = 0.02
+
+# 测试跑割草会把报告写出来，别写进仓库的 data/data
+mow_report.OUTPUT_DIR = tempfile.mkdtemp(prefix="mow_report_test_")
 
 
 def make_system(map_id=1):
@@ -170,10 +176,10 @@ class MappingTaskTest(unittest.TestCase):
         finally:
             world.clear_edits()
 
-    def test_no_go_guard_blocks_forward_motion(self):
+    def test_no_go_guard_blocks_forward_motion_on_edge(self):
         robot, grid, manager = make_system()
         manager.task = {"type": "mow", "zones": [1], "mode": "A"}
-        manager.phase = "zone_stripes"
+        manager.phase = "zone_edge"
         x, y, theta = manager._pose()
         world.add_no_go_zone(
             x + 0.18, y - 0.6, x + 1.6, y + 0.6
@@ -188,6 +194,26 @@ class MappingTaskTest(unittest.TestCase):
             self.assertAlmostEqual(w2, 0.2)
         finally:
             world.clear_edits()
+
+    def test_no_go_guard_does_not_interrupt_planned_lanes(self):
+        """弓字阶段不再叠反应式禁区保护（弓字线本身已经按禁区切好了）。
+
+        以前这里会被拦停：机器走到线段尽头 → 判"前方是禁区" → 停车转向 →
+        重规划，于是在禁区边上反复改路线来回跑。
+        """
+        robot, grid, manager = make_system()
+        manager.task = {"type": "mow", "zones": [1], "mode": "A"}
+        manager.phase = "zone_stripes"
+        x, y, theta = manager._pose()
+        world.add_no_go_zone(x + 0.18, y - 0.6, x + 1.6, y + 0.6)
+        try:
+            self.assertEqual(manager._guard_no_go((0.6, 0.2)), (0.6, 0.2))
+        finally:
+            world.clear_edits()
+
+    def test_no_go_margin_covers_guard_band(self):
+        """禁区膨胀必须大于反应式保护的判定距离，否则弓字线会落在保护带里。"""
+        self.assertGreater(tasks.NO_GO_MARGIN, world.ROBOT_RADIUS + 0.06)
 
     def test_finished_mapping_never_restarts_from_stale_breakpoint(self):
         robot, grid, manager = make_system()
@@ -433,6 +459,66 @@ class EditedMapZoneFlowTest(unittest.TestCase):
         ]
         self.assertTrue(any("沿边缘割草一周" in message for message in first_zone_events))
         self.assertTrue(any("规划弓字线段" in message for message in first_zone_events))
+
+
+class PlanSpinGuardTest(unittest.TestCase):
+    """重规划原地打转时先退一步，不要靠"标记失败"把主方向的弓字线全丢掉。"""
+
+    def setUp(self):
+        self.robot, self.grid, self.manager = make_system(3)
+        self.grid.build_free_area((self.robot.pose[0], self.robot.pose[1]))
+        self.grid.partition_zones()
+        self.manager.zone_id = 1
+        self.manager.task = {"type": "mow"}
+        self.manager.zone_stage = "stripes"
+        self.manager.lane_axis = "h"
+        self.manager.main_lane_axis = "h"
+        self.manager.last_plan_coverage = 0.5
+        self.manager.failed_segments = {((0.0, 0.0), (1.0, 0.0))}
+        self.manager.segments = [((2.0, 2.0), (4.0, 2.0))]
+        self.manager._segment_entry = lambda a, b: a
+
+    def test_repeated_replans_without_moving_trigger_backtrack(self):
+        manager = self.manager
+        calls = []
+        manager._start_backtrack = lambda goal, kind, length=6.0: calls.append((goal, kind)) or True
+        manager.plan_anchor = tuple(self.robot.pose[:2])
+        spinning = [manager._plan_is_spinning(0.5) for _ in range(PLAN_STUCK_LIMIT)]
+        self.assertEqual(spinning[:-1], [False] * (PLAN_STUCK_LIMIT - 1))
+        self.assertTrue(spinning[-1], "连续多次原地重规划应该触发后退")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], "to_segment")
+        self.assertEqual(manager.failed_segments, set(), "退回时要清掉误判的失败线段")
+        self.assertEqual(manager.main_lane_axis, "h", "主方向不能因为打转被换掉")
+        self.assertEqual(manager.lane_axis, "h")
+
+    def test_progress_resets_the_spin_counter(self):
+        manager = self.manager
+        backups = []
+        manager._start_backtrack = lambda goal, kind, length=6.0: backups.append(goal) or True
+        manager.plan_anchor = tuple(self.robot.pose[:2])
+        # 车每次真的挪了半米：即使重规划再频繁也不算打转
+        for index in range(PLAN_STUCK_LIMIT * 2):
+            self.robot.pose[0] += 0.5
+            self.assertFalse(manager._plan_is_spinning(0.5))
+            self.assertEqual(manager.plan_stuck, 0)
+        self.assertEqual(backups, [])
+        # 覆盖率在涨也算有进展
+        self.robot.pose[0] += 0.0
+        coverage = 0.5
+        for index in range(PLAN_STUCK_LIMIT * 2):
+            coverage += 0.01
+            self.assertFalse(manager._plan_is_spinning(coverage))
+            manager.last_plan_coverage = coverage
+        self.assertEqual(backups, [])
+
+    def test_stuck_counted_only_when_standing_still(self):
+        manager = self.manager
+        self.robot.pose[0] += 1.0
+        self.assertFalse(manager._plan_is_spinning(0.5))
+        self.assertEqual(manager.plan_stuck, 0)
+        self.assertFalse(manager._plan_is_spinning(0.5))
+        self.assertEqual(manager.plan_stuck, 1)
 
 
 class LaneAxisTest(unittest.TestCase):

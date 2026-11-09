@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import traceback
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -28,6 +29,121 @@ from tasks import TaskManager  # noqa: E402
 FRONTEND_DIR = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "frontend")
 )
+
+# 割草报告目录：默认仓库根的 data/data（可用 ROBOT_REPORT_DIR 覆盖）
+def report_dir():
+    import mow_report
+
+    return mow_report.output_dir()
+
+
+# 自建地图落盘目录：data/map/editor_<名字>/editor_map.json，重启后自动读回来
+def editor_map_root():
+    return os.path.normpath(
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir, "data", "map"
+        )
+    )
+
+
+def persist_editor_map(definition):
+    """把编辑器保存的地图写到 data/map/editor_<名字>/editor_map.json。"""
+    name = str(definition.get("name") or "自定义地图")
+    safe = "".join(ch if ch.isalnum() or ch in "-_·" else "_" for ch in name).strip("_")
+    folder = os.path.join(editor_map_root(), "editor_" + (safe or "map"))
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "editor_map.json")
+    payload = dict(definition)
+    payload.pop("id", None)  # 编号以运行时注册为准
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False)
+    return path
+
+
+def load_persisted_editor_maps():
+    """启动时把自建地图读回来（不然重启一次就全丢了）。"""
+    root = editor_map_root()
+    if not os.path.isdir(root):
+        return 0
+    loaded = 0
+    for name in sorted(os.listdir(root)):
+        path = os.path.join(root, name, "editor_map.json")
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as handle:
+                definition = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        definition["id"] = 0
+        definition["imported"] = True
+        definition["editor_built"] = True
+        definition.setdefault("source_path", "editor:" + str(definition.get("name")))
+        try:
+            world.register_map(definition)
+            loaded += 1
+        except Exception:  # pragma: no cover - 坏文件跳过
+            traceback.print_exc()
+    return loaded
+
+
+def list_reports(limit=50):
+    """data/data 下的割草报告（每次任务一个时间命名的文件夹），按时间倒序。
+
+    兼容旧格式：早期直接把 `mow_report_<时间戳>.html/png/json` 平铺在 data/data 里。
+    """
+    root = report_dir()
+    if not os.path.isdir(root):
+        return []
+    items = []
+    # 新格式：<时间>/report.html（+ coverage.png / data.json）
+    for name in sorted(os.listdir(root)):
+        folder = os.path.join(root, name)
+        if not os.path.isdir(folder):
+            continue
+        html_path = os.path.join(folder, "report.html")
+        if not os.path.isfile(html_path):
+            continue
+        entry = {
+            "folder": name,
+            "html": "{}/report.html".format(name),
+            "url": "/reports/{}/report.html".format(name),
+            "png": "{}/coverage.png".format(name),
+            "json": "{}/data.json".format(name),
+        }
+        try:
+            entry["created"] = datetime.fromtimestamp(
+                os.path.getmtime(html_path)
+            ).isoformat(timespec="seconds")
+            entry["size"] = os.path.getsize(html_path)
+        except OSError:  # pragma: no cover - 文件刚被删掉
+            continue
+        items.append(entry)
+    # 旧格式（平铺文件）
+    for name in sorted(os.listdir(root)):
+        if not name.endswith(".html") or not name.startswith("mow_report_"):
+            continue
+        stem = name[: -len(".html")]
+        entry = {
+            "folder": None,
+            "stem": stem,
+            "html": name,
+            "url": "/reports/" + name,
+            "png": stem + ".png",
+            "json": stem + ".json",
+        }
+        path = os.path.join(root, name)
+        try:
+            entry["created"] = datetime.fromtimestamp(os.path.getmtime(path)).isoformat(
+                timespec="seconds"
+            )
+            entry["size"] = os.path.getsize(path)
+        except OSError:  # pragma: no cover
+            continue
+        items.append(entry)
+    items.sort(key=lambda item: item["created"] or "", reverse=True)
+    return items[:limit]
+
 
 # 日志（bag）目录：默认仓库根的 data/bag，可用环境变量 ROBOT_BAG_DIR 覆盖
 BAG_DIR = os.environ.get(
@@ -524,12 +640,23 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
             self._send_json(
                 {"costmap": layer, "maps": (replay.info or {}).get("map_summary") or {}}
             )
+        elif path == "/api/reports":
+            entries = list_reports()
+            self._send_json(
+                {
+                    "directory": report_dir(),
+                    "reports": entries,
+                    "latest": entries[0]["url"] if entries else None,
+                }
+            )
         elif path == "/api/config":
             self._send_json(self._state())
         elif path == "/api/health":
             self._send_json(
                 {"status": "ok", "time": round(time.time(), 3), "speed": self.server.simulator.speed}
             )
+        elif path.startswith("/reports/"):
+            self._serve_report(path[len("/reports/") :])
         elif path.startswith("/api/"):
             self._send_json({"error": "接口不存在"}, status=404)
         else:
@@ -953,6 +1080,14 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=400)
             return
+        except Exception as exc:  # pragma: no cover - 兜底：内部异常也要给出可读反馈
+            # 以前这里会把异常抛给 socketserver，浏览器只看到连接被重置/500 空响应，
+            # 界面上就是"点了按钮没反应"。现在回一条 JSON 错误并把堆栈打进服务日志。
+            traceback.print_exc()
+            self._send_json(
+                {"error": "处理 {} 时出错：{}".format(path, exc)}, status=500
+            )
+            return
 
         self._send_json(self._state())
 
@@ -1024,6 +1159,40 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
             full_path = os.path.join(full_path, "index.html")
         if not os.path.isfile(full_path):
             self._send_text("页面不存在", status=404)
+            return
+        with open(full_path, "rb") as handle:
+            body = handle.read()
+        extension = os.path.splitext(full_path)[1].lower()
+        self.send_response(200)
+        self.send_header("Content-Type", CONTENT_TYPES.get(extension, "application/octet-stream"))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_report(self, relative):
+        """把 data/data 下的割草报告发出去；/reports/latest 指向最新一份。"""
+        root = report_dir()
+        name = unquote(relative or "").strip("/") or "latest"
+        if name == "latest":
+            entries = list_reports(1)
+            if not entries:
+                self._send_text("还没有生成过割草报告：先跑一次自动割草", status=404)
+                return
+            name = entries[0]["html"]
+        name = name.strip("/")
+        if not name:
+            self._send_text("报告名不能为空", status=400)
+            return
+        if ".." in name.split("/"):
+            self._send_text("禁止访问", status=403)
+            return
+        full_path = os.path.normpath(os.path.join(root, name))
+        if not (full_path == root or full_path.startswith(root + os.sep)):
+            self._send_text("禁止访问", status=403)
+            return
+        if not os.path.isfile(full_path):
+            self._send_text("报告不存在", status=404)
             return
         with open(full_path, "rb") as handle:
             body = handle.read()
@@ -1180,6 +1349,10 @@ def save_editor(httpd, name=None):
         httpd.manager = manager
         httpd.simulator.manager = manager
     httpd.editor = None
+    try:
+        persist_editor_map(definition)
+    except OSError:  # pragma: no cover - 落盘失败不影响本次保存
+        traceback.print_exc()
     if draft_map_id is not None:
         try:
             world.delete_map(draft_map_id)
@@ -1209,6 +1382,7 @@ def rebuild_system(httpd, definition=None):
 
 
 def create_server(host="127.0.0.1", port=8000):
+    load_persisted_editor_maps()
     world.select_map(1)
     robot = RobotCar()
     grid = GridMap()

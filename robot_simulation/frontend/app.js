@@ -68,6 +68,7 @@
     chargeBtn: document.getElementById("chargeBtn"),
     resumeBtn: document.getElementById("resumeBtn"),
     stopBtn: document.getElementById("stopBtn"),
+    reportBtn: document.getElementById("reportBtn"),
     resetBtn: document.getElementById("resetBtn"),
     estopBtn: document.getElementById("estopBtn"),
     manualLinear: document.getElementById("manualLinear"),
@@ -1908,13 +1909,14 @@
   function updateZones(zones) {
     ensureZoneRows(zones);
     const joined = zones.map((zone) => zone.id).join(",");
-    if (
-      zones.length &&
-      joined !== zoneAutoValue &&
-      (!zoneInputDirty || els.zoneOrder.value === zoneAutoValue)
-    ) {
+    if (zones.length && joined !== zoneAutoValue) {
       zoneAutoValue = joined;
-      els.zoneOrder.value = joined;
+      // 只在占位符里提示"自动"会用哪些区域，绝不往输入框里写值：
+      // 一旦自动填成 "1,2,3"，后端就会当成用户指定顺序，按路程就近排序永远不生效。
+      if (!zoneInputDirty) {
+        els.zoneOrder.value = "";
+        els.zoneOrder.placeholder = "自动（" + joined + "）";
+      }
     }
     zones.forEach((zone, index) => {
       const target = zoneRows[index];
@@ -2960,6 +2962,12 @@
       els.missionMessage.textContent = "请先完成自动建图，生成割草区域";
       return;
     }
+    if (!zones.length) {
+      // 留空 = 让后端按"离车最近"自动排区域顺序（省路程）
+      els.zoneOrder.placeholder = zoneAutoValue
+        ? "自动（" + zoneAutoValue + "）"
+        : "自动";
+    }
     send("/api/task", { task: "mow", zones, mode: els.mowMode.value });
   });
 
@@ -3143,6 +3151,15 @@
     trail = [];
     send("/api/stop", {});
   });
+
+  // 割草报告：任务结束会在 data/data 下写一份文档，这里直接打开最新一份。
+  // 必须同步 window.open（放在 await 之后会被浏览器的弹窗拦截器当广告拦掉），
+  // 所以这里直接打开服务端的 /reports/latest，由它跳到最新报告。
+  if (els.reportBtn) {
+    els.reportBtn.addEventListener("click", () => {
+      window.open("/reports/latest", "_blank");
+    });
+  }
 
   els.speedButtons.forEach((button) => {
     button.addEventListener("click", () => {

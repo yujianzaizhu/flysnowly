@@ -434,9 +434,9 @@ class GridMap(object):
         视觉聚类给出的圆只用于绕障几何（绕行起点、花瓣探明），不能当成障碍物体积
         整片刷进栅格 —— 那样障碍物周围会多出一大圈假障碍，割草永远补不上。
 
-        这里用已探明占据栅格的**凸包**代表障碍物轮廓：只把观测到的轮廓围出来的
-        区域补成实心（视觉看不到的背面与内部空洞），再沿真实轮廓外扩必要的车体、
-        刀盘余量。凸包始终不大于包围圆，所以障碍物附近的窄带可以正常割到。
+        这里只把**被观测轮廓围住、从外侧灌不进去**的内部空洞补成实心（视觉看不到
+        的背面），再沿真实轮廓外扩必要的车体、刀盘余量。L 形 / C 形障碍的凹口能连
+        到外部，不会被填掉，障碍物附近的可割区可以正常割到。
 
         返回写入的栅格数，便于统计与调试。
         """
@@ -482,41 +482,55 @@ class GridMap(object):
                     stack.append((nc, nr))
         if len(points) < 3:
             return 0
-        hull = _convex_hull(sorted(points))
-        if len(hull) < 3:
-            return 0
 
-        # 逐行求凸包与扫描线的交点，填充两极之间的栅格
-        spans = {}
-        count = len(hull)
-        for index in range(count):
-            ac, ar = hull[index]
-            bc, br = hull[(index + 1) % count]
-            if ar == br:
-                continue
-            low, high = (ar, br) if ar < br else (br, ar)
-            for row in range(max(row0, low), min(row1, high) + 1):
-                t = (row - ar) / float(br - ar)
-                col = ac + (bc - ac) * t
-                span = spans.get(row)
-                if span is None:
-                    spans[row] = [col, col]
-                else:
-                    span[0] = min(span[0], col)
-                    span[1] = max(span[1], col)
+        # 只补"被观测轮廓围住、从 bbox 边界灌不进去"的内部空洞（视觉看不到的背面）。
+        # 以前用凸包填充，L 形 / C 形 / 细长障碍会被抹成整个外接框 —— 一个 4 m² 的
+        # 障碍能变成 13 m² 的"假障碍"，周围可割区被啃掉一大片（界面上看起来就是
+        # 障碍物被"涂抹"了）。凹口是能连到外部的，不该填。
+        occupied = set()
+        for row in range(row0, row1 + 1):
+            base = row * self.cols
+            for col in range(col0, col1 + 1):
+                if self.data[base + col] == OCCUPIED:
+                    occupied.add((col, row))
+        outside = set()
+        stack = []
+        for col in range(col0, col1 + 1):
+            for row in (row0, row1):
+                if (col, row) not in occupied and (col, row) not in outside:
+                    outside.add((col, row))
+                    stack.append((col, row))
+        for row in range(row0, row1 + 1):
+            for col in (col0, col1):
+                if (col, row) not in occupied and (col, row) not in outside:
+                    outside.add((col, row))
+                    stack.append((col, row))
+        while stack:
+            col, row = stack.pop()
+            for dc, dr in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nc = col + dc
+                nr = row + dr
+                if not (col0 <= nc <= col1 and row0 <= nr <= row1):
+                    continue
+                if (nc, nr) in occupied or (nc, nr) in outside:
+                    continue
+                outside.add((nc, nr))
+                stack.append((nc, nr))
 
         changed = False
         total = 0
-        for row, span in spans.items():
-            lo = max(col0, int(math.floor(span[0])))
-            hi = min(col1, int(math.ceil(span[1])))
-            for col in range(lo, hi + 1):
+        for row in range(row0, row1 + 1):
+            for col in range(col0, col1 + 1):
+                cell = (col, row)
+                if cell in occupied or cell in outside:
+                    continue
                 index = self.index(col, row)
                 if self.verified_free[index]:
-                    # 车体压过的格子不可能是障碍：凸包填充在窄通道里会糊死通道
+                    # 车体压过的格子不可能是障碍
                     continue
                 if self.data[index] != OCCUPIED:
                     self.data[index] = OCCUPIED
+                    self._drop_from_totals(index)
                     changed = True
                     self._note_known(index, spread=1)
                 self._fill_rows(self.blocked, col, row, INFLATE_CELLS)
@@ -1107,6 +1121,92 @@ class GridMap(object):
                 zone = self.zone_at(cx, cy)
                 if zone is not None:
                     self.zone_mowed[zone["id"]] += 1
+
+    def _drop_from_totals(self, index):
+        """某个格子变成"割不到"时，把它从该区域的覆盖分母里扣掉。
+
+        分母是"能割的格子数"，所以场内新探明的障碍、绕障后盖掉的刀盘层都要扣；
+        已经割过的格子不扣（它同时还在分子里，扣了覆盖率会虚高）。
+        """
+        if not self.zone_id_map:
+            return
+        zone_id = self.zone_id_map[index]
+        if not zone_id:
+            return
+        if self.mowed[index]:
+            return
+        current = self.zone_totals.get(zone_id, 0)
+        if current > 0:
+            self.zone_totals[zone_id] = current - 1
+            self.covered_free = sum(self.zone_totals.values())
+
+    def refresh_zone_totals(self):
+        """按"当前真正可割的格子"重算每个区域的覆盖分母。
+
+        分区是在建图刚结束时做的：那时禁区还没刷进 blocked、场内障碍物也还没
+        被涂成占据格。这些区域以后是不可能割到的，但一直留在分母里，覆盖率就
+        永远上不去（图上明明割满了，数字只有 80% 多）。开始割草时按当前可割格
+        重算一次分母，覆盖率='已割 / 真正能割的'。
+        """
+        totals = {zone["id"]: 0 for zone in self.zones}
+        cols = self.cols
+        for index, zone_id in enumerate(self.zone_id_map):
+            if not zone_id:
+                continue
+            if not self.free_mask[index] or self.no_mow[index]:
+                continue
+            if self.data[index] == OCCUPIED or self.mow_blocked[index]:
+                continue
+            totals[zone_id] = totals.get(zone_id, 0) + 1
+        for zone_id, value in totals.items():
+            self.zone_totals[zone_id] = value
+        self.covered_free = sum(self.zone_totals.values())
+        return self.zone_totals
+
+    def block_for_mowing(self, x, y, radius, margin=0.26):
+        """把障碍物周围一圈标成"不割"（只写刀盘层，不动占据格/导航层）。
+
+        绕障/绕行过的障碍物用这个盖一下：之后规划弓字线不会再把线段贴在它身上，
+        省掉"走到跟前 → 发现已绕过 → 跳过 → 重新规划"的来回折腾。
+
+        只沿**已探明占据格**外扩 `margin`，不用估计圆整片涂抹 —— 估计圆的半径
+        常常是真实障碍的两倍多（细长 / C 形障碍尤其明显），拿它盖一圈会在图上
+        留下很宽的一条"假障碍"带（就是之前障碍物看起来被涂抹的原因）。
+        """
+        col0, row0 = self.cell_of(x - radius - margin, y - radius - margin)
+        col1, row1 = self.cell_of(x + radius + margin, y + radius + margin)
+        col0, row0 = max(0, col0), max(0, row0)
+        col1, row1 = min(self.cols - 1, col1), min(self.rows - 1, row1)
+        # 先把框内的占据格找出来，再按 margin 外扩
+        occupied = [
+            (col, row)
+            for row in range(row0, row1 + 1)
+            for col in range(col0, col1 + 1)
+            if self.data[self.index(col, row)] == OCCUPIED
+        ]
+        if not occupied:
+            return 0
+        span = max(1, int(math.ceil(margin / max(self.cell, 1e-6))))
+        marked = 0
+        for col, row in occupied:
+            for dc in range(-span, span + 1):
+                for dr in range(-span, span + 1):
+                    nc = col + dc
+                    nr = row + dr
+                    if not (0 <= nc < self.cols and 0 <= nr < self.rows):
+                        continue
+                    cx, cy = self.center_of(nc, nr)
+                    if math.hypot(cx - (col + 0.5) * self.cell, cy - (row + 0.5) * self.cell) > margin:
+                        continue
+                    index = self.index(nc, nr)
+                    if self.mow_blocked[index] or self.data[index] == OCCUPIED:
+                        continue
+                    self.mow_blocked[index] = 1
+                    self._drop_from_totals(index)
+                    marked += 1
+        if marked:
+            self.version += 1
+        return marked
 
     def zone_coverage(self, zone_id):
         total = self.zone_totals.get(zone_id, 0)

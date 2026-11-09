@@ -1,6 +1,7 @@
 import math
 import os
 import sys
+import tempfile
 import unittest
 from collections import deque
 
@@ -12,6 +13,7 @@ BACKEND_DIR = params.BACKEND_DIR
 if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
+import mow_report  # noqa: E402
 import planner  # noqa: E402
 import world  # noqa: E402
 from grid_map import GridMap  # noqa: E402
@@ -19,6 +21,9 @@ from robot_car import RobotCar  # noqa: E402
 from tasks import TaskManager  # noqa: E402
 
 DT = 0.02
+
+# 跑完整割草会生成数据报告，测试里写到临时目录，别污染仓库的 data/data
+mow_report.OUTPUT_DIR = tempfile.mkdtemp(prefix="mow_report_test_")
 
 
 def make_system():

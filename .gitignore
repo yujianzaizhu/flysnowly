@@ -38,3 +38,7 @@ Thumbs.db
 
 # 本地日志包（bag）体积大，不入库
 data/bag/
+
+# 割草任务报告是运行产物，不入库
+data/data/*/
+data/data/mow_report_*

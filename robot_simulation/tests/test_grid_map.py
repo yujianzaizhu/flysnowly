@@ -222,6 +222,27 @@ class MappingTest(unittest.TestCase):
         inner = arc.cell_of(5.0, 4.0)
         self.assertNotEqual(arc.data[arc.index(*inner)], OCCUPIED)
 
+    def test_stamp_footprint_keeps_concave_notch_open(self):
+        """L 形 / C 形障碍的凹口不能被抓成实心（以前用凸包，4 m2 的障碍变 13 m2）。"""
+        grid = GridMap()
+        # 画一个 C 形（三边围起来、右边开口）的占据格
+        for col in range(10, 30):
+            for row in (10, 11):
+                grid.mark_occupied(col, row)
+            for row in (28, 29):
+                grid.mark_occupied(col, row)
+        for row in range(10, 30):
+            for col in (10, 11):
+                grid.mark_occupied(col, row)
+        before = sum(1 for value in grid.data if value == OCCUPIED)
+        grid.stamp_footprint(4.0, 4.0, 1.6)
+        after = sum(1 for value in grid.data if value == OCCUPIED)
+        # C 形的开口能让凹口连到外部：不该再补一大片实心
+        self.assertLess(after - before, 30)
+        # 凹口里的格子必须还是可通行的（不是占据格）
+        col, row = grid.cell_of(2.2, 1.0)
+        self.assertNotEqual(grid.data[grid.index(20, 20)], OCCUPIED)
+
     def test_obstacle_cluster_detection(self):
         grid = GridMap()
         for index in range(40):
@@ -280,6 +301,99 @@ class MappingTest(unittest.TestCase):
                 grid.data[grid.index(c0 + dc, r0 + dr)] = 2
         grid.data_version += 1
         self.assertTrue(grid.obstacle_circles(None), "场内障碍应该被识别")
+
+
+class EdgeRouteMultiZoneTest(unittest.TestCase):
+    """多区域（相邻）地图：每个区域的沿边路线都要能规划出来。
+
+    以前 `edge_route_mask` 用 `zone["x0".."y1"]` 反推距离场 bbox，外扩 2 格后
+    会有几十个格子落到 bbox 外，腐蚀时下标越界 → `start_mowing` 抛 IndexError，
+    界面上就是"点了开始割草，机器原地不动"。
+    """
+
+    def setUp(self):
+        def rect(x0, y0, x1, y1):
+            return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+
+        self.definition = {
+            "id": 996,
+            "name": "三区相邻",
+            "native": True,
+            "width": 24.0,
+            "height": 22.0,
+            "polygon": [
+                (5.0, 5.0),
+                (5.0, 17.0),
+                (18.0, 17.0),
+                (18.0, 3.0),
+                (12.0, 3.0),
+                (12.0, 5.0),
+            ],
+            "dock": {"x": 6.5, "y": 6.5},
+            "start": {"x": 7.0, "y": 6.5, "theta": 0.0},
+            "obstacles": [],
+            "regions": [
+                {"id": 1, "points": rect(5.0, 5.0, 12.0, 17.0)},
+                {"id": 2, "points": rect(12.0, 8.0, 18.0, 17.0)},
+                {"id": 3, "points": rect(12.0, 3.0, 18.0, 8.0)},
+            ],
+            "passages": [],
+        }
+        world.MAPS[996] = self.definition
+        world.select_map(996)
+        self.grid = GridMap()
+        self.assertTrue(
+            self.grid.build_free_area((world.START["x"], world.START["y"]))
+        )
+        self.zones = self.grid.partition_zones()
+
+    def tearDown(self):
+        world.MAPS.pop(996, None)
+        world.select_map(1)
+
+    def test_every_zone_has_a_closed_edge_route(self):
+        self.assertEqual(len(self.zones), 3)
+        for zone in self.zones:
+            route = planner.edge_route_mask(self.grid, zone, (zone["cx"], zone["cy"]))
+            self.assertGreater(len(route), 50, "区域 %d 的沿边路线为空" % zone["id"])
+            self.assertLess(
+                math.hypot(route[0][0] - route[-1][0], route[0][1] - route[-1][1]),
+                1e-6,
+            )
+            clearances = [world.boundary_distance(x, y) for x, y in route]
+            self.assertAlmostEqual(
+                sorted(clearances)[len(clearances) // 2],
+                world.ROBOT_RADIUS + planner.EDGE_WALL_CLEARANCE,
+                delta=0.06,
+            )
+
+    def test_erode_ignores_cells_outside_distance_field(self):
+        # 距离场只覆盖 2x2，传进来的格子有一部分在框外：必须跳过而不是抛 IndexError
+        dist = [1.0, 1.0, 1.0, 1.0]
+        cells = {(5, 5), (6, 5), (7, 5), (6, 7), (4, 5)}
+        eroded = planner._erode(cells, dist, 2, 5, 5, 0.5)
+        self.assertEqual(eroded, {(5, 5), (6, 5)})
+
+
+class ZoneOrderTest(unittest.TestCase):
+    """开始割草时留空区域顺序：按"离车最近"排，先近后远。"""
+
+    def test_greedy_order_follows_distance(self):
+        def zone(zone_id, cx):
+            outline = [(cx - 1.0, 4.0), (cx + 1.0, 4.0), (cx + 1.0, 6.0), (cx - 1.0, 6.0)]
+            return {"id": zone_id, "cx": cx, "cy": 5.0, "outline": outline}
+
+        zones = [zone(1, 20.0), zone(2, 4.0), zone(3, 12.0)]
+        order = planner.order_zones_by_travel(zones, (0.0, 5.0))
+        self.assertEqual(order, [2, 3, 1])
+
+    def test_single_zone_or_missing_outline_keeps_order(self):
+        self.assertEqual(planner.order_zones_by_travel([{"id": 7, "outline": []}], (0, 0)), [7])
+        zones = [
+            {"id": 2, "cx": 1.0, "cy": 1.0, "outline": [(1.0, 1.0), (2.0, 1.0)]},
+            {"id": 1, "cx": 9.0, "cy": 1.0, "outline": [(9.0, 1.0), (8.0, 1.0)]},
+        ]
+        self.assertEqual(planner.order_zones_by_travel(zones, (0.5, 1.0)), [2, 1])
 
 
 class PlannerTest(unittest.TestCase):
@@ -578,6 +692,79 @@ class PlannerTest(unittest.TestCase):
             self.assertGreater(
                 math.hypot(x - 5.0, y - 4.5), 0.35 + world.ROBOT_RADIUS - 0.02
             )
+
+class CoverageTotalsTest(unittest.TestCase):
+    """覆盖率分母 = 当前真正能割的格子（禁区 / 场内障碍 / 刀盘层都要扣掉）。"""
+
+    def setUp(self):
+        world.select_map(1)
+        self.grid = GridMap()
+        self.assertTrue(
+            self.grid.build_free_area((world.START["x"], world.START["y"]))
+        )
+        self.zones = self.grid.partition_zones()
+
+    def test_refresh_zone_totals_drops_unmowable_cells(self):
+        grid = self.grid
+        before = dict(grid.zone_totals)
+        self.assertGreater(before[1], 0)
+        picked = 0
+        for index, zone_id in enumerate(grid.zone_id_map):
+            if zone_id != 1 or not grid.free_mask[index]:
+                continue
+            if picked < 40:
+                grid.mow_blocked[index] = 1
+            elif picked < 80:
+                grid.data[index] = OCCUPIED
+            else:
+                break
+            picked += 1
+        grid.refresh_zone_totals()
+        self.assertEqual(grid.zone_totals[1], before[1] - 80)
+        self.assertEqual(grid.covered_free, sum(grid.zone_totals.values()))
+
+    def test_refresh_zone_totals_keeps_mowed_cells_in_numerator(self):
+        grid = self.grid
+        mowed_cell = None
+        for index, zone_id in enumerate(grid.zone_id_map):
+            if zone_id == 1 and grid.free_mask[index] and not grid.mowed[index]:
+                mowed_cell = index
+                break
+        self.assertIsNotNone(mowed_cell)
+        col, row = divmod(mowed_cell, grid.cols)
+        x, y = grid.center_of(col, row)
+        before = grid.zone_totals[1]
+        grid.mark_mowed(x, y)
+        self.assertEqual(grid.mowed[mowed_cell], 1)
+        grid.mow_blocked[mowed_cell] = 1
+        grid.refresh_zone_totals()
+        # 已割的格子从分母里扣掉，分子还在，覆盖率不能超过 1
+        self.assertEqual(grid.zone_totals[1], before - 1)
+        self.assertLessEqual(grid.zone_coverage(1), 1.0)
+
+    def test_block_for_mowing_hugs_occupied_cells_only(self):
+        """绕障后盖刀盘层只沿真实占据格外扩，不按估计圆整片涂抹。"""
+        grid = self.grid
+        zone = self.zones[0]
+        cx, cy = zone["cx"], zone["cy"]
+        for dc in range(-2, 3):
+            for dr in range(-2, 3):
+                grid.mark_occupied(*grid.cell_of(cx + dc * 0.15, cy + dr * 0.15))
+        before = grid.zone_totals[zone["id"]]
+        # 传一个远大于真实障碍的估计半径（2 m），盖出来的范围仍应贴着障碍
+        marked = grid.block_for_mowing(cx, cy, 2.0, 0.26)
+        self.assertGreater(marked, 0)
+        self.assertLess(marked, 120)
+        self.assertEqual(before - grid.zone_totals[zone["id"]], marked)
+        # 半径外扩之外的地方不能被盖住
+        col, row = grid.cell_of(cx + 1.5, cy)
+        self.assertFalse(grid.cell_blocked_mow(col, row))
+
+    def test_block_for_mowing_without_observed_cells_is_noop(self):
+        grid = GridMap()
+        self.assertEqual(grid.block_for_mowing(3.0, 3.0, 1.0), 0)
+
+
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 """任务控制：自动建图（含孤岛识别）、自动分区、割草、回充与断点续作。"""
 
 import math
+import os
 import threading
 import time
 from collections import deque
@@ -15,6 +16,15 @@ LOW_BATTERY = 30.0
 RESUME_BATTERY = 80.0
 DEFAULT_MOWING_MODE = "A"
 MAX_ZONE_PLAN_PASSES = 30
+# 禁区的规划膨胀（m）：必须明显大于反应式禁区保护的距离（车体半径 + 0.06），
+# 这样按禁区切出来的弓字线不会落在保护带里，机器就不会在禁区旁边反复改路线。
+NO_GO_MARGIN = 0.28
+# 同位置连续重规划多少次算"车被顶住了"（不是这些弓字线走不到）
+PLAN_STUCK_LIMIT = 5
+# 每个区域最多为"被顶住"后退几次，避免来来回回退个不停
+PLAN_STUCK_BACKTRACKS = 3
+# 割草报告的轨迹采样间隔（m）
+TRACK_SAMPLE_STEP = 0.16
 PATCH_MIN_CELLS = 20
 # 覆盖率不足时重补割的轮次上限，以及每轮至少要有多少提升才继续
 COVERAGE_RETRY_LIMIT = 4
@@ -78,7 +88,20 @@ MOW_STALL_PHASES = frozenset(
 # 原地打转超过这个角度（约两圈）还没挪窝，就按卡滞处理
 MAX_SPIN_WITHOUT_MOVE = 12.6
 # 位置 2.6 s 不动（或转了两圈还没挪窝）就判定卡滞
-STUCK_TRIGGER_SECONDS = 2.6
+STUCK_TRIGGER_SECONDS = 2.0
+# 顶着墙/障碍物还在踩油门（碰撞）超过这么久、而车没怎么动，就立刻倒车脱困，
+# 不再傻等 STUCK_TRIGGER_SECONDS。
+BUMP_STUCK_SECONDS = 0.5
+# 去弓字起点（to_segment）最多磨多久 / 重规划几次就必须跳过这一段
+SEGMENT_NAV_SECONDS = 5.0
+SEGMENT_NAV_ATTEMPTS = 2
+# 倒车脱困：速度、距离、时间上限。原来 -0.22 m/s 退 1 m 要 4.5 s，卡一次就是
+# 一大截；车体半径才 0.18 m，退 1.2 m 足够让开墙面/障碍物拐角。
+ESCAPE_SPEED = -0.34
+ESCAPE_DISTANCE = 1.2
+ESCAPE_TIME_LIMIT = 4.0
+# 一个区域里最多用几次"沿历史路径倒车脱困"（再多就换阶段兜底，别在原地反复退）
+ESCAPE_LIMIT = 5
 # 这些阶段要按"净位移"判卡滞：10 s 内走不动 1 m 就算磨蹭
 PROGRESS_GUARD_PHASES = frozenset(
     (
@@ -237,6 +260,25 @@ class TaskManager(object):
         self._reset_state()
 
     # ----------------------------------------------------------- 基础状态
+    def _reset_mow_record(self, mode):
+        """新一次割草任务：清空上一份数据记录。"""
+        self.mow_track = []
+        self.mow_plan_segments = {}
+        self.mow_plan_edges = {}
+        self.mow_zone_records = []
+        self.mow_report = None
+        self.mow_report_written = False
+        self.mow_start_sim = self.robot.sim_time
+        self.mow_start_battery = self.robot.battery
+        self.mow_start_distance = self.robot.distance_traveled
+        self.mow_start_collisions = self.robot.collisions
+        self.mow_mode = mode
+        self.zone_start_sim = None
+        self.zone_stats_mark = dict(self.stats)
+        self.plan_anchor = None
+        self.plan_stuck = 0
+        self.plan_stuck_backtracks = 0
+
     def _reset_state(self):
         self.task = None
         self.phase = "idle"
@@ -316,6 +358,22 @@ class TaskManager(object):
         self.ring_scan_heading = 0.0
         self.task_start_sim = None
         self.task_end_sim = None
+        # ---- 割草数据记录（任务结束时写成报告） ----
+        self.mow_track = []              # 实际轨迹（按距离采样）
+        self.mow_plan_segments = {}      # 规划过的弓字线段：key -> (a, b)
+        self.mow_plan_edges = {}         # 每个区域的沿边规划线：zone_id -> points
+        self.mow_zone_records = []       # 每个区域割完时的数据快照
+        self.mow_report = None           # 最近一次生成的报告信息
+        self.mow_report_written = False
+        self.mow_start_sim = None
+        self.mow_start_battery = None
+        self.mow_start_distance = 0.0
+        self.mow_start_collisions = 0
+        self.zone_start_sim = None
+        self.zone_stats_mark = None
+        self.plan_anchor = None          # 上次"有进展"时的位置（重规划打转检测）
+        self.plan_stuck = 0
+        self.plan_stuck_backtracks = 0
         self.stats = {
             "segments_planned": 0,
             "rings": 0,
@@ -495,7 +553,12 @@ class TaskManager(object):
             selected_mode = str(mode or DEFAULT_MOWING_MODE).upper()
             if selected_mode not in ("A", "B"):
                 raise ValueError("割草模式仅支持 A/B")
-            order = _validate_zones(zone_order, available)
+            explicit_order = _validate_zones(zone_order, available)
+            if explicit_order:
+                order = explicit_order
+            else:
+                # 留空就按"离当前车位置最近"排区域，少跑区域之间的空趟
+                order = planner.order_zones_by_travel(self.grid.zones, self._pose()[:2])
             self._reset_state()
             self.mowing_mode = selected_mode
             self.task_serial += 1
@@ -505,10 +568,14 @@ class TaskManager(object):
             # 新任务从建图完成时的障碍层开始：清掉上次割草涂抹的障碍，边界建图保留。
             if self.grid.restore_obstacle_baseline():
                 self._log("info", "已重置区域内障碍涂抹（保留边界建图），本次任务重新识别障碍")
-            # B 模式先排弓字线，禁区多膨胀一点，避免机器贴着禁区边缘卡住
-            no_go_margin = 0.28 if selected_mode == "B" else 0.10
-            self.grid.apply_no_go(world.NO_GO, margin=no_go_margin)
+            # 禁区膨胀必须大于"反应式保护"的判定距离（车体半径 + 0.06），否则弓字线
+            # 会落在禁区保护带里：机器走到线段尽头就被判"前方是禁区"，停下来转向、
+            # 重规划，看起来就是在禁区边上一直改路线来回跑。A/B 统一按 0.28 m。
+            self.grid.apply_no_go(world.NO_GO, margin=NO_GO_MARGIN)
+            # 覆盖分母按"当前真正能割的格子"重算：禁区、已探明障碍物不该算进分母
+            self.grid.refresh_zone_totals()
             self.task = {"type": "mow", "zones": order, "mode": selected_mode}
+            self._reset_mow_record(selected_mode)
             self.zone_order = order
             self.zone_index = 0
             self.zone_id = order[0]
@@ -521,7 +588,32 @@ class TaskManager(object):
                     selected_mode, ", ".join(str(z) for z in order)
                 ),
             )
-            self._plan_to_zone_corner()
+            if not explicit_order:
+                self._log(
+                    "info",
+                    "区域顺序按路程就近排（{}）：先近后远，减少区域之间的空跑".format(
+                        "→".join(str(z) for z in order)
+                    ),
+                )
+            try:
+                self._plan_to_zone_corner()
+            except Exception as exc:  # pragma: no cover - 兜底，别让规划异常卡死任务
+                # 规划异常（以前沿边掩膜越界就会走到这里）不能留下一个"有任务但不动"
+                # 的状态：记一条告警，直接转入弓字覆盖（沿边留给后续补割），机器照常干活。
+                self._log(
+                    "warn",
+                    "前往区域 {} 的沿边路线规划失败（{}），改为先做弓字覆盖".format(
+                        self.zone_id, exc
+                    ),
+                )
+                self.route = []
+                self.route_kind = None
+                self.nav_goal = None
+                if self._zone() is None:
+                    self.phase = "idle"
+                else:
+                    self.zone_stage = "stripes"
+                    self.phase = "zone_plan"
 
     def stop_task(self, reason="任务已停止", resumable=True):
         with self.lock:
@@ -693,6 +785,21 @@ class TaskManager(object):
                     self.history.append((pose[0], pose[1]))
                     if self.phase in ZONE_TRAIL_PHASES:
                         self.zone_history.append((pose[0], pose[1]))
+                if (
+                    self.mow_track is not None
+                    and self.task is not None
+                    and self.task.get("type") == "mow"
+                    and (
+                        not self.mow_track
+                        or math.hypot(
+                            pose[0] - self.mow_track[-1][0],
+                            pose[1] - self.mow_track[-1][1],
+                        )
+                        >= TRACK_SAMPLE_STEP
+                    )
+                    and len(self.mow_track) < 40000
+                ):
+                    self.mow_track.append((round(pose[0], 3), round(pose[1], 3)))
 
             if self.replay.active:
                 self.replay.tick(dt)
@@ -742,13 +849,18 @@ class TaskManager(object):
     # 已经由栅格 blocked 层绕开禁区，再加保护会打断正常绕行。
     DOCK_PHASES = ("to_dock", "charge_go", "charge_return")
 
+    # 反应式禁区保护只在"没有走过 A* / 没有按禁区切段"的运动阶段兜底。
+    # 弓字（zone_stripes）的线段本身就按禁区膨胀切过了，再叠一层会在禁区拐角
+    # 反复停车→转向→重规划，机器就在禁区边上左右来回跑；这里把它去掉。
+    # 这些阶段允许"顶着障碍物不动 → 立刻倒车脱困"
+    BUMP_ESCAPE_PHASES = ("zone_stripes", "zone_edge", "to_segment", "detour", "ring")
+
     NO_GO_GUARD_PHASES = (
         "map_seek",
         "map_follow",
         "map_escape",
         "zone_edge",
         "corner_clean",
-        "zone_stripes",
         "detour",
         "ring",
     )
@@ -871,11 +983,12 @@ class TaskManager(object):
             self.stuck_ref = None
             self.stuck_time = 0.0
         if self.phase == "to_segment" and not self._dyn_yield and (
-            self.phase_time > 10.0 or self.stuck_time > STUCK_TRIGGER_SECONDS
+            self.phase_time > SEGMENT_NAV_SECONDS
+            or self.stuck_time > STUCK_TRIGGER_SECONDS
         ):
             self.replan_cooldown = 0.0
             self.segment_nav_attempts += 1
-            if self.segment_nav_attempts <= 3 and self._replan_route():
+            if self.segment_nav_attempts <= SEGMENT_NAV_ATTEMPTS and self._replan_route():
                 self.stuck_time = 0.0
                 self.stuck_ref = None
                 self.phase_time = 0.0
@@ -1026,7 +1139,7 @@ class TaskManager(object):
         self._log("warn", "检测到卡滞（{}），尝试后退沿历史路径脱困".format(phase))
         if phase == "zone_stripes" and self.segment is not None:
             self.failed_segments.add(_segment_key(self.segment_plan or self.segment))
-        if self.zone_escape_count < 3 and self._begin_escape(phase):
+        if self.zone_escape_count < ESCAPE_LIMIT and self._begin_escape(phase):
             self.zone_escape_count += 1
             self.stuck_time = 0.0
             self.stuck_ref = None
@@ -1112,7 +1225,7 @@ class TaskManager(object):
             path.append((point[0], point[1]))
             length += distance
             last = point
-            if length >= 1.0:
+            if length >= ESCAPE_DISTANCE:
                 break
         if not path or length < 0.20:
             return False
@@ -1134,7 +1247,7 @@ class TaskManager(object):
             if math.hypot(target[0] - x, target[1] - y) >= 0.12:
                 break
             self.escape_index += 1
-        if self.escape_index >= len(self.escape_path) or self.escape_time > 4.0:
+        if self.escape_index >= len(self.escape_path) or self.escape_time > ESCAPE_TIME_LIMIT:
             self._resume_after_escape()
             return 0.0, 0.0
         target = self.escape_path[self.escape_index]
@@ -1143,7 +1256,7 @@ class TaskManager(object):
         desired = world.wrap_angle(bearing + math.pi)
         err = world.wrap_angle(desired - theta)
         w = world.clamp(1.8 * err, -1.5, 1.5)
-        return -0.22, w
+        return ESCAPE_SPEED, w
 
     def _resume_after_escape(self):
         resume = self.escape_resume
@@ -2364,6 +2477,127 @@ class TaskManager(object):
             result.append((x, y))
         return result
 
+    def _record_zone_finish(self, zone_id):
+        """把这个区域的割草数据存成快照（任务结束时写进报告）。"""
+        if zone_id is None:
+            return
+        zone = self._zone(zone_id)
+        cell = self.grid.cell
+        free = self.grid.zone_totals.get(zone_id, 0)
+        mowed = self.grid.zone_mowed.get(zone_id, 0)
+        mark = self.zone_stats_mark or {}
+        self.mow_zone_records.append(
+            {
+                "id": zone_id,
+                "name": (zone or {}).get("name") or "区域 {}".format(zone_id),
+                "area": round(free * cell * cell, 2),
+                "mowed_area": round(mowed * cell * cell, 2),
+                "coverage": round(min(1.0, mowed / free) if free else 0.0, 4),
+                "start_sim": round(self.zone_start_sim or 0.0, 1),
+                "end_sim": round(self.robot.sim_time, 1),
+                "seconds": round(
+                    max(0.0, self.robot.sim_time - (self.zone_start_sim or 0.0)), 1
+                ),
+                "rings": self.stats.get("rings", 0) - mark.get("rings", 0),
+                "edge_skips": self.stats.get("edge_skips", 0) - mark.get("edge_skips", 0),
+                "segments_planned": self.stats.get("segments_planned", 0)
+                - mark.get("segments_planned", 0),
+                "lane_axis": self.main_lane_axis,
+                "coverage_retries": self.coverage_retries,
+            }
+        )
+
+    def _write_mow_report(self):
+        """全部区域割完后，把这次任务的数据写成 data/data 下的报告文档。"""
+        if self.mow_report is not None:
+            return self.mow_report
+        try:
+            import mow_report
+        except Exception as exc:  # pragma: no cover - 报告模块缺失不影响割草主流程
+            self._log("warn", "割草报告模块不可用：{}".format(exc))
+            return None
+        try:
+            report = mow_report.generate(self)
+        except Exception as exc:  # pragma: no cover - 写文件失败不该中断任务
+            self._log("warn", "割草报告生成失败：{}".format(exc))
+            return None
+        self.mow_report = report
+        self.mow_report_written = True
+        folder = report.get("folder")
+        self._log(
+            "event",
+            "割草报告已生成：{}（覆盖图 {}）".format(
+                (folder + "/" + os.path.basename(report["html"]))
+                if folder
+                else os.path.basename(report["html"]),
+                os.path.basename(report["png"]),
+            ),
+        )
+        return report
+
+    def _record_plan_edge(self, zone):
+        """记下这个区域的沿边规划线（报告里画"规划路径"用）。"""
+        if zone is None or not self.edge_points:
+            return
+        self.mow_plan_edges[zone["id"]] = [
+            (round(point[0], 3), round(point[1], 3)) for point in self.edge_points
+        ]
+
+    def _record_plan_segments(self, segments):
+        """记下规划过的弓字线段（去重，报告里画"规划路径"用）。"""
+        if not segments:
+            return
+        for segment in segments:
+            key = _segment_key(segment)
+            if key in self.mow_plan_segments:
+                continue
+            a, b = segment
+            self.mow_plan_segments[key] = (
+                (round(a[0], 3), round(a[1], 3)),
+                (round(b[0], 3), round(b[1], 3)),
+            )
+
+    def _plan_is_spinning(self, coverage_now):
+        """重规划在原地打转时，沿来路退一段而不是把主方向的弓字线全标失败。
+
+        返回 True 表示本帧已经处理过（调用方直接返回）。
+        """
+        pose = self._pose()
+        if self.plan_anchor is None:
+            moved = None
+        else:
+            moved = math.hypot(pose[0] - self.plan_anchor[0], pose[1] - self.plan_anchor[1])
+        if (
+            moved is None
+            or moved > 0.30
+            or coverage_now > self.last_plan_coverage + 0.005
+        ):
+            self.plan_anchor = (pose[0], pose[1])
+            self.plan_stuck = 0
+            return False
+        self.plan_stuck += 1
+        if self.plan_stuck < PLAN_STUCK_LIMIT:
+            return False
+        self.plan_stuck = 0
+        self.plan_anchor = (pose[0], pose[1])
+        if self.plan_stuck_backtracks >= PLAN_STUCK_BACKTRACKS:
+            # 退不出来就老老实实往下走（交给后面的补割/漏扫兜底）
+            self.failed_segments.clear()
+            return False
+        goal = None
+        if self.segments:
+            a, b = self.segments[0]
+            goal = self._segment_entry(a, b) or a
+        if goal is not None and self._start_backtrack(goal, "to_segment"):
+            # 这些线段本身没走不通，清掉"失败"标记，退出后再按原方向重排
+            self.failed_segments.clear()
+            self.plan_stuck_backtracks += 1
+            self.plan_anchor = None
+            self._log("warn", "弓字起点附近被顶住，沿来路退回后按原方向重新规划")
+            return True
+        self.failed_segments.clear()
+        return False
+
     def _preferred_lane_axis(self, zone):
         """整个区域的主弓字方向：沿着区域长边走。
 
@@ -2416,12 +2650,15 @@ class TaskManager(object):
             return
         self._reset_zone_progress()
         self.lane_axis = self.main_lane_axis = self._preferred_lane_axis(zone)
+        self.zone_start_sim = self.robot.sim_time
+        self.zone_stats_mark = dict(self.stats)
         if self.mowing_mode == "B":
             self.zone_stage = "stripes"
             self.phase = "zone_plan"
             self._log("event", "进入区域 {}：B 模式，先规划弓字覆盖".format(self.zone_id))
         else:
             self.edge_points = self._zone_edge_points(zone)
+            self._record_plan_edge(zone)
             self._prepare_edge_corners()
             self.zone_stage = "edge"
             self.edge_start_sim = self.robot.sim_time
@@ -2435,6 +2672,8 @@ class TaskManager(object):
             return
         self._reset_zone_progress()
         self.lane_axis = self.main_lane_axis = self._preferred_lane_axis(zone)
+        self.zone_start_sim = self.robot.sim_time
+        self.zone_stats_mark = dict(self.stats)
         self.edge_done = True
         self.zone_stage = "stripes"
         self.phase = "zone_plan"
@@ -2930,10 +3169,17 @@ class TaskManager(object):
             self.grid.stamp_footprint(circle["x"], circle["y"], circle["r"])
         # 只要覆盖率还在涨，就不把重规划计入"无效轮次"上限，避免大区域被提前结束。
         coverage_now = self.grid.zone_coverage(self.zone_id)
+        # 原地重规划保护：连着好几次重规划、车却没挪窝（也没多割到），说明车被顶住了，
+        # 不是这些弓字线走不到。以前这里靠"标记失败"往下走，会一股脑把主方向的线段
+        # 全标掉，主覆盖被迫提前换方向（看起来"先横着排、又改竖着排"）。现在先沿来路
+        # 退一段再按原方向重来。
+        if self._plan_is_spinning(coverage_now):
+            return
         if coverage_now > self.last_plan_coverage + 0.01:
             self.zone_plan_passes = 0
         self.last_plan_coverage = coverage_now
         raw_segments = self._node_lanes(zone, "COVERAGE")
+        self._record_plan_segments(raw_segments)
         filtered = [
             segment for segment in raw_segments if _segment_key(segment) not in self.failed_segments
         ]
@@ -2956,6 +3202,7 @@ class TaskManager(object):
                     for segment in vertical
                     if _segment_key(segment) not in self.failed_segments
                 ]
+                self._record_plan_segments(vertical)
                 self.segments = planner.order_segments(filtered, pose[:2], pose[2])
                 if self.segments:
                     self._log("info", "区域 {} 进行纵向补割".format(self.zone_id))
@@ -2975,6 +3222,7 @@ class TaskManager(object):
             self._complete_zone()
             return
         self.edge_points = self._zone_edge_points(zone)
+        self._record_plan_edge(zone)
         self.edge_index = 0
         self.edge_ringed_circles = []
         self._prepare_edge_corners()
@@ -3225,6 +3473,7 @@ class TaskManager(object):
             "event",
             "区域 {} 割草完成，覆盖率 {:.0f}%".format(self.zone_id, coverage * 100.0),
         )
+        self._record_zone_finish(self.zone_id)
         self.segments = []
         self.segment = None
         self.segment_plan = None
@@ -3240,6 +3489,7 @@ class TaskManager(object):
             self.zone_id = None
             self.phase = "to_dock"
             self._log("event", "全部区域割草完成，返回充电桩")
+            self._write_mow_report()
             self._set_route((world.DOCK["x"], world.DOCK["y"]), "mow_dock")
 
     # ----------------------------------------------------------- 绕障
@@ -3310,7 +3560,7 @@ class TaskManager(object):
             and circle.get("kind") == "large"
         ):
             self.grid.stamp_footprint(circle["x"], circle["y"], circle["r"])
-            self.bypassed_circles.append(dict(circle))
+            self._mark_bypassed(circle)
             if self.segment is not None:
                 self.failed_segments.add(_segment_key(self.segment_plan or self.segment))
             self.phase = "zone_plan"
@@ -3323,7 +3573,7 @@ class TaskManager(object):
             zone = self._zone()
             points = planner.ring_route(circle, (x, y), grid=self.grid, zone=zone)
             if not points:
-                self.bypassed_circles.append(dict(circle))
+                self._mark_bypassed(circle)
                 self._log("warn", "障碍物周围被其他障碍遮挡，跳过绕障并重新规划")
                 if source == "edge":
                     self._resume_edge_route()
@@ -3379,6 +3629,21 @@ class TaskManager(object):
             if distance <= circle["r"] + limit and (best is None or distance < best[0]):
                 best = (distance, circle)
         return best[1] if best else None
+
+    def _mark_bypassed(self, circle):
+        """把障碍物记成"已绕过"，同时盖进刀盘层。
+
+        只盖 `mow_blocked`（不改成占据格）：地图上还是真实轮廓，但规划弓字线时
+        会绕开这块，省掉"走到跟前 → 发现已绕过 → 跳过 → 重新规划"的反复折腾。
+        """
+        if circle is None:
+            return
+        if not self._is_bypassed(circle):
+            self.bypassed_circles.append(dict(circle))
+        try:
+            self.grid.block_for_mowing(circle["x"], circle["y"], circle["r"])
+        except (KeyError, TypeError):
+            pass
 
     def _is_bypassed(self, circle):
         for known in self.bypassed_circles:
@@ -3705,8 +3970,8 @@ class TaskManager(object):
         after = self.ring_after
         if self.ring_surface_tries >= RING_FALLBACK_LIMIT:
             self._log("warn", "绕障受阻（{}），跳过该障碍并重新规划".format(reason))
-            if circle is not None and not self._is_bypassed(circle):
-                self.bypassed_circles.append(dict(circle))
+            if circle is not None:
+                self._mark_bypassed(circle)
             self.ring_circle = None
             self.ring_points = []
             self.ring_index = 0
@@ -3719,8 +3984,8 @@ class TaskManager(object):
             self._finish_detour()
             return
         self.ring_surface_tries += 1
-        if circle is not None and not self._is_bypassed(circle):
-            self.bypassed_circles.append(dict(circle))
+        if circle is not None:
+            self._mark_bypassed(circle)
         self.ring_circle = None
         self.ring_points = []
         self.ring_index = 0
@@ -3794,7 +4059,7 @@ class TaskManager(object):
         after = self.ring_after
         self.ring_after = None
         if self.ring_circle is not None:
-            self.bypassed_circles.append(dict(self.ring_circle))
+            self._mark_bypassed(self.ring_circle)
             self.ring_circle = None
         clipped = self.ring_clipped
         self.ring_clipped = False
@@ -3927,6 +4192,19 @@ class TaskManager(object):
         if self.phase in ("zone_stripes", "zone_edge", "to_segment", "detour", "ring"):
             pose = self._pose()
             self.grid.relax_around(pose[0], pose[1], 0.45)
+        if (
+            self.stuck_time > BUMP_STUCK_SECONDS
+            and self.phase in self.BUMP_ESCAPE_PHASES
+            and self.zone_escape_count < ESCAPE_LIMIT
+            and self._begin_escape(self.phase)
+        ):
+            # 顶在墙/障碍物上还在往前踩：位置几乎没动，等 STUCK_TRIGGER_SECONDS 只是
+            # 白白磨时间，直接沿来路倒车脱困（车顶在墙角时这是最有效的一招）。
+            self.zone_escape_count += 1
+            self.stats["stuck_recoveries"] += 1
+            self.stuck_time = 0.0
+            self.stuck_ref = None
+            return
         if self.phase in ("zone_stripes", "zone_edge"):
             self.zone_bump_count += 1
         if self.phase == "zone_stripes" and self.zone_bump_count >= 2:
@@ -3973,7 +4251,7 @@ class TaskManager(object):
             circle = self._nearest_circle(self._pose()[0], self._pose()[1], 1.0)
             if circle is not None:
                 self.grid.stamp_footprint(circle["x"], circle["y"], circle["r"])
-                self.bypassed_circles.append(dict(circle))
+                self._mark_bypassed(circle)
             self.phase = "zone_plan"
         elif self.phase == "zone_stripes":
             self._begin_detour(self.phase)
@@ -4601,7 +4879,7 @@ class TaskManager(object):
             circle, self._pose()[:2], grid=self.grid, zone=self._zone()
         )
         if not points:
-            self.bypassed_circles.append(dict(circle))
+            self._mark_bypassed(circle)
             self._next_ring()
             return
         self.ring_circle = circle
@@ -4986,7 +5264,7 @@ def _validate_zones(raw, available):
             continue
         if value in available and value not in values:
             values.append(value)
-    return values or list(available)
+    return values
 
 
 def _front_distance(readings, half_angle_deg):

@@ -146,6 +146,83 @@ class ServerTest(unittest.TestCase):
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
+    def test_internal_error_returns_json_instead_of_dropping(self):
+        # 内部异常必须回一条 JSON（500），不能让浏览器看到"点了没反应"
+        with self.httpd.simulator.lock:
+            manager = self.httpd.manager
+            original = manager.start_mowing
+
+            def boom(*args, **kwargs):
+                raise RuntimeError("模拟内部错误")
+
+            manager.start_mowing = boom
+        try:
+            request = urllib.request.Request(
+                self.base + "/api/task",
+                data=json.dumps({"task": "mow", "zones": [1]}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as context:
+                urllib.request.urlopen(request, timeout=5)
+            self.assertEqual(context.exception.code, 500)
+            body = json.loads(context.exception.read().decode("utf-8"))
+            self.assertIn("模拟内部错误", body["error"])
+        finally:
+            with self.httpd.simulator.lock:
+                manager.start_mowing = original
+
+    def test_reports_endpoint_lists_folders(self):
+        import mow_report
+
+        previous = mow_report.OUTPUT_DIR
+        root = tempfile.mkdtemp(prefix="mow_reports_api_")
+        mow_report.OUTPUT_DIR = root
+        try:
+            folder = os.path.join(root, "2026-11-09_16-31-12")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "report.html"), "w", encoding="utf-8") as handle:
+                handle.write("<html><body>割草任务报告</body></html>")
+            with open(os.path.join(folder, "coverage.png"), "wb") as handle:
+                handle.write(b"\x89PNG\r\n\x1a\n")
+            _, body = self.get("/api/reports")
+            data = json.loads(body)
+            self.assertEqual(data["directory"], root)
+            self.assertEqual(len(data["reports"]), 1)
+            entry = data["reports"][0]
+            self.assertEqual(entry["folder"], "2026-11-09_16-31-12")
+            self.assertEqual(data["latest"], "/reports/2026-11-09_16-31-12/report.html")
+            status, html = self.get(data["latest"])
+            self.assertEqual(status, 200)
+            self.assertIn("割草任务报告", html)
+            with urllib.request.urlopen(
+                self.base + "/reports/2026-11-09_16-31-12/coverage.png", timeout=3
+            ) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers.get("Content-Type"), "image/png")
+                self.assertTrue(response.read().startswith(b"\x89PNG"))
+        finally:
+            mow_report.OUTPUT_DIR = previous
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_reports_latest_without_report_is_404(self):
+        import mow_report
+
+        previous = mow_report.OUTPUT_DIR
+        empty = tempfile.mkdtemp(prefix="mow_report_empty_")
+        mow_report.OUTPUT_DIR = empty
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as context:
+                self.get("/reports/latest")
+            self.assertEqual(context.exception.code, 404)
+            _, body = self.get("/api/reports")
+            data = json.loads(body)
+            self.assertEqual(data["reports"], [])
+            self.assertIsNone(data["latest"])
+        finally:
+            mow_report.OUTPUT_DIR = previous
+            shutil.rmtree(empty, ignore_errors=True)
+
     def test_start_mapping(self):
         _, state = self.post("/api/task", {"task": "map"})
         self.assertEqual(state["task"]["type"], "map")
@@ -546,6 +623,49 @@ class ServerTest(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as context:
             self.get("/../backend/server.py")
         self.assertIn(context.exception.code, (403, 404))
+
+    def test_editor_map_persists_and_reloads(self):
+        tmp = tempfile.mkdtemp()
+        original = server.editor_map_root
+        server.editor_map_root = lambda: tmp
+        registered = None
+        try:
+            definition = {
+                "name": "持久化/测试图",
+                "width": 12.0,
+                "height": 9.0,
+                "dock": {"x": 2.0, "y": 2.0, "r": 0.4},
+                "start": {"x": 3.0, "y": 2.0, "theta": 0.0},
+                "id": 987654,
+            }
+            path = server.persist_editor_map(definition)
+            self.assertTrue(os.path.isfile(path))
+            with open(path, encoding="utf-8") as handle:
+                saved = json.load(handle)
+            self.assertNotIn("id", saved)  # 编号只在运行时分配
+            self.assertEqual(saved["name"], "持久化/测试图")
+
+            self.assertEqual(server.load_persisted_editor_maps(), 1)
+            loaded = [
+                item for item in world.map_list() if item["name"] == "持久化/测试图"
+            ]
+            self.assertEqual(len(loaded), 1)
+            self.assertTrue(loaded[0]["editor"])
+            registered = loaded[0]["id"]
+            # 重复加载同一来源要覆盖同一编号，不能越读越多
+            self.assertEqual(server.load_persisted_editor_maps(), 1)
+            self.assertEqual(
+                len([m for m in world.map_list() if m["name"] == "持久化/测试图"]), 1
+            )
+        finally:
+            server.editor_map_root = original
+            if registered is not None:
+                try:
+                    world.delete_map(registered)
+                except ValueError:
+                    pass
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 
 if __name__ == "__main__":

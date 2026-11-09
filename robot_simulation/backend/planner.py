@@ -157,11 +157,21 @@ def _chamfer_distance(cells, cols, c0, c1, r0, r1, grid_rows=None):
 
 
 def _erode(cells, dist, width, c0, r0, threshold):
-    """按距离阈值腐蚀：距离 >= threshold 格的点保留。"""
+    """按距离阈值腐蚀：距离 >= threshold 格的点保留。
+
+    距离场只覆盖 bbox，bbox 以外的格子直接跳过。以前这里直接拿下标去取，
+    `col - c0 < 0` 会静默读到上一行末尾（腐蚀结果悄悄出错），越界的行则
+    直接 IndexError，把整条“开始割草”请求打断。
+    """
+    height = len(dist) // width if width else 0
     result = set()
     for cell in cells:
         col, row = cell
-        value = dist[(row - r0) * width + (col - c0)]
+        dcol = col - c0
+        drow = row - r0
+        if dcol < 0 or dcol >= width or drow < 0 or drow >= height:
+            continue
+        value = dist[drow * width + dcol]
         if value >= threshold:
             result.add(cell)
     return result
@@ -275,8 +285,13 @@ def edge_route_mask(grid, zone, start_xy, inset=None):
     # 回墙根，再按 inset 腐蚀，路线才会真正贴着墙走。
     cells = _grow_into_open(grid, cells, steps=EDGE_GROW_CELLS)
     cell = grid.cell
-    c0, r0 = grid.cell_of(zone["x0"], zone["y0"])
-    c1, r1 = grid.cell_of(zone["x1"], zone["y1"])
+    # 距离场 bbox 必须按“外扩后的实际栅格”来算：zone["x0"/"x1"] 是 round(…, 2) 的
+    # 结果，int(x / cell) 截断后可能比真实格数少一格，外扩出去的格子就落到距离场
+    # 外面（腐蚀时越界，整条"开始割草"直接失败）。
+    c0 = min(col for col, _row in cells)
+    c1 = max(col for col, _row in cells)
+    r0 = min(row for _col, row in cells)
+    r1 = max(row for _col, row in cells)
     c0 = max(0, c0 - 1)
     r0 = max(0, r0 - 1)
     c1 = min(grid.cols - 1, c1 + 1)
@@ -431,6 +446,50 @@ def _snap_route_to_wall(grid, points, target=None, reach=0.90, centre=None):
 def edge_route_grid(grid, zone, start_xy, clearance=None):
     """兼容旧名字：现在统一走「交集 + 腐蚀」的掩膜方案。"""
     return edge_route_mask(grid, zone, start_xy, inset=clearance)
+
+
+def order_zones_by_travel(zones, start_xy):
+    """按"离当前位置最近"的顺序排区域（贪心最近邻），少跑区域之间的空趟。
+
+    用每个区域的外轮廓点算距离（比质心准：长条形区域质心可能离机器人很远），
+    选完一个区域后，把"当前点"挪到该区域外轮廓上离其余区域最近的那一点，相当于
+    从区域的"出口"出发找下一个区域。区域顺序本来就只能人工指定，这里只在留空
+    时给一个更省路线的顺序。
+    """
+    remaining = [zone for zone in zones if zone.get("outline")]
+    if len(remaining) < 2:
+        return [zone["id"] for zone in zones]
+    order = []
+    cur = (float(start_xy[0]), float(start_xy[1]))
+    while remaining:
+        best = None
+        for zone in remaining:
+            outline = zone["outline"]
+            distances = [math.hypot(x - cur[0], y - cur[1]) for x, y in outline]
+            index = min(range(len(distances)), key=distances.__getitem__)
+            if best is None or distances[index] < best[0]:
+                best = (distances[index], zone, outline[index])
+        _, zone, _entry = best
+        order.append(zone["id"])
+        remaining.remove(zone)
+        if not remaining:
+            break
+        # 采样其余区域的外轮廓，避免大图上逐个点两两相乘
+        others = []
+        for other in remaining:
+            others.extend(other["outline"][::3])
+        outline = zone["outline"][::2] or zone["outline"]
+        cur = min(
+            outline,
+            key=lambda point: min(
+                math.hypot(point[0] - ox, point[1] - oy) for ox, oy in others
+            ),
+        )
+    # 没有轮廓的区域（理论上不会出现）按原顺序补在后面
+    for zone in zones:
+        if zone["id"] not in order:
+            order.append(zone["id"])
+    return order
 
 
 def lane_segments(grid, zone, spacing=None, axis="h"):
