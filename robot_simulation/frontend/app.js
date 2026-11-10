@@ -55,8 +55,6 @@
     mapText: document.getElementById("mapText"),
     overallFill: document.getElementById("overallFill"),
     overallText: document.getElementById("overallText"),
-    taskDistance: document.getElementById("taskDistance"),
-    taskDuration: document.getElementById("taskDuration"),
     mowMode: document.getElementById("mowMode"),
     moduleBtn: document.getElementById("moduleBtn"),
     moduleMenu: document.getElementById("moduleMenu"),
@@ -94,6 +92,7 @@
     themeSelect: document.getElementById("themeSelect"),
     logDock: document.querySelector(".log-dock"),
     logToggleBtn: document.getElementById("logToggleBtn"),
+    dockTab: document.getElementById("dockTab"),
     logCount: document.getElementById("logCount"),
     paramTabs: Array.from(document.querySelectorAll("[data-param-tab]")),
     paramPanes: Array.from(document.querySelectorAll("[data-param-pane]")),
@@ -126,9 +125,10 @@
     bagPlayBtn: document.getElementById("bagPlayBtn"),
     bagPauseBtn: document.getElementById("bagPauseBtn"),
     bagStopBtn: document.getElementById("bagStopBtn"),
-    bagSpeed: document.getElementById("bagSpeed"),
     bagProgress: document.getElementById("bagProgress"),
     bagTime: document.getElementById("bagTime"),
+    bagBar: document.getElementById("bagBar"),
+    bagWorld: document.getElementById("bagWorld"),
     bagHint: document.getElementById("bagHint"),
     bagFidelity: document.getElementById("bagFidelity"),
     bagErrAvg: document.getElementById("bagErrAvg"),
@@ -327,15 +327,42 @@
     return response.json();
   }
 
+  // 世界时间 = 日志当时的墙钟时间（消息头里的 Unix 时间戳），不是仿真时钟
+  function wallClockText(epochSeconds) {
+    if (!epochSeconds) return "--";
+    const date = new Date(Number(epochSeconds) * 1000);
+    if (Number.isNaN(date.getTime())) return "--";
+    const pad = (v) => String(v).padStart(2, "0");
+    // 用 UTC 显示：日志里的时间戳就是 UTC，这样和包名（zmqbag_x_YYYY-MM-DD-HH-MM-SS）对得上
+    return (
+      pad(date.getUTCMonth() + 1) + "-" + pad(date.getUTCDate()) + " " +
+      pad(date.getUTCHours()) + ":" + pad(date.getUTCMinutes()) + ":" + pad(date.getUTCSeconds())
+    );
+  }
+
+  let lastEditorLock = "";
+
   function ingest(state) {
     previous = current || state;
     current = state;
     currentAt = performance.now();
+    if (state.queue) renderBagQueue(state.queue);
+    if (state.bag) renderBagBar(state.bag);
+    // 编辑按钮的可用性跟着任务/回放状态变：状态轮询里必须刷新一次，
+    // 否则"忙的时候禁用 → 停止后按钮永远灰着"（地图编辑点了没反应）。
+    const editing = (state.draft && state.draft.active) || false;
+    const editorLock = (editorTaskBusy(state) ? "busy" : "idle") + "|" + (editing ? "on" : "off");
+    if (editorLock !== lastEditorLock) {
+      lastEditorLock = editorLock;
+      updateEditorUI();
+    }
 
     const replaying = !!(state.bag && state.bag.loaded);
+    // 连续播放会自动换日志、重建场地、时间轴归零：这些都不能把上一段的路径抹掉，
+    // 只有手动载入日志 / 复位才清除轨迹。
+    const queueRunning = !!(bagQueue && bagQueue.active);
     if (lastMapId !== null && state.map_id !== lastMapId) {
-      // 连续播放日志会重建场地，这里保留轨迹以便对照上一段作业
-      if (!replaying) trail = [];
+      if (!replaying && !queueRunning) trail = [];
       mapVersion = -1;
       zoneAutoValue = "";
       zoneInputDirty = false;
@@ -364,7 +391,7 @@
     editorApplyDraft(state.draft);
     editorSampleTrace(state);
 
-    if (state.time + 1e-6 < lastSampleTime && !replaying) {
+    if (state.time + 1e-6 < lastSampleTime && !replaying && !queueRunning) {
       trail = [];
       previous = state;
       mapVersion = -1;
@@ -375,23 +402,31 @@
     const teleports = Number(bag.teleports || 0);
     const restarts = Number(bag.restarts || 0);
     const logName = bag.name || "";
-    const bagRestarted =
-      (logName && lastLogName && logName !== lastLogName) ||
-      restarts > lastRestarts ||
-      (!!bag.active && !lastBagActive);
+    const queuePlaying = !!(bagQueue && bagQueue.active);
+    const nameChanged = !!(logName && lastLogName && logName !== lastLogName);
+    let switchedBag = false;
+    if (nameChanged) {
+      // 连续播放会自动换日志：路径要接着画（只在手动载入/复位时清除），
+      // 两段之间用红色跳线连一下，免得看着像一条连续的作业路径。
+      if (!queuePlaying) trail = [];
+      else switchedBag = true;
+      lastRestarts = restarts;
+      lastBagActive = !!bag.active;
+    } else if (restarts > lastRestarts) {
+      // 拖了进度条：从当前位置重新起笔画，不画"初始跳线"
+      trail = [];
+    } else if (!!bag.active && !lastBagActive && !queuePlaying) {
+      trail = [];
+    }
     lastRestarts = restarts;
     lastBagActive = !!bag.active;
     if (logName) lastLogName = logName;
-    if (bagRestarted) {
-      // 刚开始回放 / 换日志 / 拖了进度条：从当前位置重新起笔画，不画"初始跳线"
-      trail = [];
-    }
 
     const tail = trail[trail.length - 1];
     const step = tail ? Math.hypot(state.pose.x - tail.x, state.pose.y - tail.y) : 0.0;
     if (!tail || step > 0.02) {
-      // 回放中发生重定位、或位置突然跳很远：这一段画成红色跳线
-      const jump = !!tail && (teleports > lastTeleportsMark || step > 2.0);
+      // 回放中发生重定位、换包、或位置突然跳很远：这一段画成红色跳线
+      const jump = !!tail && (teleports > lastTeleportsMark || step > 2.0 || switchedBag);
       lastTeleportsMark = teleports;
       trail.push({ x: state.pose.x, y: state.pose.y, jump });
       if (trail.length > TRAIL_LIMIT) trail.shift();
@@ -585,9 +620,12 @@
   }
 
   function editorTaskBusy(state) {
-    const task = (state || current || {}).task || {};
+    const snapshot = state || current || {};
+    const task = snapshot.task || {};
     const phase = task.phase || "idle";
-    return !!task.type && !["idle", "done", "stopped"].includes(phase);
+    if (!!task.type && !["idle", "done", "stopped"].includes(phase)) return true;
+    // 日志回放还在跑也算"任务进行中"：这时改地图会被仿真覆盖
+    return !!((snapshot.bag || {}).active);
   }
 
   function editorSay(text, tone) {
@@ -1932,18 +1970,6 @@
     });
   }
 
-  function formatDuration(seconds) {
-    const total = Math.max(0, Math.floor(seconds || 0));
-    const minutes = Math.floor(total / 60);
-    const rest = total % 60;
-    if (minutes >= 60) {
-      const hours = Math.floor(minutes / 60);
-      const mins = minutes % 60;
-      return hours + ":" + String(mins).padStart(2, "0") + ":" + String(rest).padStart(2, "0");
-    }
-    return String(minutes).padStart(2, "0") + ":" + String(rest).padStart(2, "0");
-  }
-
   function updateMission(task, state) {
     const mapProgress = clamp(task.map_progress || 0, 0, 1);
     const coverage = clamp(task.coverage || 0, 0, 1);
@@ -1956,8 +1982,6 @@
     els.mapText.textContent = (mapProgress * 100).toFixed(2) + "%";
     els.overallFill.style.width = (overall * 100).toFixed(2) + "%";
     els.overallText.textContent = (overall * 100).toFixed(2) + "%";
-    els.taskDistance.textContent = Math.round(Number(task.distance || state.distance || 0));
-    els.taskDuration.textContent = formatDuration(task.duration || 0);
     els.missionMessage.textContent = task.message || "";
     els.speedButtons.forEach((button) => {
       button.classList.toggle("active", Number(button.dataset.speed) === state.speed);
@@ -2607,7 +2631,10 @@
       for (let col = 0; col < width; col += 1) {
         const digit = line.charCodeAt(col) - 48;
         if (digit <= 0) continue;
-        const offset = (row * width + col) * 4;
+        // 栅格行 0 是最小 y，而画布第 0 行在最上面：写图时翻转过来，
+        // 这样按 origin 直接叠上去才和真实地图重合（之前漏了这一步，
+        // 整块代价地图上下镜像，看着像"转了一个角度"）。
+        const offset = ((height - 1 - row) * width + col) * 4;
         if (digit >= 9) {
           data[offset] = 255;
           data[offset + 1] = 96;
@@ -2627,7 +2654,7 @@
       }
     }
     cctx.putImageData(image, 0, 0);
-    layer.flipRows = true;
+    layer.flipRows = true;  // 已在上面的 offset 里翻转过
     costmapLayer = layer;
     costmapVersion += 1;
   }
@@ -2639,7 +2666,7 @@
     const height = costmapLayer.height;
     const resolution = costmapLayer.resolution;
     if (!width || !height || !resolution) return;
-    // 栅格行 0 是最小 y：画布 y 轴向下，需要用负高度翻转绘制
+    // 图像已经翻成"第 0 行在最上"，按 origin 左上角直接贴即可
     const left = geom.x(costmapLayer.origin[0]);
     const top = geom.y(costmapLayer.origin[1] + height * resolution);
     ctx.save();
@@ -3333,96 +3360,162 @@
     });
   }
 
-  // ------------------------------------------------------------- 独立窗口（弹窗）
-  const POPUP_CSS = [
-    "html,body{margin:0;height:100%;background:var(--bg);color:var(--text);",
-    "font-family:'Segoe UI','PingFang SC','Microsoft YaHei',system-ui,sans-serif;font-size:12px}",
-    ".popup-host{height:100%;box-sizing:border-box}",
-  ].join("");
-  const popups = {};
+  // ------------------------------------------------------- 独立窗口（页面内浮层）
+  // 以前用 window.open 开浏览器弹窗：一操作主界面/地图，弹窗就被主窗口压到后面看不见了。
+  // 现在改成**页面内浮层**（position: fixed + 高 z-index），永远压在界面和地图上层；
+  // 可拖动、可拉伸，位置和大小记在 localStorage 里。
+  const floatKey = "mower.floatPanels";
+  const floatPanels = {};
   const bagPlayerEl = document.querySelector(".bag-player");
+
+  function loadFloatLayout() {
+    try {
+      return JSON.parse(localStorage.getItem(floatKey) || "{}") || {};
+    } catch (error) {
+      return {};
+    }
+  }
+
+  function saveFloatLayout(key, panel) {
+    const layout = loadFloatLayout();
+    layout[key] = {
+      left: panel.offsetLeft,
+      top: panel.offsetTop,
+      width: panel.offsetWidth,
+      height: panel.offsetHeight,
+    };
+    try {
+      localStorage.setItem(floatKey, JSON.stringify(layout));
+    } catch (error) {
+      /* ignore */
+    }
+  }
 
   function popupWindow(key, node, options) {
     const opts = options || {};
-    const known = popups[key];
-    if (known && !known.win.closed) {
-      known.win.focus();
-      return known.win;
+    const known = floatPanels[key];
+    if (known && known.panel.isConnected) {
+      known.panel.style.zIndex = String(nextFloatZ());
+      return known.panel;
     }
-    const size =
-      "width=" + (opts.width || 560) + ",height=" + (opts.height || 420) +
-      ",menubar=no,toolbar=no,location=no,status=no,alwaysRaised=yes";
-    const win = window.open("", "mower-" + key, size);
-    if (!win) {
-      setBagHint("浏览器拦截了弹出窗口，请允许弹窗后重试", 6000);
-      return null;
-    }
-    const doc = win.document;
-    doc.open();
-    doc.write(
-      "<!DOCTYPE html><html><head><meta charset='utf-8'><title>" +
-        (opts.title || "机器人控制台") +
-        "</title></head><body></body></html>"
-    );
-    doc.close();
-    doc.documentElement.dataset.theme = document.documentElement.dataset.theme || "dark";
-    const link = doc.createElement("link");
-    link.rel = "stylesheet";
-    link.href = location.origin + "/styles.css";
-    doc.head.appendChild(link);
-    const style = doc.createElement("style");
-    style.textContent = POPUP_CSS;
-    doc.head.appendChild(style);
-    const host = doc.createElement("div");
-    host.className = "popup-host";
-    doc.body.appendChild(host);
+    const panel = document.createElement("div");
+    panel.className = "float-panel";
+    panel.dataset.key = key;
+    panel.style.zIndex = String(nextFloatZ());
+
+    const bar = document.createElement("div");
+    bar.className = "float-panel__bar";
+    const title = document.createElement("span");
+    title.className = "float-panel__title";
+    title.textContent = opts.title || "机器人控制台";
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "float-panel__back";
+    back.textContent = "收回";
+    back.title = "收回到主界面";
+    bar.appendChild(title);
+    bar.appendChild(back);
+
+    const body = document.createElement("div");
+    body.className = "float-panel__body";
+    panel.appendChild(bar);
+    panel.appendChild(body);
+    document.body.appendChild(panel);
+
+    const layout = loadFloatLayout()[key] || {};
+    const width = Math.min(layout.width || opts.width || 560, window.innerWidth - 40);
+    const height = Math.min(layout.height || opts.height || 420, window.innerHeight - 40);
+    panel.style.width = width + "px";
+    panel.style.height = height + "px";
+    panel.style.left =
+      Math.max(0, Math.min(layout.left, window.innerWidth - width - 8) || window.innerWidth - width - 24) + "px";
+    panel.style.top = Math.max(0, layout.top || 64) + "px";
+
     const parent = node.parentNode;
     const next = node.nextSibling;
     node.classList.add("is-popped");
-    host.appendChild(node);
-    popups[key] = { win, node, parent, next };
-    // 只在弹窗真的被关掉时收回节点（失焦 / 切到主窗口时不能消失）
+    body.appendChild(node);
+    floatPanels[key] = { panel, node, parent, next };
+
+    back.addEventListener("click", () => restorePopup(key));
+    panel.addEventListener("pointerdown", () => {
+      panel.style.zIndex = String(nextFloatZ());
+    });
+    makeFloatDraggable(panel, bar);
     refreshPopupBack();
-    try {
-      win.focus();
-    } catch (error) {
-      /* 某些浏览器不允许脚本抢焦点，忽略 */
-    }
-    return win;
+    return panel;
+  }
+
+  let floatZ = 9000;
+  function nextFloatZ() {
+    floatZ += 1;
+    return floatZ;
+  }
+
+  function makeFloatDraggable(panel, handle) {
+    let startX = 0;
+    let startY = 0;
+    let baseLeft = 0;
+    let baseTop = 0;
+    let dragging = false;
+    handle.addEventListener("pointerdown", (event) => {
+      if (event.target.closest("button")) return;
+      dragging = true;
+      startX = event.clientX;
+      startY = event.clientY;
+      baseLeft = panel.offsetLeft;
+      baseTop = panel.offsetTop;
+      handle.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    });
+    handle.addEventListener("pointermove", (event) => {
+      if (!dragging) return;
+      const left = baseLeft + (event.clientX - startX);
+      const top = baseTop + (event.clientY - startY);
+      panel.style.left = Math.max(0, Math.min(left, window.innerWidth - 80)) + "px";
+      panel.style.top = Math.max(0, Math.min(top, window.innerHeight - 40)) + "px";
+    });
+    const finish = (event) => {
+      if (!dragging) return;
+      dragging = false;
+      try {
+        handle.releasePointerCapture(event.pointerId);
+      } catch (error) {
+        /* ignore */
+      }
+      saveFloatLayout(panel.dataset.key, panel);
+    };
+    handle.addEventListener("pointerup", finish);
+    handle.addEventListener("pointercancel", finish);
   }
 
   function restorePopup(key) {
-    const record = popups[key];
+    const record = floatPanels[key];
     if (!record) return;
-    delete popups[key];
-    if (!record.win.closed) {
-      try {
-        record.win.close();
-      } catch (error) {
-        /* 关闭失败时只把节点搬回来 */
-      }
-    }
+    delete floatPanels[key];
+    saveFloatLayout(key, record.panel);
     record.node.classList.remove("is-popped");
     if (record.parent && record.parent.isConnected && record.node.parentNode !== record.parent) {
       const anchor = record.next && record.next.parentNode === record.parent ? record.next : null;
       record.parent.insertBefore(record.node, anchor);
     }
+    if (record.panel.isConnected) record.panel.remove();
     refreshPopupBack();
   }
 
   function refreshPopupBack() {
     if (!els.popupBackBtn) return;
-    const open = Object.keys(popups).some((key) => !popups[key].win.closed);
+    const open = Object.keys(floatPanels).some((key) => floatPanels[key].panel.isConnected);
     els.popupBackBtn.hidden = !open;
   }
 
   function recallPopups() {
-    Object.keys(popups).forEach((key) => restorePopup(key));
+    Object.keys(floatPanels).forEach((key) => restorePopup(key));
   }
 
   function syncPopups() {
-    Object.keys(popups).forEach((key) => {
-      if (popups[key].win.closed) restorePopup(key);
+    Object.keys(floatPanels).forEach((key) => {
+      if (!floatPanels[key].panel.isConnected) restorePopup(key);
     });
   }
 
@@ -3626,7 +3719,7 @@
 
   const LAYER_LABELS = {
     pose: "仿真实际轨迹（跳变处画细线）",
-    costmap: "日志代价地图叠加（机器人周围的红/橙方块就是它）",
+    costmap: "日志局部代价地图（窗口随车滚动时机器人会落在窗口里；否则按日志自己的坐标摆放，和真实地图逐格对齐）",
     static_costmap: "静态代价地图（当前未叠加显示）",
     image: "日志图像窗口",
     map: "日志真实地图（已作为仿真场地，不能隐藏）",
@@ -3689,6 +3782,31 @@
     els.bagQueueInfo.textContent = (queue.active ? "连续播放 " : "队列 ") + index + "/" + total;
   }
 
+  // 任务操作栏里的回放条：平时禁用，载入日志后才可用。
+  // 直接吃 /api/state 里的 bag 状态，这样即使不打开日志播放面板也会实时更新。
+  function renderBagBar(state) {
+    const bag = state || {};
+    const loaded = !!bag.loaded;
+    if (els.bagBar) els.bagBar.classList.toggle("is-idle", !loaded);
+    if (els.bagCurrentName) {
+      els.bagCurrentName.textContent = loaded && bag.name ? bag.name : "未载入日志";
+    }
+    if (els.bagTime) {
+      els.bagTime.textContent = loaded
+        ? Number(bag.time || 0).toFixed(1) + " / " + Number(bag.duration || 0).toFixed(1) + " s"
+        : "--";
+    }
+    if (els.bagWorld) {
+      els.bagWorld.textContent = loaded ? wallClockText(bag.wall_time) : "--";
+    }
+    const paused = loaded && bag.active && !bag.playing && !bag.finished;
+    if (els.bagPlayBtn) {
+      els.bagPlayBtn.disabled = !loaded;
+      els.bagPlayBtn.textContent = paused ? "继续" : "播放";
+    }
+    if (els.bagPauseBtn) els.bagPauseBtn.disabled = !loaded || !bag.playing;
+  }
+
   function renderBagState(state) {
     if (!state || !els.bagTime) return;
     bagState = state;
@@ -3699,6 +3817,7 @@
       els.bagProgress.value = String(Math.round(ratio * 1000));
     }
     els.bagTime.textContent = time.toFixed(1) + " / " + duration.toFixed(1) + " s";
+    renderBagBar(state);
     const percent = state.samples ? (state.fidelity * 100).toFixed(1) : "--";
     els.bagFidelity.textContent = percent === "--" ? "--" : percent + "%";
     els.bagFidelity.classList.toggle("is-good", state.samples > 0 && state.fidelity >= 0.9);
@@ -3731,8 +3850,13 @@
     }
     if (els.bagCostInfo) {
       const cost = maps.grid_costmap;
+      // 只有日志里的窗口本身是"随车滚动"发布时，叠加层才会跟着车走
+      const follow =
+        state.alignment === "costmap" || state.alignment === "map" || state.pose_frame === "map"
+          ? " · 随车"
+          : " · 按日志坐标";
       els.bagCostInfo.textContent = cost
-        ? cost.size[0] + "×" + cost.size[1] + " m · " + (cost.frames || 1) + " 帧"
+        ? cost.size[0] + "×" + cost.size[1] + " m · " + (cost.frames || 1) + " 帧" + follow
         : "--";
     }
     if (state.loaded && state.name && state.name !== bagLiveName) {
@@ -3760,11 +3884,9 @@
     }
     if (els.bagPlayBtn) {
       const paused = state.loaded && state.active && !state.playing && !state.finished;
-      els.bagPlayBtn.textContent = paused ? "继续" : "播放";
       els.bagPlayBtn.title = paused
         ? "从暂停位置继续回放"
         : "从头播放（已暂停时可直接继续）";
-      els.bagPauseBtn.disabled = !state.playing;
     }
     updateBagVideo(state);
     if (els.bagVideoToggleBtn) {
@@ -3811,7 +3933,7 @@
         clearInterval(bagImageTimer);
         bagImageTimer = 0;
       }
-      if (popups.video && !popups.video.win.closed) popups.video.win.close();
+      if (floatPanels.video) restorePopup("video");
       return;
     }
     if (els.bagVideoTitle && state.image_topic) {
@@ -3962,8 +4084,8 @@
       if (!bagVideoClosed) {
         refreshBagImage(true);
       }
-      if (bagVideoClosed && popups.video && !popups.video.win.closed) {
-        popups.video.win.close();
+      if (bagVideoClosed && floatPanels.video) {
+        restorePopup("video");
       }
       updateBagVideo(bagState);
       els.bagVideoToggleBtn.setAttribute("aria-pressed", bagVideoClosed ? "false" : "true");
@@ -3987,7 +4109,7 @@
     els.bagVideoCloseBtn.addEventListener("click", () => {
       bagVideoClosed = true;
       els.bagVideo.hidden = true;
-      if (popups.video && !popups.video.win.closed) popups.video.win.close();
+      if (floatPanels.video) restorePopup("video");
     });
   }
 
@@ -4013,11 +4135,6 @@
     });
     els.bagPauseBtn.addEventListener("click", () => bagControl("pause"));
     els.bagStopBtn.addEventListener("click", () => bagControl("stop"));
-    els.bagSpeed.addEventListener("change", () => {
-      // 回放倍速叠加在仿真倍速上：直接改仿真速度
-      const factor = Number(els.bagSpeed.value) || 1;
-      send("/api/speed", { speed: factor >= 4 ? 4 : factor });
-    });
     els.bagProgress.addEventListener("pointerdown", () => {
       bagDragging = true;
     });
@@ -4288,6 +4405,8 @@
       els.logToggleBtn.textContent = logHidden ? "展开" : "收起";
       els.logToggleBtn.setAttribute("aria-expanded", String(!logHidden));
     }
+    // 完全收起后整块 dock 不占地方，底部留一个小提手再展开（和左侧栏一致）
+    if (els.dockTab) els.dockTab.hidden = !logHidden;
   }
 
   function toggleCollapsed(panel) {
@@ -4319,14 +4438,18 @@
     localStorage.setItem(COLLAPSE_KEY, JSON.stringify(collapsed));
     applyCollapsed();
   });
+  function toggleDock() {
+    collapsed.events = collapsed.events !== true;
+    localStorage.setItem(COLLAPSE_KEY, JSON.stringify(collapsed));
+    applyCollapsed();
+  }
   if (els.logToggleBtn) {
     els.logToggleBtn.addEventListener("click", (event) => {
       event.stopPropagation();
-      collapsed.events = collapsed.events !== true;
-      localStorage.setItem(COLLAPSE_KEY, JSON.stringify(collapsed));
-      applyCollapsed();
+      toggleDock();
     });
   }
+  if (els.dockTab) els.dockTab.addEventListener("click", toggleDock);
   applyCollapsed();
 
   // ------------------------------------------------------------- 地图缩放/坐标

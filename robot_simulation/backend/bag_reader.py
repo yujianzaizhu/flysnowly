@@ -17,6 +17,15 @@ import struct
 
 BAG_SUFFIXES = (".bag", ".db3", ".sqlite", ".sqlite3")
 POSE_TOPICS = ("base_pose", "odom_data")
+# 动态坐标变换（world → base_link1 等）：孩子帧的位置就是"地图坐标系下的真实位姿"。
+# base_pose / odom_data 常常是另一套局部坐标系（实测要转 ~150° 才能对上地图），
+# 用它们回放会让轨迹落错地方、代价地图看着"不跟车"。
+TF_TOPIC = "tf_dynamic"
+TF_POSE_CHILDREN = ("base_link1", "base_link", "base_car_link", "wio_link_local")
+# 选作位姿源的判据：真的在动、落在地图自由区、且和代价地图窗口中心基本重合
+TF_MIN_SPAN = 2.0
+TF_MIN_FREE_RATIO = 0.90
+TF_MAX_WINDOW_GAP = 0.60
 # 地图 / 代价地图话题（都在 Zmqmsg 表里，消息体是带 map_info 的占据栅格）
 MAP_TOPICS = ("whole_map", "grid_costmap", "static_costmap")
 COSTMAP_TOPIC = "grid_costmap"
@@ -36,6 +45,13 @@ TOPIC_LAYERS = {
 }
 # 电量话题的关键字（日志里有就按它显示，没有就保持 100%）
 BATTERY_HINTS = ("battery", "battery_state", "batt", "power", "soc", "bms")
+# 同一时刻重复的位姿（odom_data 里大量存在，TI 差 <1 ms）：只留最后一条，
+# 否则插值跨度接近 0，回放里的参考点会来回抽动。
+POSE_DUP_WINDOW = 0.001
+# 相邻位姿的"等价速度"超过它、且位移够大 → 日志自己发生了重定位（换坐标系/重新定位），
+# 不是控制误差，回放时允许同步对齐（界面画成红色跳线），不要硬追。
+POSE_JUMP_SPEED = 1.5
+POSE_JUMP_STEP = 0.35
 
 WIRE_VARINT = 0
 WIRE_64BIT = 1
@@ -177,6 +193,62 @@ def _decode_twist(blob):
     return linear, angular
 
 
+def _decode_header_stamp(blob):
+    """取消息头里的墙钟时间戳（返回 Unix 秒）；不是纪元时间（太小）就返回 None。
+
+    两种写法都认：直接一个 int64 纳秒（本仓库的日志），或者
+    ``builtin_interfaces/Time {sec, nanosec}`` 子消息（标准 ROS 2 头）。
+    """
+    try:
+        top = _parse_message(blob)
+        header = _first_bytes(top, 1)
+        if header is None:
+            return None
+        for field, wire, value in _parse_message(header):
+            if field != 2:
+                continue
+            if wire == WIRE_VARINT:
+                return value / 1e9 if value >= 1e18 else None
+            if wire == WIRE_LENGTH:
+                inner = _numbers(_parse_message(value))
+                seconds = inner.get(1, 0) + inner.get(2, 0) / 1e9
+                return seconds if seconds >= 1e9 else None
+    except (BagError, IndexError, struct.error):
+        return None
+    return None
+
+
+def _decode_tf(blob):
+    """解析 tf_dynamic：{header, child_frame, transform{translation, rotation}}。
+
+    只关心"孩子帧在地图坐标系里的位置"，所以返回 (x, y, yaw, child)。
+    """
+    try:
+        top = _parse_message(blob)
+        body = _first_bytes(top, 1)
+        if body is None:
+            return None
+        inner = _parse_message(body)
+        child = _first_bytes(inner, 2)
+        transform = _first_bytes(inner, 3)
+        if transform is None:
+            return None
+        payload = _parse_message(transform)
+        position = _first_bytes(payload, 1)
+        if position is None:
+            return None
+        pos = _numbers(_parse_message(position))
+        orientation = _first_bytes(payload, 2)
+        quat = _numbers(_parse_message(orientation)) if orientation else {}
+    except (BagError, IndexError, struct.error):
+        return None
+    name = (child or b"").decode("utf-8", "replace")
+    yaw = _yaw_from_quaternion(
+        quat.get(1, 0.0), quat.get(2, 0.0), quat.get(3, 0.0), quat.get(4, 1.0)
+    )
+    return pos.get(1, 0.0), pos.get(2, 0.0), yaw, name
+
+
 def _decode_grid(blob):
     """解析占据栅格/代价地图消息：{resolution,width,height,origin,data}。"""
     try:
@@ -270,6 +342,66 @@ def _resample(points, max_points=MAX_POSE_SAMPLES):
         return points
     step = len(points) / float(max_points)
     return [points[min(len(points) - 1, int(index * step))] for index in range(max_points)]
+
+
+def _merge_duplicate_poses(points):
+    """合并时间戳几乎相同的重复位姿（只留最后一条）。
+
+    ``odom_data`` 里每条消息几乎都有 4~6% 的重复时间戳（TI 只差几十纳秒），
+    留着会让线性插值的跨度趋近 0，参考点在同一时刻来回抽动，看起来就是"位姿跳变"。
+    """
+    if len(points) < 2:
+        return points, 0
+    merged = []
+    dropped = 0
+    for point in points:
+        if merged and abs(point[0] - merged[-1][0]) <= POSE_DUP_WINDOW:
+            merged[-1] = point
+            dropped += 1
+        else:
+            merged.append(point)
+    return merged, dropped
+
+
+def _pose_step(previous, current):
+    return math.hypot(
+        current[1] - previous[1], current[2] - previous[2]
+    )
+
+
+def find_spikes(points):
+    """单点毛刺：这一帧离前后两帧都远，前后两帧彼此却很近（定位抖一下又回来）。"""
+    spikes = set()
+    for index in range(1, len(points) - 1):
+        before = _pose_step(points[index - 1], points[index])
+        after = _pose_step(points[index], points[index + 1])
+        bridge = _pose_step(points[index - 1], points[index + 1])
+        if before >= POSE_JUMP_STEP and after >= POSE_JUMP_STEP and bridge < POSE_JUMP_STEP:
+            spikes.add(index)
+    return spikes
+
+
+def find_relocations(points, spikes=None):
+    """找出日志自己发生重定位的采样点下标。
+
+    判定：这一步位移够大且等价速度够快。"跳过去又跳回来"的是单点毛刺
+    （见 ``find_spikes``），交给回放侧的去毛刺处理，不能当成重定位 ——
+    否则回放会为了两帧噪声瞬移两次。连续几次大跳（掉台阶时常见）都要算。
+    """
+    spikes = find_spikes(points) if spikes is None else spikes
+    cuts = []
+    count = len(points)
+    for index in range(1, count):
+        if index in spikes or (index - 1) in spikes:
+            continue
+        dt = points[index][0] - points[index - 1][0]
+        if dt <= 1e-6:
+            continue
+        step = _pose_step(points[index - 1], points[index])
+        if step < POSE_JUMP_STEP or step / dt < POSE_JUMP_SPEED:
+            continue
+        cuts.append(index)
+    return cuts
 
 
 def _pick_image_topic(available):
@@ -480,6 +612,180 @@ def _topic_rows(con, topic):
     )
 
 
+def _costmap_information(grid):
+    """这一帧有多少"能看的内容"：非致命格子占比（全致命的窗口是没信息的空窗口）。"""
+    data = grid["data"]
+    if not data:
+        return 0.0
+    return sum(1 for value in data if value < 90) / float(len(data))
+
+
+def _pick_costmap_source(frames):
+    """从同一话题的多种窗口里挑出"有内容"的那一组（全致命的空窗口丢掉）。"""
+    if not frames:
+        return []
+    groups = {}
+    for stamp, grid in frames:
+        key = (round(grid["resolution"], 4), grid["width"], grid["height"])
+        groups.setdefault(key, []).append((stamp, grid))
+    key = max(
+        groups,
+        key=lambda item: (
+            round(_costmap_information(groups[item][len(groups[item]) // 2][1]), 3),
+            len(groups[item]),
+        ),
+    )
+    return groups[key]
+
+
+def _normalize_costmap_frames(frames, start):
+    """把代价地图帧整理成回放好用的形式。
+
+    同一个 ``grid_costmap`` 话题上会混着两种窗口，实测是 10 m@0.03 m（有内容）
+    和 3 m@0.01 m（整帧 100% 致命代价、原点固定不变，等于空窗口）交替发布。
+    混着叠加会看起来"一帧大、一帧小、位置还对不上"，所以只保留**最有信息量**
+    的那一组（全致命的空窗口在有别的选择时直接丢掉，帧数只做并列时的次序）。
+    时间戳再换成相对回放时间：帧间隔并不均匀，按索引比例取帧会和位姿对不上。
+    """
+    picked = _pick_costmap_source(frames)
+    step = max(1, len(picked) // MAX_COSTMAP_FRAMES)
+    return [(round(stamp - start, 3), grid) for stamp, grid in picked[::step]]
+
+
+def pose_frame_offset(timeline, frames):
+    """用局部代价地图反推"位姿坐标系 → 地图坐标系"的平移量。
+
+    局部代价地图是按车滚动发布的窗口，多张窗口的中心连起来就是车在地图坐标系里
+    走过的位置；把它们和同一时刻的日志位姿逐帧对齐，取中位数就得到两个坐标系之间
+    的平移（``spread`` 是离散度：窗口真是"以车为中心"发布时它接近 0）。
+
+    有了这个平移量，回放时就能把轨迹摆到日志地图里**真正走过的位置**——机器人会落在
+    代价地图窗口里，窗口自然跟着车走；而窗口本身按它自己的 origin 摆，和静态地图
+    逐格对齐。返回 ``None`` 表示日志里没有可用的代价地图窗口。
+    """
+    if not frames or len(timeline) < 2:
+        return None
+    offsets = []
+    cursor = 0
+    for stamp, grid in frames:
+        while cursor + 1 < len(timeline) and timeline[cursor + 1][0] <= stamp:
+            cursor += 1
+        pose = timeline[cursor]
+        half = grid["width"] * grid["resolution"] / 2.0
+        offsets.append(
+            (grid["origin"][0] + half - pose[1], grid["origin"][1] + half - pose[2])
+        )
+    if not offsets:
+        return None
+    xs = sorted(item[0] for item in offsets)
+    ys = sorted(item[1] for item in offsets)
+    dx = xs[len(xs) // 2]
+    dy = ys[len(ys) // 2]
+    dev_x = math.sqrt(sum((item - dx) ** 2 for item in xs) / len(xs))
+    dev_y = math.sqrt(sum((item - dy) ** 2 for item in ys) / len(ys))
+    # 摆好之后车是不是真的落在这个窗口里：这才是"窗口跟着车走"的判据
+    inside = 0
+    cursor = 0
+    for stamp, grid in frames:
+        while cursor + 1 < len(timeline) and timeline[cursor + 1][0] <= stamp:
+            cursor += 1
+        pose = timeline[cursor]
+        width = grid["width"] * grid["resolution"]
+        height = grid["height"] * grid["resolution"]
+        x = pose[1] + dx
+        y = pose[2] + dy
+        if (
+            grid["origin"][0] - 0.5 <= x <= grid["origin"][0] + width + 0.5
+            and grid["origin"][1] - 0.5 <= y <= grid["origin"][1] + height + 0.5
+        ):
+            inside += 1
+    inside_ratio = inside / float(len(frames))
+    return {
+        "dx": round(dx, 3),
+        "dy": round(dy, 3),
+        "spread": round(max(dev_x, dev_y), 3),
+        "frames": len(offsets),
+        "inside": round(inside_ratio, 3),
+        "centered": inside_ratio >= 0.9,
+    }
+
+
+def _tf_track(tracks):
+    """从各孩子帧里挑出"地图坐标系下的机器人位姿"。
+
+    ``tf_dynamic`` 同一个话题里混着多个孩子帧（base_link1 / camera_link /
+    wio_link_local / imu …）。机器人的那个有三个特征：真的在动、落在地图自由格上、
+    并且和局部代价地图窗口中心基本重合（窗口是随车滚动的）。判据不满足就返回
+    ``None``，调用方继续用 base_pose / odom_data。
+    """
+    best = None
+    for name in TF_POSE_CHILDREN:
+        points = tracks.get(name)
+        if not points or len(points) < 10:
+            continue
+        xs = [point[1] for point in points]
+        ys = [point[2] for point in points]
+        span = max(max(xs) - min(xs), max(ys) - min(ys))
+        sample = points[:: max(1, len(points) // 200)]
+        free_ratio = _free_ratio_of(tracks.get("_map"), sample)
+        gap = _window_gap(tracks.get("_frames"), points)
+        score = (free_ratio >= TF_MIN_FREE_RATIO, span)
+        if span < TF_MIN_SPAN or free_ratio < TF_MIN_FREE_RATIO:
+            continue
+        if gap is not None and gap > TF_MAX_WINDOW_GAP:
+            continue
+        candidate = (score, name, span, free_ratio, gap)
+        if best is None or candidate[0] > best[0]:
+            best = candidate
+    if best is None:
+        return None
+    return {
+        "name": best[1],
+        "span": round(best[2], 2),
+        "free_ratio": round(best[3], 3),
+        "window_gap": None if best[4] is None else round(best[4], 2),
+    }
+
+
+def _free_ratio_of(grid, points):
+    if not grid or not points:
+        return 0.0
+    resolution = grid["resolution"]
+    width = grid["width"]
+    height = grid["height"]
+    ox, oy = grid["origin"]
+    data = grid["data"]
+    inside = 0
+    for _stamp, x, y, _yaw in points:
+        col = int((x - ox) / resolution)
+        row = int((y - oy) / resolution)
+        if 0 <= col < width and 0 <= row < height and data[row * width + col] < 50:
+            inside += 1
+    return inside / float(len(points))
+
+
+def _window_gap(frames, points):
+    """位姿与局部代价地图窗口中心的中位距离（窗口随车滚动时约等于 0）。"""
+    if not frames or not points:
+        return None
+    cursor = 0
+    gaps = []
+    for stamp, grid in frames:
+        while cursor + 1 < len(points) and points[cursor + 1][0] <= stamp:
+            cursor += 1
+        point = points[cursor]
+        half_x = grid["width"] * grid["resolution"] / 2.0
+        half_y = grid["height"] * grid["resolution"] / 2.0
+        gaps.append(
+            math.hypot(
+                grid["origin"][0] + half_x - point[1],
+                grid["origin"][1] + half_y - point[2],
+            )
+        )
+    gaps.sort()
+    return gaps[len(gaps) // 2]
+
+
 def read_bag(path):
     """读取日志：返回时间轴、位姿轨迹、速度指令与话题统计。"""
     path = os.path.abspath(os.path.expanduser(str(path)))
@@ -514,16 +820,24 @@ def read_bag(path):
         topics.sort(key=lambda item: item["count"], reverse=True)
 
         tracks = {}
+        deduped = {}
+        # 日志当时的墙钟时间（消息头里的 Unix 时间戳）：界面上的"世界时间"用它，
+        # 而不是仿真时钟。tf 消息头常常没有纪元时间，所以顺路在 base_pose 里取。
+        wall_start = None
         for topic in POSE_TOPICS:
             points = []
             for timestamp, blob in _topic_rows(con, topic):
                 pose = _decode_pose(blob)
                 if pose is None:
                     continue
+                if wall_start is None:
+                    wall_start = _decode_header_stamp(blob)
                 points.append((float(timestamp), pose[0], pose[1], pose[2]))
                 if len(points) >= MAX_POSE_SAMPLES * 2:
                     break
             if points:
+                points, dropped = _merge_duplicate_poses(points)
+                deduped[topic] = dropped
                 tracks[topic] = _resample(points)
 
         commands = []
@@ -532,7 +846,6 @@ def read_bag(path):
             commands.append((float(timestamp), linear, angular))
 
         maps = {}
-        costmap_frames = []
         for topic in MAP_TOPICS:
             best = None
             frames = []
@@ -546,21 +859,48 @@ def read_bag(path):
                     # 取占据最完整的一帧作为该日志的地图
                     best = grid
             if topic == COSTMAP_TOPIC and frames:
-                step = max(1, len(frames) // MAX_COSTMAP_FRAMES)
-                maps[topic] = frames[::step]
-                costmap_frames = maps[topic]
+                maps[topic] = frames
             elif best is not None:
                 maps[topic] = best
+
+        # 地图坐标系下的真实位姿（tf_dynamic 的 world → base_link1）。
+        # base_pose / odom_data 常常是另一套局部坐标系，用它们回放会把轨迹摆错地方、
+        # 代价地图看着"不跟车"，所以有可用的 tf 位姿就优先用它。
+        tf_track = None
+        tf_info = None
+        if maps.get("whole_map") and any(
+            item["name"] == TF_TOPIC for item in topics
+        ):
+            tf_tracks = {}
+            for timestamp, blob in _topic_rows(con, TF_TOPIC):
+                decoded = _decode_tf(blob)
+                if decoded is None or decoded[3] not in TF_POSE_CHILDREN:
+                    continue
+                tf_tracks.setdefault(decoded[3], []).append(
+                    (float(timestamp), decoded[0], decoded[1], decoded[2])
+                )
+            tf_tracks["_map"] = maps.get("whole_map")
+            frames = maps.get(COSTMAP_TOPIC) or []
+            tf_tracks["_frames"] = _pick_costmap_source(frames)
+            tf_info = _tf_track(tf_tracks)
+            if tf_info is not None:
+                tf_info["frames"] = len(tf_tracks[tf_info["name"]])
     except sqlite3.Error as exc:
         con.close()
         raise BagError("读取日志失败: {}".format(exc))
 
-    if not tracks:
-        raise BagError("日志里没有 base_pose / odom_data 位姿数据，无法回放")
+    if not tracks and not tf_info:
+        raise BagError("日志里没有位姿数据（base_pose / odom_data / tf_dynamic），无法回放")
 
-    # 优先使用 base_pose（世界坐标），没有时退回里程计
-    pose_topic = "base_pose" if "base_pose" in tracks else "odom_data"
-    poses = tracks[pose_topic]
+    if tf_info is not None:
+        pose_topic = tf_info["name"]
+        poses = _resample(tf_tracks[pose_topic])
+        pose_frame = "map"
+    else:
+        # 优先使用 base_pose（世界坐标），没有时退回里程计
+        pose_topic = "base_pose" if "base_pose" in tracks else "odom_data"
+        poses = tracks[pose_topic]
+        pose_frame = "local"
     start = poses[0][0]
     try:
         images = _read_images(con, tables, start)
@@ -579,6 +919,19 @@ def read_bag(path):
         (round(t - start, 4), linear, angular) for t, linear, angular in commands
         if t >= start - 0.5
     ]
+    # 日志自身的重定位时刻（相对时间）：回放时同步对齐，不硬追
+    spikes = find_spikes(timeline)
+    relocations = [
+        round(timeline[index][0], 4)
+        for index in find_relocations(timeline, spikes)
+        if 0.0 < timeline[index][0] <= (timeline[-1][0] if timeline else 0.0)
+    ]
+    frame_offset = None
+    if COSTMAP_TOPIC in maps:
+        maps[COSTMAP_TOPIC] = _normalize_costmap_frames(maps[COSTMAP_TOPIC], start)
+        if pose_frame != "map":
+            # 位姿已经在地图坐标系里时不需要再平移（反推出来的平移只会引入误差）
+            frame_offset = pose_frame_offset(timeline, maps[COSTMAP_TOPIC])
 
     duration = timeline[-1][0] if timeline else 0.0
     xs = [point[1] for point in timeline]
@@ -622,6 +975,11 @@ def read_bag(path):
         "battery": battery,
         "battery_topic": battery_topic if battery else None,
         "pose_topic": pose_topic,
+        "pose_frame": pose_frame,
+        "wall_start": None if wall_start is None else round(wall_start, 3),
+        "tf_pose": tf_info,
+        "pose_frame_offset": frame_offset,
+        "relocations": relocations,
         "duration": round(duration, 2),
         "poses": timeline,
         "commands": command_timeline,
@@ -642,5 +1000,8 @@ def read_bag(path):
                 round(_standard_deviation(ys, mean_y), 3),
             ),
             "commands": len(command_timeline),
+            "relocations": len(relocations),
+            "pose_spikes": len(spikes),
+            "duplicate_poses": deduped.get(pose_topic, 0),
         },
     }

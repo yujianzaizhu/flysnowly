@@ -1164,10 +1164,62 @@ body {
   object-fit: contain;
 }
 
-/* 独立窗口里的排版 */
-.popup-host {
-  height: 100%;
-  padding: 10px;
+/* 独立窗口：页面内浮层，永远压在界面/地图上层（可拖动、可拉伸） */
+.float-panel {
+  position: fixed;
+  display: flex;
+  flex-direction: column;
+  min-width: 260px;
+  min-height: 180px;
+  padding: 0;
+  background: var(--panel, #0f1720);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+  resize: both;
+  z-index: 9000;
+}
+
+.float-panel__bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.06);
+  font-size: 12px;
+  cursor: move;
+  user-select: none;
+}
+
+.float-panel__title {
+  flex: 1 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 600;
+}
+
+.float-panel__back {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: inherit;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.float-panel__back:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.float-panel__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px;
   box-sizing: border-box;
 }
 
@@ -1266,8 +1318,32 @@ body {
   max-height: 148px;
 }
 
-.log-dock.is-collapsed .dock-pane {
+/* 收起 = 整块隐藏（和左侧栏一致），靠底部的小提手重新展开 */
+.log-dock.is-collapsed {
   display: none;
+}
+
+.dock-tab-raise {
+  position: fixed;
+  left: 50%;
+  bottom: 0;
+  transform: translateX(-50%);
+  z-index: 12;
+  padding: 3px 14px;
+  border-radius: 8px 8px 0 0;
+  border: 1px solid var(--line-strong);
+  border-bottom: none;
+  background: rgba(var(--well-rgb), 0.92);
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+}
+
+.dock-tab-raise:hover {
+  color: var(--text);
+  border-color: rgba(var(--green-rgb), 0.5);
 }
 
 /* ------------------------------------------------------------- 工作区 */
@@ -1618,6 +1694,94 @@ body {
   height: 10px;
 }
 .dot--path { background: var(--obstacle-small-color); }
+
+/* 任务操作栏里的回放状态条：平时禁用（灰），载入日志后才可用 */
+.bag-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 320px;
+  min-width: 0;
+  padding: 3px 8px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: rgba(var(--well-rgb), 0.55);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.bag-bar.is-idle {
+  opacity: 0.6;
+}
+
+.bag-bar-btn {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  font: inherit;
+  font-size: 11px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.bag-bar-btn:hover:not(:disabled) {
+  border-color: rgba(var(--green-rgb), 0.5);
+  color: var(--green);
+}
+
+.bag-bar-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.bag-bar-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.bag-bar-time {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.bag-bar-world {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.bag-bar-world strong {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.bag-bar-hint {
+  flex: 1 1 90px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.bag-hud-note {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.zone-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
 
 .tips {
   position: absolute;

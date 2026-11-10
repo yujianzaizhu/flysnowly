@@ -398,6 +398,50 @@ def resolve_bag(server, name):
     raise ValueError("找不到日志: {}".format(name))
 
 
+# 同一个场地的日志（同一个文件夹里的连续几段）共用一个充电桩位置。
+# 每段日志的 whole_map 内容略有差别，按"自由区里最靠场地中心"选桩会因为边界
+# 差几格就跳到别的角落去，连续播放时界面上充电桩一直在换地方。
+BAG_DOCK_CACHE = {}
+
+
+def _log_map_signature(log_map):
+    return (
+        round(log_map["resolution"], 4),
+        int(log_map["width"]),
+        int(log_map["height"]),
+        round(log_map["origin"][0], 3),
+        round(log_map["origin"][1], 3),
+    )
+
+
+def _log_map_free_cell(log_map, col, row):
+    """日志地图的 (col, row) 格是不是可通行（0=自由 / 100=占据）。"""
+    width = log_map["width"]
+    height = log_map["height"]
+    if not (0 <= col < width and 0 <= row < height):
+        return False
+    return log_map["data"][row * width + col] < 50
+
+
+def apply_stable_dock(definition, log_map):
+    """同一场地复用第一次选出来的充电桩位置（仍落在可通行区域内时）。"""
+    signature = _log_map_signature(log_map)
+    transform = definition.get("replay_transform") or {}
+    scale = float(transform.get("scale", 1.0) or 1.0)
+    base = transform.get("offset") or [0.0, 0.0]
+    cached = BAG_DOCK_CACHE.get(signature)
+    if cached:
+        # sim = (log - origin) * scale + base，一格日志栅格 = resolution * scale（米）
+        step = max(1e-6, scale * log_map["resolution"])
+        col = int((cached["x"] - base[0]) / step)
+        row = int((cached["y"] - base[1]) / step)
+        if _log_map_free_cell(log_map, col, row):
+            definition["dock"] = dict(cached)
+            return definition
+    BAG_DOCK_CACHE[signature] = dict(definition.get("dock") or {})
+    return definition
+
+
 def load_bag(httpd, name, use_log_map=True):
     """解析日志并载入回放；日志自带地图时同时把它建成仿真场地。"""
     path = resolve_bag(httpd, name)
@@ -418,6 +462,7 @@ def load_bag(httpd, name, use_log_map=True):
                     grid_origin=log_map["origin"],
                     name="{}·日志".format(label),
                 )
+                definition = apply_stable_dock(definition, log_map)
             except Exception as exc:  # 日志地图坏了就退回开阔场地
                 print("日志地图构造失败：{}".format(exc))
                 definition = None
@@ -439,11 +484,11 @@ def load_bag(httpd, name, use_log_map=True):
     manager.load_replay(info, transform)
     replay = manager.replay
     if replay is not None and replay.track:
-        # 轨迹已按日志地图自由区中心摆放，起点即回放第一帧位置
+        # 起点/车体跟着日志第一帧走；**充电桩不要跟着动** —— 之前这里把桩直接搬到
+        # 回放起点，连续播放时每换一个包桩就跳一次，"充电桩老是换地方"就是这么来的。
         first = replay.track[0]
         pose = (round(first[1], 4), round(first[2], 4), round(first[3], 4))
         world.START.update({"x": pose[0], "y": pose[1], "theta": pose[2]})
-        world.DOCK.update({"x": pose[0], "y": pose[1], "r": 0.45})
         manager.robot.pose = [pose[0], pose[1], pose[2]]
     return manager, info, path
 
@@ -1103,6 +1148,9 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
         state["map_name"] = world.MAP_NAME
         state["config"] = dict(config.settings.__dict__)
         state["bag"] = self.server.manager.replay_state()
+        # 连续播放的状态也放进主状态里：界面的轨迹逻辑要按它判断"是不是在连续播"，
+        # 只靠 /api/bag 轮询会慢半拍，切包那一瞬间就以为用户手动换了日志。
+        state["queue"] = bag_queue_snapshot(self.server)
         state["draft"] = _editor_snapshot(self.server)
         return state
 
@@ -1245,12 +1293,11 @@ def build_manager(robot, grid):
 
 
 def _editor_busy(manager):
-    """任务进行中不能改地图（自动建图 / 割草 都不行）。"""
-    return manager.task is not None and manager.phase not in (
-        "idle",
-        "done",
-        "stopped",
-    )
+    """任务进行中不能改地图（自动建图 / 割草 / 日志回放 都不行）。"""
+    if manager.task is not None and manager.phase not in ("idle", "done", "stopped"):
+        return True
+    replay = getattr(manager, "replay", None)
+    return bool(replay is not None and getattr(replay, "active", False))
 
 
 def _editor_require(httpd):

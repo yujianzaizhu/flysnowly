@@ -617,6 +617,13 @@ class TaskManager(object):
 
     def stop_task(self, reason="任务已停止", resumable=True):
         with self.lock:
+            if self.task is not None and self.task.get("type") == "replay":
+                # 日志回放不是"任务"：按停止任务时要真的把回放停下来，
+                # 否则回放还在跑、task 又挂着，界面会一直认为"任务进行中"，
+                # 地图编辑等按钮就再也点不动了。
+                self._log("warn", reason)
+                self.stop_replay()
+                return
             if not self.task and self.charge_reason is None:
                 self.robot.stop()
                 return
@@ -726,6 +733,8 @@ class TaskManager(object):
     def replay_state(self, with_costmap=False):
         state = self.replay.state()
         state["phase"] = self.phase
+        # 世界时间（仿真时钟）：地图下方的回放悬浮条要显示它
+        state["world_time"] = round(self.robot.sim_time, 2)
         state["maps"] = (self.replay.info or {}).get("map_summary") or {}
         info = self.replay.info or {}
         state["battery_topic"] = info.get("battery_topic")

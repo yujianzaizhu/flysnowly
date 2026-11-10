@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -623,6 +624,118 @@ class ServerTest(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as context:
             self.get("/../backend/server.py")
         self.assertIn(context.exception.code, (403, 404))
+
+    def test_stop_task_stops_replay_and_unlocks_editor(self):
+        """按“停止任务”要真的把日志回放停下来，回放停了地图编辑就得能用。"""
+        tmp = tempfile.mkdtemp(prefix="robot-stopplay-")
+        try:
+            path = os.path.join(tmp, "clip.bag")
+            bag_fixtures.build_bag(path)
+            self.post("/api/bag/load", {"name": path})
+            self.post("/api/bag/control", {"command": "play"})
+            time.sleep(0.5)
+            _status, body = self.post("/api/stop", {})
+            state = body.get("state") or {}
+            self.assertIsNone((state.get("task") or {}).get("type"))
+            self.assertFalse((state.get("bag") or {}).get("active"))
+            # 回放真的停了：编辑地图不再被拦
+            _status, draft = self.post("/api/editor/blank", {})
+            self.assertTrue(draft["draft"]["active"])
+            self.post("/api/editor/discard", {})
+        finally:
+            self.post("/api/bag/control", {"command": "stop"})
+            self.post("/api/map", {"map": 1})
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_editor_is_blocked_while_replay_is_active(self):
+        tmp = tempfile.mkdtemp(prefix="robot-editlock-")
+        try:
+            path = os.path.join(tmp, "clip.bag")
+            bag_fixtures.build_bag(path)
+            self.post("/api/bag/load", {"name": path})
+            self.post("/api/bag/control", {"command": "play"})
+            time.sleep(0.4)
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self.post("/api/editor/blank", {})
+            self.assertEqual(ctx.exception.code, 400)
+            self.post("/api/bag/control", {"command": "stop"})
+            _status, draft = self.post("/api/editor/blank", {})
+            self.assertTrue(draft["draft"]["active"])
+            self.post("/api/editor/discard", {})
+        finally:
+            self.post("/api/bag/control", {"command": "stop"})
+            self.post("/api/map", {"map": 1})
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_bag_load_keeps_dock_fixed(self):
+        """载入日志只把车体放到日志第一帧，不能顺手把充电桩也搬过去。
+
+        以前这里把 DOCK 覆盖成回放起点，连续播放每换一个包桩就跳一次。
+        """
+        tmp = tempfile.mkdtemp(prefix="robot-bagdock-")
+        try:
+            first = os.path.join(tmp, "one.bag")
+            bag_fixtures.build_bag(first, samples=40)
+            self.post("/api/bag/load", {"name": first})
+            dock_after_first = dict(world.DOCK)
+            # 第二段日志起点不同（车在别的角落），桩位不能跟着跑
+            second = os.path.join(tmp, "two.bag")
+            con = sqlite3.connect(second)
+            con.execute(
+                "create table Zmqmsg (TOPIC BLOB NOT NULL, TI REAL NOT NULL, DA BLOB NOT NULL)"
+            )
+            for index in range(40):
+                stamp = 2000.0 + index * 0.1
+                con.execute(
+                    "insert into Zmqmsg values (?, ?, ?)",
+                    (b"base_pose", stamp,
+                     bag_fixtures._pose_message(stamp, 6.0 + 0.02 * index, 4.0, 0.0)),
+                )
+            con.commit()
+            con.close()
+            _status, body = self.post("/api/bag/load", {"name": second})
+            self.assertIn("state", body)
+            self.assertEqual(dict(world.DOCK), dock_after_first)
+        finally:
+            self.post("/api/bag/control", {"command": "stop"})
+            self.post("/api/map", {"map": 1})
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_log_map_dock_is_stable_across_bags(self):
+        """同一场地（同分辨率/尺寸/原点）的日志要复用同一个充电桩位置。
+
+        每段日志的 whole_map 内容略有差别，按"自由区里最靠中心"重新选桩会跳到
+        别的角落，连续播放时界面上充电桩一直在换地方。
+        """
+        log_map = {
+            "resolution": 0.05,
+            "width": 40,
+            "height": 40,
+            "origin": (-1.0, -1.0),
+            "data": bytearray([0] * (40 * 40)),
+        }
+        transform = {
+            "origin": [-1.0, -1.0],
+            "scale": 1.0,
+            "padding": 0.2,
+            "cell": 0.1,
+            "offset": [0.25, 0.25],
+        }
+        server.BAG_DOCK_CACHE.clear()
+        first = {"dock": {"x": 1.05, "y": 1.05, "r": 0.45}, "replay_transform": transform}
+        server.apply_stable_dock(first, log_map)
+        second = {"dock": {"x": 2.05, "y": 1.55, "r": 0.45}, "replay_transform": transform}
+        server.apply_stable_dock(second, log_map)
+        self.assertEqual(second["dock"], {"x": 1.05, "y": 1.05, "r": 0.45})
+        # 缓存位置已经撞到障碍时才重新选
+        blocked = dict(log_map)
+        blocked["data"] = bytearray([100] * (40 * 40))
+        server.apply_stable_dock({"dock": {"x": 0.05, "y": 0.05, "r": 0.45}, "replay_transform": transform}, blocked)
+        # 缓存位置在新区块里被占了：不强行复用，保留这次自己选的位置
+        third = {"dock": {"x": 3.05, "y": 3.05, "r": 0.45}, "replay_transform": transform}
+        server.apply_stable_dock(third, blocked)
+        self.assertEqual(third["dock"], {"x": 3.05, "y": 3.05, "r": 0.45})
+        server.BAG_DOCK_CACHE.clear()
 
     def test_editor_map_persists_and_reloads(self):
         tmp = tempfile.mkdtemp()
