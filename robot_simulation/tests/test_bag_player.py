@@ -287,7 +287,27 @@ def _tf_message(timestamp, x, y, yaw, child="base_link1"):
 WALL_NS = 1789000000 * 1000000000  # 测试用的墙钟起点（Unix 纪元，纳秒）
 
 
-def build_map_frame_bag(path, samples=120, dt=0.1):
+def _cloud_message(timestamp, points, frustum=((3.0, -3.0, -2.0), (3.0, 3.0, -2.0))):
+    """PointCloud2 风格障碍物点云：field3=width、6=point_step、8=data。"""
+    header = (
+        _field_bytes(1, _varint(1 << 3) + _varint(1))
+        + _field_bytes(2, _varint(1 << 3) + _varint(int(timestamp * 1000)))
+        + _field_bytes(3, b"world")
+    )
+    all_points = list(points) + list(frustum)
+    blob = bytearray()
+    for x, y, z in all_points:
+        # 每点 32 字节：12 字节坐标 + 预留（真实消息里有 label 等字段）
+        blob += struct.pack("<fff", x, y, z) + bytes(20)
+    return (
+        _field_bytes(1, header)
+        + _varint(3 << 3) + _varint(len(all_points))
+        + _varint(6 << 3) + _varint(32)
+        + _field_bytes(8, bytes(blob))
+    )
+
+
+def build_map_frame_bag(path, samples=120, dt=0.1, clouds=False, wall_offset_ns=0):
     """位姿在"局部坐标系"里、但 tf 里有地图坐标系真实位姿、代价地图窗口随车滚动的日志。"""
     con = sqlite3.connect(path)
     con.execute("create table Zmqmsg (TOPIC BLOB NOT NULL, TI REAL NOT NULL, DA BLOB NOT NULL)")
@@ -311,7 +331,10 @@ def build_map_frame_bag(path, samples=120, dt=0.1):
         con.execute(
             "insert into Zmqmsg values (?, ?, ?)",
             (b"base_pose", stamp,
-             _pose_message(stamp, local_x, 0.0, 0.0, wall_ns=WALL_NS + index * int(dt * 1e9))),
+             _pose_message(
+                 stamp, local_x, 0.0, 0.0,
+                 wall_ns=WALL_NS + wall_offset_ns + index * int(dt * 1e9),
+             )),
         )
         # 地图坐标系真实位姿：沿 x 走，y 固定在 2.0（自由带里）
         world_x = 1.5 + 0.02 * index
@@ -324,6 +347,12 @@ def build_map_frame_bag(path, samples=120, dt=0.1):
                 "insert into Zmqmsg values (?, ?, ?)",
                 (b"grid_costmap", stamp,
                  _map_message(stamp, 0.05, 40, 40, (world_x - 1.0, 1.0), bytes(cells))),
+            )
+        if clouds:
+            con.execute(
+                "insert into Zmqmsg values (?, ?, ?)",
+                (b"obstaclecloud", stamp,
+                 _cloud_message(stamp, ((1.0, 0.5, 0.10), (1.5, -0.5, 0.20), (2.0, 0.0, 0.05)))),
             )
     con.commit()
     con.close()
@@ -748,6 +777,84 @@ class BagReaderTest(unittest.TestCase):
         self.assertAlmostEqual(
             replay.state()["wall_time"], info["wall_start"] + target, places=1
         )
+
+    def test_obstacle_cloud_is_mapped_into_map_frame(self):
+        """深度相机点云按位姿 + 相机偏移换算到地图坐标，视锥角点跳过。"""
+        path = os.path.join(self.tmpdir, "cloud.bag")
+        build_map_frame_bag(path, clouds=True)
+        info = bag_reader.read_bag(path)
+        self.assertEqual(info["pose_frame"], "map")
+        frames = info["clouds"]
+        self.assertEqual(len(frames), 120)
+        stamp, points = frames[0]
+        self.assertAlmostEqual(stamp, 0.0, places=2)
+        # 每帧 3 个真实点（2 个 z=-2 的视锥角点被丢掉）
+        self.assertEqual(len(points), 6)
+        pose_x, pose_y = info["poses"][0][1], info["poses"][0][2]
+        cam_x, cam_y = bag_reader.CLOUD_CAMERA_OFFSET
+        self.assertAlmostEqual(points[0], round(pose_x + cam_x + 1.0, 2), places=2)
+        self.assertAlmostEqual(points[1], round(pose_y + cam_y + 0.5, 2), places=2)
+        world.select_map(1)
+        manager = TaskManager(RobotCar(), GridMap())
+        manager.load_replay(info)
+        layer = manager.replay.cloud_at(0.0)
+        self.assertEqual(layer["frames"], 1)
+        self.assertEqual(layer["count"], 3)
+
+    def test_cloud_points_are_shifted_into_simulation_frame(self):
+        """点云必须和轨迹用同一套换算，否则点云会飘到地图外面。"""
+        path = os.path.join(self.tmpdir, "cloudframe.bag")
+        build_map_frame_bag(path, clouds=True)
+        info = bag_reader.read_bag(path)
+        log_map = info["maps"]["whole_map"]
+        definition = map_import.build_map_from_grid(
+            log_map["resolution"], log_map["width"], log_map["height"],
+            log_map["data"], grid_origin=log_map["origin"], name="log",
+        )
+        world.select_map(world.register_map(definition))
+        manager = TaskManager(RobotCar(), GridMap())
+        manager.load_replay(info, definition["replay_transform"])
+        replay = manager.replay
+        layer = replay.cloud_at(1.0)
+        pose = replay.track[10]
+        self.assertAlmostEqual(replay.scale, 1.0, places=3)
+        # 累计点云的第一点来自第一帧
+        self.assertAlmostEqual(
+            layer["points"][0], round(info["clouds"][0][1][0] + replay.map_offset[0], 2), places=2
+        )
+        self.assertAlmostEqual(
+            layer["points"][1], round(info["clouds"][0][1][1] + replay.map_offset[1], 2), places=2
+        )
+        # 离车身不超过 3 m（点云是相机看到的前方障碍）
+        self.assertLess(abs(layer["points"][0] - pose[1]), 3.0)
+        self.assertLess(abs(layer["points"][1] - pose[2]), 3.0)
+
+    def test_cloud_accumulates_until_time(self):
+        path = os.path.join(self.tmpdir, "cloud.bag")
+        build_map_frame_bag(path, clouds=True)
+        info = bag_reader.read_bag(path)
+        world.select_map(1)
+        manager = TaskManager(RobotCar(), GridMap())
+        manager.load_replay(info)
+        early = manager.replay.cloud_at(0.5)
+        late = manager.replay.cloud_at(info["duration"])
+        self.assertGreater(late["frames"], early["frames"])
+        self.assertGreater(late["count"], early["count"])
+
+    def test_world_time_keeps_milliseconds(self):
+        path = os.path.join(self.tmpdir, "wall.bag")
+        build_map_frame_bag(path, wall_offset_ns=345000000)
+        info = bag_reader.read_bag(path)
+        world.select_map(1)
+        manager = TaskManager(RobotCar(), GridMap())
+        manager.load_replay(info)
+        replay = manager.replay
+        replay.seek(0.55)
+        value = replay.state()["wall_time"]
+        expected = info["wall_start"] + 0.55
+        self.assertAlmostEqual(value, expected, places=2)
+        # 不能只有 0.1 s 精度
+        self.assertGreater(abs(value - round(value, 1)), 0.001)
 
     def test_costmap_cells_row_zero_is_min_y(self):
         """栅格行 0 是最小 y：写图时要翻转，否则整块代价地图上下镜像。"""

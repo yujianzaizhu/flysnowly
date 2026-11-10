@@ -1301,6 +1301,10 @@ body {
   background: #ff6048;
 }
 
+.dot--cloud {
+  background: #ff7adc;
+}
+
 .bag-topic em {
   font-style: normal;
   color: rgba(var(--muted-rgb), 0.85);

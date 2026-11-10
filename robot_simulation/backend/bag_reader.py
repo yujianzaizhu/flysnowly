@@ -42,9 +42,18 @@ TOPIC_LAYERS = {
     "grid_costmap": "costmap",
     "base_pose": "pose",
     "odom_data": "pose",
+    "obstaclecloud": "cloud",
 }
 # 电量话题的关键字（日志里有就按它显示，没有就保持 100%）
 BATTERY_HINTS = ("battery", "battery_state", "batt", "power", "soc", "bms")
+# 障碍物点云话题（PointCloud2：x/y/z + label，按 camera 帧发布）
+CLOUD_TOPIC = "obstaclecloud"
+# 深度相机在车体上的安装偏移（base_link1 → depth_camera，米）
+CLOUD_CAMERA_OFFSET = (0.35, 0.04)
+MAX_CLOUD_FRAMES = 240
+MAX_CLOUD_POINTS = 90
+# 视锥角点用 z = -2 占位，不是真实障碍点
+CLOUD_FRUSTUM_Z = -2.0
 # 同一时刻重复的位姿（odom_data 里大量存在，TI 差 <1 ms）：只留最后一条，
 # 否则插值跨度接近 0，回放里的参考点会来回抽动。
 POSE_DUP_WINDOW = 0.001
@@ -638,6 +647,80 @@ def _pick_costmap_source(frames):
     return groups[key]
 
 
+def _decode_pointcloud(blob):
+    """解析 PointCloud2 风格的障碍物点云，返回 (点数, step, data)。"""
+    try:
+        top = _parse_message(blob)
+    except (BagError, IndexError, struct.error):
+        return None
+    width = point_step = None
+    data = None
+    for field, wire, value in top:
+        if field == 3 and wire == WIRE_VARINT:
+            width = value
+        elif field == 6 and wire == WIRE_VARINT:
+            point_step = value
+        elif field == 8 and wire == WIRE_LENGTH:
+            data = value
+    if not width or not point_step or data is None:
+        return None
+    if len(data) < width * point_step:
+        return None
+    return width, point_step, data
+
+
+def read_obstacle_clouds(con, poses, start):
+    """把障碍物点云换算到地图坐标（相机帧 → 车体 → 世界）。
+
+    只在地图坐标系位姿可用时才有意义（否则点云不知道往哪儿放），
+    返回 ``[(相对时间, [x1, y1, x2, y2, ...]), ...]``，已降采样。
+    """
+    if not poses or len(poses) < 2:
+        return []
+    frames = []
+    try:
+        rows = list(_topic_rows(con, CLOUD_TOPIC))
+    except sqlite3.Error:
+        return []
+    if not rows:
+        return []
+    # 大多数帧只是"视锥角点"（4 个点、没有真实障碍点），所以按"有内容的帧数"
+    # 上限来截断，而不是按消息条数抽稀
+    camera_x, camera_y = CLOUD_CAMERA_OFFSET
+    cursor = 0
+    for stamp, blob in rows:
+        decoded = _decode_pointcloud(blob)
+        if decoded is None:
+            continue
+        width, point_step, data = decoded
+        while cursor + 1 < len(poses) and poses[cursor + 1][0] <= stamp:
+            cursor += 1
+        pose = poses[cursor]
+        yaw = pose[3]
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        point_stride = max(1, width // MAX_CLOUD_POINTS)
+        points = []
+        for index in range(0, width, point_stride):
+            chunk = data[index * point_step : (index + 1) * point_step]
+            if len(chunk) < 12:
+                continue
+            local_x, local_y, local_z = struct.unpack("<fff", chunk[:12])
+            if abs(local_z - CLOUD_FRUSTUM_Z) < 1e-3:
+                continue
+            base_x = camera_x + local_x
+            base_y = camera_y + local_y
+            world_x = pose[1] + base_x * cos_yaw - base_y * sin_yaw
+            world_y = pose[2] + base_x * sin_yaw + base_y * cos_yaw
+            points.append(round(world_x, 2))
+            points.append(round(world_y, 2))
+        if points:
+            frames.append((round(stamp - start, 3), points))
+            if len(frames) >= MAX_CLOUD_FRAMES:
+                break
+    return frames
+
+
 def _normalize_costmap_frames(frames, start):
     """把代价地图帧整理成回放好用的形式。
 
@@ -906,6 +989,10 @@ def read_bag(path):
         images = _read_images(con, tables, start)
     except sqlite3.Error:
         images = None
+    # 障碍物点云（深度相机）：只有位姿在地图坐标系里才换算得出来
+    clouds = []
+    if pose_frame == "map":
+        clouds = read_obstacle_clouds(con, poses, start)
     battery = None
     battery_topic = _pick_battery_topic([topic["name"] for topic in topics])
     if battery_topic:
@@ -977,6 +1064,7 @@ def read_bag(path):
         "pose_topic": pose_topic,
         "pose_frame": pose_frame,
         "wall_start": None if wall_start is None else round(wall_start, 3),
+        "clouds": clouds,
         "tf_pose": tf_info,
         "pose_frame_offset": frame_offset,
         "relocations": relocations,

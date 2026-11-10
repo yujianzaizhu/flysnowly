@@ -198,6 +198,7 @@
       route: "255, 209, 102",
       obstacleLarge: "255, 143, 90",
       obstacleSmall: "255, 209, 102",
+      cloud: "255, 122, 220",
       dockIcon: "#d8fff0",
       rim: "190, 245, 255",
       wheelIdle: "130, 160, 200",
@@ -219,6 +220,7 @@
       route: "196, 132, 20",
       obstacleLarge: "217, 98, 47",
       obstacleSmall: "192, 138, 16",
+      cloud: "176, 38, 150",
       dockIcon: "#0b5f45",
       rim: "40, 90, 130",
       wheelIdle: "120, 140, 165",
@@ -240,6 +242,7 @@
       route: "255, 205, 140",
       obstacleLarge: "255, 159, 107",
       obstacleSmall: "255, 207, 134",
+      cloud: "255, 150, 220",
       dockIcon: "#3a2103",
       rim: "255, 230, 200",
       wheelIdle: "190, 160, 130",
@@ -266,7 +269,7 @@
   let trail = [];
   // 话题图层开关：日志里的 grid_costmap（红色代价方块）、轨迹、图像窗口都可单独屏蔽
   const LAYER_KEY = "mowerTopicLayersV1";
-  let layerVisible = { pose: true, costmap: true, image: true, map: true, static_costmap: true };
+  let layerVisible = { pose: true, costmap: true, cloud: true, image: true, map: true, static_costmap: true };
   try {
     const saved = JSON.parse(localStorage.getItem(LAYER_KEY) || "null");
     if (saved && typeof saved === "object") layerVisible = Object.assign(layerVisible, saved);
@@ -333,10 +336,13 @@
     const date = new Date(Number(epochSeconds) * 1000);
     if (Number.isNaN(date.getTime())) return "--";
     const pad = (v) => String(v).padStart(2, "0");
-    // 用 UTC 显示：日志里的时间戳就是 UTC，这样和包名（zmqbag_x_YYYY-MM-DD-HH-MM-SS）对得上
+    // 用 UTC 显示：日志里的时间戳就是 UTC，这样和包名（zmqbag_x_YYYY-MM-DD-HH-MM-SS）对得上；
+    // 带毫秒（回放采样率 10~50 Hz，秒级看不出来）
+    const ms = date.getUTCMilliseconds();
     return (
       pad(date.getUTCMonth() + 1) + "-" + pad(date.getUTCDate()) + " " +
-      pad(date.getUTCHours()) + ":" + pad(date.getUTCMinutes()) + ":" + pad(date.getUTCSeconds())
+      pad(date.getUTCHours()) + ":" + pad(date.getUTCMinutes()) + ":" + pad(date.getUTCSeconds()) +
+      "." + String(ms).padStart(3, "0")
     );
   }
 
@@ -362,7 +368,10 @@
     // 只有手动载入日志 / 复位才清除轨迹。
     const queueRunning = !!(bagQueue && bagQueue.active);
     if (lastMapId !== null && state.map_id !== lastMapId) {
-      if (!replaying && !queueRunning) trail = [];
+      // 手动载入日志/换地图会整体换场地并挪车位，这不是回放里的"跳变"：
+      // 直接重新起笔，否则会从上一张图的旧位置拉一条初始跳线过来。
+      // 只有连续播放（自动换日志换场地）才接着画，段间用跳线连。
+      if (!queueRunning) trail = [];
       mapVersion = -1;
       zoneAutoValue = "";
       zoneInputDirty = false;
@@ -422,8 +431,15 @@
     lastBagActive = !!bag.active;
     if (logName) lastLogName = logName;
 
-    const tail = trail[trail.length - 1];
-    const step = tail ? Math.hypot(state.pose.x - tail.x, state.pose.y - tail.y) : 0.0;
+    let tail = trail[trail.length - 1];
+    let step = tail ? Math.hypot(state.pose.x - tail.x, state.pose.y - tail.y) : 0.0;
+    if (tail && step > 2.0 && !bag.active && !queuePlaying) {
+      // 载入日志会换场地并把车整体挪过去，这不是回放里的"跳变"：
+      // 重新起笔，否则会从旧位置拉一条初始跳线过来。
+      trail = [];
+      tail = null;
+      step = 0.0;
+    }
     if (!tail || step > 0.02) {
       // 回放中发生重定位、换包、或位置突然跳很远：这一段画成红色跳线
       const jump = !!tail && (teleports > lastTeleportsMark || step > 2.0 || switchedBag);
@@ -2117,6 +2133,7 @@
       drawObstacles(geom, state.obstacles || []);
       drawPaths(geom, state);
       drawCostmap(geom);
+      drawCloud(geom);
       drawTrail(geom);
       // 编辑草稿自带充电桩，临时场地的占位桩不画，避免出现两个桩
       drawPassageLabels(geom, state.map || lastMapPayload, world);
@@ -3720,6 +3737,7 @@
   const LAYER_LABELS = {
     pose: "仿真实际轨迹（跳变处画细线）",
     costmap: "日志局部代价地图（窗口随车滚动时机器人会落在窗口里；否则按日志自己的坐标摆放，和真实地图逐格对齐）",
+    cloud: "障碍物点云（深度相机 obstaclecloud，已换算到地图坐标，随回放累积）",
     static_costmap: "静态代价地图（当前未叠加显示）",
     image: "日志图像窗口",
     map: "日志真实地图（已作为仿真场地，不能隐藏）",
@@ -3901,12 +3919,55 @@
   let costmapPollAt = 0;
   let costmapTime = -1;
 
+  let cloudPoints = null;        // 截至当前时刻的障碍物点云（地图坐标，扁平的 [x,y,...]）
+  let cloudPollAt = 0;
+  let cloudTime = -1;
+
+  async function refreshCloud(force) {
+    const state = bagState;
+    if (!state || !state.loaded) {
+      cloudPoints = null;
+      return;
+    }
+    const time = state.time || 0;
+    if (!force && !state.playing && Math.abs(time - cloudTime) < 0.3) return;
+    const now = performance.now();
+    if (!force && now - cloudPollAt < 500) return;
+    cloudPollAt = now;
+    cloudTime = time;
+    try {
+      const data = await request("/api/bag/cloud?t=" + time);
+      cloudPoints = data.cloud && data.cloud.points ? data.cloud.points : null;
+    } catch (error) {
+      /* 回放切换/结束期间的请求失败忽略 */
+    }
+  }
+
+  function drawCloud(geom) {
+    if (layerVisible.cloud === false) return;
+    if (!cloudPoints || !cloudPoints.length) return;
+    ctx.save();
+    ctx.fillStyle = "rgba(" + palette.cloud + ", 0.8)";
+    const size = Math.max(1.5, geom.scale * 0.02);
+    for (let index = 0; index < cloudPoints.length; index += 2) {
+      ctx.fillRect(
+        geom.x(cloudPoints[index]) - size / 2,
+        geom.y(cloudPoints[index + 1]) - size / 2,
+        size,
+        size
+      );
+    }
+    ctx.restore();
+  }
+
   async function refreshCostmap(force) {
     const state = bagState;
     if (!state || !state.loaded) {
       costmapLayer = null;
+      cloudPoints = null;
       return;
     }
+    refreshCloud(force);
     const time = state.time || 0;
     // 暂停 / 拖动进度条后也要更新代价地图，按时间变化判定即可
     if (!force && !state.playing && Math.abs(time - costmapTime) < 0.3) return;

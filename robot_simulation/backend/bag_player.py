@@ -545,6 +545,46 @@ class BagReplay(object):
         self._costmap_cache[best] = result
         return result
 
+    def cloud_at(self, time, max_points=3000):
+        """截至 ``time`` 的障碍物点云（已换算到仿真坐标，累计并降采样），供界面叠加。
+
+        点云是拿**地图坐标系**的位姿算出来的（只有位姿在 map 帧里才有），所以和静态地图
+        同坐标系，用 ``map_offset`` 换算；没有日志地图时才退回轨迹的平移量。
+        """
+        frames = (self.info or {}).get("clouds") or []
+        if not frames:
+            return None
+        scale = self.scale if self.transform else 1.0
+        if self.transform:
+            dx, dy = self.map_offset
+        else:
+            dx, dy = self.offset
+        points = []
+        for stamp, chunk in frames:
+            if stamp > time:
+                break
+            for index in range(0, len(chunk) - 1, 2):
+                points.append(round(chunk[index] * scale + dx, 2))
+                points.append(round(chunk[index + 1] * scale + dy, 2))
+        if not points:
+            return None
+        total = len(points) // 2
+        stride = 1
+        if total > max_points:
+            stride = int(math.ceil(total / float(max_points)))
+        if stride > 1:
+            picked = []
+            for index in range(0, total, stride):
+                picked.append(points[index * 2])
+                picked.append(points[index * 2 + 1])
+            points = picked
+        return {
+            "points": points,
+            "count": len(points) // 2,
+            "total": total,
+            "frames": sum(1 for stamp, _chunk in frames if stamp <= time),
+        }
+
     def _map_anchor(self):
         """回放轨迹的落点：优先充电桩附近，其次场地中心。"""
         for candidate in (
@@ -779,9 +819,10 @@ class BagReplay(object):
             "relocations": len(self.relocations),
             "alignment": getattr(self, "alignment", "none"),
             "pose_frame": getattr(self, "pose_frame", "local"),
+            # 世界时间：日志当时的墙钟时间，带毫秒
             "wall_time": None
             if not self.wall_start
-            else round(self.wall_start + self.time, 1),
+            else round(self.wall_start + self.time, 3),
             "tf_pose": (self.info or {}).get("tf_pose"),
             "restarts": self.restarts,
             "summary": (self.info or {}).get("summary"),

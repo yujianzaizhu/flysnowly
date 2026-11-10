@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bag_reader  # noqa: E402
 import config  # noqa: E402
 import map_editor  # noqa: E402
-import map_import  # noqa: E402
+import map_import
 import world  # noqa: E402
 from grid_map import GridMap  # noqa: E402
 from robot_car import RobotCar  # noqa: E402
@@ -685,6 +685,14 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
             self._send_json(
                 {"costmap": layer, "maps": (replay.info or {}).get("map_summary") or {}}
             )
+        elif path == "/api/bag/cloud":
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                time_value = float((query.get("t") or ["0"])[0])
+            except ValueError:
+                time_value = 0.0
+            replay = self.server.manager.replay
+            self._send_json({"cloud": replay.cloud_at(time_value)})
         elif path == "/api/reports":
             entries = list_reports()
             self._send_json(
