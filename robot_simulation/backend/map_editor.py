@@ -313,6 +313,10 @@ class Draft(object):
         # 笔迹合并轮廓的缓存
         self._brush_cache_key = None
         self._brush_cache = []
+        # 几何改动计数：笔迹轮廓、内容外接框的缓存键只比这个数 + 列表对象，
+        # 不再每次把上万个点拼进键里（编辑时每秒要算十几次）
+        self._paint_rev = 0
+        self._bounds_cache = None
 
     # ------------------------------------------------------------- 撤销 / 平移
     def _snapshot(self):
@@ -329,6 +333,7 @@ class Draft(object):
         }
 
     def _push_history(self):
+        self._paint_rev += 1
         self._history.append(self._snapshot())
         if len(self._history) > UNDO_LIMIT:
             self._history.pop(0)
@@ -346,6 +351,7 @@ class Draft(object):
 
     def undo(self):
         """撤回上一步编辑（主要是防误删）。"""
+        self._paint_rev += 1
         while self._history:
             state = self._history.pop()
             if self._state_key(state) == self._geometry_key():
@@ -380,6 +386,7 @@ class Draft(object):
 
     def _translate(self, dx, dy):
         """把全部几何平移（载入已有地图时用它把图摆到画布中央）。"""
+        self._paint_rev += 1
 
         def move_point(point):
             return (round(point[0] + dx, _ROUND), round(point[1] + dy, _ROUND))
@@ -749,8 +756,29 @@ class Draft(object):
 
     # ------------------------------------------------------------- 栅格化
     def content_bounds(self, margin=CROP_MARGIN):
-        """所有元素的联合外接框（对齐到栅格）：保存时按它裁剪地图。"""
+        """所有元素的联合外接框（对齐到栅格）：保存时按它裁剪地图。
+
+        编辑期间界面每 100 ms 拉一次 `/api/state`，草稿里带上 bounds，
+        涂抹几千个点时逐点拼两个大列表要 10 ms/次；改成直接累计 min/max
+        并按"改动计数 + 列表对象"缓存结果。
+        """
         cell = world.CELL
+        token = (
+            self._paint_rev,
+            id(self.static),
+            id(self.poly_obstacles),
+            id(self.regions),
+            id(self.passages),
+            id(self.docks),
+            id(self.no_gos),
+            id(self.dynamic),
+            self.width,
+            self.height,
+            margin,
+        )
+        cached = self._bounds_cache
+        if cached and cached[0] == token:
+            return cached[1]
         xs = []
         ys = []
 
@@ -782,7 +810,9 @@ class Draft(object):
             add(item["ax"], item["ay"], item["r"])
             add(item["bx"], item["by"], item["r"])
         if not xs or not ys:
-            return (0.0, 0.0, self.width, self.height)
+            result = (0.0, 0.0, self.width, self.height)
+            self._bounds_cache = (token, result)
+            return result
         x0 = max(0.0, min(xs) - margin)
         y0 = max(0.0, min(ys) - margin)
         x1 = min(self.width, max(xs) + margin)
@@ -795,7 +825,9 @@ class Draft(object):
             x1 = min(self.width, x0 + cell)
         if y1 - y0 < cell:
             y1 = min(self.height, y0 + cell)
-        return (round(x0, 4), round(y0, 4), round(x1, 4), round(y1, 4))
+        result = (round(x0, 4), round(y0, 4), round(x1, 4), round(y1, 4))
+        self._bounds_cache = (token, result)
+        return result
 
     def rasterize(self, bounds=None):
         """把区域 + 通道刷成"可走掩膜"，障碍与禁区从里面挖掉。
@@ -941,17 +973,66 @@ class Draft(object):
                 return False, reps
         return True, reps
 
+    def passage_links(self):
+        """通道实际连起来的区域对：看通道两端落在哪个区域里（不信任可能过期的 id）。"""
+        links = []
+        for corridor in self.passages:
+            points = corridor.get("points") or []
+            if len(points) < 2:
+                continue
+            start = self.region_at(points[0][0], points[0][1])
+            end = self.region_at(points[-1][0], points[-1][1])
+            if start is None or end is None:
+                continue
+            if start["id"] == end["id"]:
+                continue
+            links.append((start["id"], end["id"]))
+        return links
+
+    def unlinked_regions(self):
+        """没被通道连到"第一个区域"上的区域编号（区域挨着但没有通道也算没连）。"""
+        ids = [region["id"] for region in self.regions]
+        if len(ids) < 2:
+            return []
+        parent = {rid: rid for rid in ids}
+
+        def find(rid):
+            while parent[rid] != rid:
+                parent[rid] = parent[parent[rid]]
+                rid = parent[rid]
+            return rid
+
+        for a, b in self.passage_links():
+            root_a, root_b = find(a), find(b)
+            if root_a != root_b:
+                parent[root_a] = root_b
+        root = find(ids[0])
+        return [rid for rid in ids if find(rid) != root]
+
     # ------------------------------------------------------------- 校验 / 导出
     def problems(self):
+        """保存前的校验项。
+
+        连通性只看通道图（区域数 + 通道数，几十次点在多边形内判断）；
+        以前这里有一步"把整张草稿栅格化 + 全图洪水填充"（`connectivity()`），
+        编辑期间界面每 100 ms 拉一次 `/api/state`，每次都要跑两遍、在 100 m
+        空白场地上要 40~60 ms，一直占着 GIL，仿真线程被拖得走不动、手动控制发卡。
+        通道本身就是刷进掩膜里的，通道图连通即掩膜连通，那一步是多余的。
+        """
         issues = []
         if not self.regions:
             issues.append("至少需要一个区域")
         if not self.docks:
             issues.append("至少需要一个充电桩")
         if len(self.regions) > 1:
-            connected, _reps = self.connectivity()
-            if not connected:
-                issues.append("多个区域之间还没有用通道连通")
+            # 只有"通道"才算连通：两个区域挨在一起（掩膜连成一片）不算
+            stranded = self.unlinked_regions()
+            if stranded:
+                issues.append(
+                    "区域 {} 还没有用通道连通（区域挨着不算，需要画一条通道）".format(
+                        "、".join("#{}".format(rid) for rid in stranded)
+                    )
+                )
         return issues
 
     def can_save(self):
@@ -1099,9 +1180,9 @@ class Draft(object):
         反复涂抹也不会越描越碎。结果按笔迹指纹缓存。
         """
         strokes = [item for item in self.static if item.get("kind") == "brush"]
-        key = tuple(
-            (item["id"], item["r"], tuple(item["points"])) for item in strokes
-        ) + tuple(tuple(item["points"]) for item in self.poly_obstacles)
+        # 便宜的有效性判断：每次改动都会走 _push_history（计数 +1），撤销/载入会
+        # 换掉列表对象（id 变），不需要再把所有点拼进键里（涂抹多时一次几毫秒）
+        key = (self._paint_rev, id(self.static), id(self.poly_obstacles))
         if self._brush_cache_key == key:
             return [list(loop) for loop in self._brush_cache]
         if not strokes:
@@ -1307,6 +1388,9 @@ class Draft(object):
         return self
 
     def state(self):
+        # 校验只算一次：以前 problems() 被 state() 和 can_save() 各调一遍，
+        # 编辑期间每秒十几次、每次都跑栅格化+洪水填充
+        issues = self.problems()
         return {
             "active": True,
             "blank": True,
@@ -1318,14 +1402,24 @@ class Draft(object):
             "passages": [dict(item) for item in self.passages],
             "docks": [dict(item) for item in self.docks],
             "no_gos": [dict(item) for item in self.no_gos],
-            "static": [dict(item) for item in self.static],
+            # 笔迹只给界面"列表 + 轮廓"用，原始点阵每次几百 KB，不再整包下发
+            "static": [
+                {
+                    "id": item["id"],
+                    "kind": item.get("kind"),
+                    "r": item["r"],
+                    "length": item.get("length"),
+                    "point_count": len(item.get("points") or ()),
+                }
+                for item in self.static
+            ],
             "brush_outlines": self.brush_outlines(),
             "poly_obstacles": [dict(item) for item in self.poly_obstacles],
             "dynamic": [dict(item) for item in self.dynamic],
             "bounds": list(self.content_bounds()),
             "can_undo": self.can_undo,
-            "problems": self.problems(),
-            "can_save": self.can_save(),
+            "problems": issues,
+            "can_save": not issues,
         }
 
 

@@ -174,6 +174,31 @@ class DraftSaveTest(unittest.TestCase):
         self.draft.add_passage([(8.0, 6.0), (14.0, 16.0)])
         self.assertEqual(self.draft.problems(), [])
 
+    def test_touching_regions_without_passage_block_saving(self):
+        """两个区域只是挨着（栅格里连成一片）不算连通，必须真有一条通道。"""
+        self.draft.add_region(square(10.0, 10.0, 2.0))
+        self.draft.add_region(square(14.0, 10.0, 2.0))  # 与第一块在 x=12 处贴边
+        self.draft.add_dock(10.0, 10.0, 0.45)
+        # 栅格上是连通的，但没有任何通道 → 不能保存
+        self.assertTrue(self.draft.connectivity()[0])
+        problems = self.draft.problems()
+        self.assertTrue(any("通道" in text for text in problems))
+        self.assertFalse(self.draft.can_save())
+        self.draft.add_passage([(11.5, 10.0), (12.5, 10.0)])
+        self.assertEqual(self.draft.problems(), [])
+        self.assertTrue(self.draft.can_save())
+
+    def test_third_region_without_passage_is_reported(self):
+        self.draft.add_region(square(10.0, 10.0, 2.0))
+        self.draft.add_region(square(20.0, 10.0, 2.0))
+        self.draft.add_region(square(10.0, 24.0, 2.0))
+        self.draft.add_dock(10.0, 10.0, 0.45)
+        self.draft.add_passage([(11.0, 10.0), (19.0, 10.0)])
+        problems = self.draft.problems()
+        self.assertEqual(len(problems), 1)
+        self.assertIn("#3", problems[0])
+        self.assertFalse(self.draft.can_save())
+
     def test_definition_carries_dock_obstacles_and_flag(self):
         self.draft.add_region(square(6.0, 6.0, 3.0))
         self.draft.add_dock(6.0, 6.0, 0.45)

@@ -518,54 +518,6 @@ body {
   font-size: 11px;
 }
 
-.zone-list {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-
-.zone-item {
-  display: grid;
-  grid-template-columns: 20px minmax(0, 1fr) 36px;
-  align-items: center;
-  gap: 8px;
-  font-size: 10.5px;
-  color: var(--muted);
-  padding: 2px 0;
-}
-
-.zone-item .zone-name {
-  font-variant-numeric: tabular-nums;
-  font-weight: 600;
-  color: var(--text);
-}
-
-.zone-item .bar {
-  height: 5px;
-}
-
-.zone-item .bar i {
-  background: rgba(var(--green-rgb), 0.75);
-}
-
-.zone-item .zone-pct {
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-}
-
-.zone-item.unselected {
-  opacity: 0.4;
-}
-
-.zone-item.current {
-  color: var(--green);
-}
-
-.zone-item.current .zone-name {
-  color: var(--green);
-  text-shadow: 0 0 10px rgba(var(--green-rgb), 0.6);
-}
-
 /* ------------------------------------------------------------- 日志 */
 .log-title {
   margin-top: 14px !important;
@@ -864,10 +816,6 @@ body {
 .bag-speed select {
   flex: 0 0 auto;
   width: 64px;
-}
-
-.bag-progress-row {
-  gap: 10px;
 }
 
 .bag-progress {
@@ -1704,7 +1652,7 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
-  flex: 1 1 320px;
+  flex: 2 1 460px;
   min-width: 0;
   padding: 3px 8px;
   border-radius: 9px;
@@ -1741,7 +1689,7 @@ body {
 }
 
 .bag-bar-name {
-  flex: 0 1 auto;
+  flex: 1 1 110px;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1765,26 +1713,37 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+.bag-bar-progress {
+  flex: 1 1 110px;
+  min-width: 80px;
+  max-width: 260px;
+  margin: 0;
+}
+
+.bag-bar-progress:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .bag-bar-hint {
-  flex: 1 1 90px;
+  flex: 0 1 auto;
   min-width: 0;
+  max-width: 240px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--muted);
 }
 
+/* 暂停提示用绿色，和运行中的灰色提示区分开 */
+.bag-bar-hint.is-paused {
+  color: var(--green);
+}
+
 .bag-hud-note {
   margin: 0;
   font-size: 11px;
   color: var(--muted);
-}
-
-.zone-progress {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-bottom: 8px;
 }
 
 .tips {

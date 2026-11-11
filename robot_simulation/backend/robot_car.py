@@ -10,8 +10,11 @@ from collections import deque
 
 import world
 
+# 自主任务（沿边 / 弓字 / 回充）用的限速
 MAX_LINEAR = 0.60
 MAX_ANGULAR = 1.8
+# 手动控制（键盘 / 界面上的线速度档位）允许开得更快：3 m/s
+MANUAL_MAX_LINEAR = 3.0
 LINEAR_ACCEL = 1.3
 ANGULAR_ACCEL = 4.5
 
@@ -87,8 +90,8 @@ class RobotCar(object):
     # ----------------------------------------------------------- 指令
     def handle_command(self, name, linear=None, angular=None):
         if name == "drive":
-            # 手动直接给线速度 / 角速度（脚本或测试用）
-            self.drive(float(linear or 0.0), float(angular or 0.0))
+            # 手动直接给线速度 / 角速度（脚本或测试用）：按手动限速放行
+            self.drive(float(linear or 0.0), float(angular or 0.0), manual=True)
             return
         if name not in COMMANDS:
             raise ValueError("未知指令: {}".format(name))
@@ -100,7 +103,7 @@ class RobotCar(object):
             default_v, default_w = COMMANDS[name]
             v = speed_v if speed_v is not None else abs(default_v)
             w = speed_w if speed_w is not None else abs(default_w)
-            v = min(v, MAX_LINEAR)
+            v = min(v, MANUAL_MAX_LINEAR)
             w = min(w, MAX_ANGULAR)
             with self.lock:
                 self.target_v = math.copysign(v, default_v) if default_v else 0.0
@@ -109,10 +112,13 @@ class RobotCar(object):
         with self.lock:
             self.target_v, self.target_w = COMMANDS[name]
 
-    def drive(self, linear, angular):
+    def drive(self, linear, angular, manual=False):
         limits = self.replay_limits
         max_v = MAX_LINEAR if limits is None else limits[0]
         max_w = MAX_ANGULAR if limits is None else limits[1]
+        if manual and limits is None:
+            # 手动驾驶可以到 3 m/s；回放拖动中仍按回放限速
+            max_v = MANUAL_MAX_LINEAR
         with self.lock:
             self.target_v = max(-max_v, min(max_v, linear))
             self.target_w = max(-max_w, min(max_w, angular))

@@ -47,14 +47,11 @@
     simTime: document.getElementById("simTime"),
     leftWheel: document.getElementById("leftWheel"),
     rightWheel: document.getElementById("rightWheel"),
-    zoneList: document.getElementById("zoneList"),
+
     log: document.getElementById("log"),
     phaseChip: document.getElementById("phaseChip"),
     zoneChip: document.getElementById("zoneChip"),
-    mapFill: document.getElementById("mapFill"),
-    mapText: document.getElementById("mapText"),
-    overallFill: document.getElementById("overallFill"),
-    overallText: document.getElementById("overallText"),
+
     mowMode: document.getElementById("mowMode"),
     moduleBtn: document.getElementById("moduleBtn"),
     moduleMenu: document.getElementById("moduleMenu"),
@@ -267,6 +264,7 @@
   let previous = null;
   let currentAt = 0;
   let trail = [];
+  let strokeBreakPending = false;   // 换日志后下一点不跟上一段连线
   // 话题图层开关：日志里的 grid_costmap（红色代价方块）、轨迹、图像窗口都可单独屏蔽
   const LAYER_KEY = "mowerTopicLayersV1";
   let layerVisible = { pose: true, costmap: true, cloud: true, image: true, map: true, static_costmap: true };
@@ -284,7 +282,7 @@
   let lastBump = 0;
   let bumpFlashUntil = 0;
   let logSignature = "";
-  let zoneRows = [];
+
   let lastMapId = null;
   let mapOptionsSignature = "";
   let viewWorldKey = "";
@@ -413,12 +411,11 @@
     const logName = bag.name || "";
     const queuePlaying = !!(bagQueue && bagQueue.active);
     const nameChanged = !!(logName && lastLogName && logName !== lastLogName);
-    let switchedBag = false;
     if (nameChanged) {
-      // 连续播放会自动换日志：路径要接着画（只在手动载入/复位时清除），
-      // 两段之间用红色跳线连一下，免得看着像一条连续的作业路径。
+      // 连续播放会自动换日志，等于重新播一份日志：上一段路径保留，
+      // 但这里重新起笔——不画跳线，也不跟上一段连线。
       if (!queuePlaying) trail = [];
-      else switchedBag = true;
+      else strokeBreakPending = true;
       lastRestarts = restarts;
       lastBagActive = !!bag.active;
     } else if (restarts > lastRestarts) {
@@ -441,10 +438,16 @@
       step = 0.0;
     }
     if (!tail || step > 0.02) {
-      // 回放中发生重定位、换包、或位置突然跳很远：这一段画成红色跳线
-      const jump = !!tail && (teleports > lastTeleportsMark || step > 2.0 || switchedBag);
+      // 回放中发生重定位、或位置突然跳很远：这一段画成红色跳线（换包不算，重新起笔）
+      const jump = !!tail && !strokeBreakPending && (teleports > lastTeleportsMark || step > 2.0);
       lastTeleportsMark = teleports;
-      trail.push({ x: state.pose.x, y: state.pose.y, jump });
+      trail.push({
+        x: state.pose.x,
+        y: state.pose.y,
+        jump,
+        gap: strokeBreakPending,
+      });
+      strokeBreakPending = false;
       if (trail.length > TRAIL_LIMIT) trail.shift();
     }
 
@@ -811,24 +814,43 @@
     updateEditorUI();
   }
 
+  // 正在画区域 / 通道（还没点保存）时，草稿本身虽然"合格"，但不能说校验通过
+  function editorPendingProblems() {
+    if (editor.mode === "region") {
+      return [
+        "区域正在生成（未保存）：绕完一圈后点“保存区域”，或点“取消区域”放弃这次区域",
+      ];
+    }
+    if (editor.mode === "passage") {
+      return [
+        "通道正在生成（未保存）：开到另一个区域后点“保存通道”，或点“取消通道”放弃这次通道",
+      ];
+    }
+    return [];
+  }
+
+  function renderEditorProblems(draft) {
+    if (!els.editorProblems) return;
+    els.editorProblems.textContent = "";
+    if (!draft || !draft.active) return;
+    const problems = editorPendingProblems().concat(draft.problems || []);
+    if (!problems.length) {
+      const ok = document.createElement("li");
+      ok.className = "is-ok";
+      ok.textContent = "校验通过，可以保存地图";
+      els.editorProblems.appendChild(ok);
+      return;
+    }
+    problems.forEach((text) => {
+      const item = document.createElement("li");
+      item.textContent = text;
+      els.editorProblems.appendChild(item);
+    });
+  }
+
   function renderEditorDraftInfo(draft) {
     if (!els.editorProblems || !els.editorList) return;
-    els.editorProblems.textContent = "";
-    const problems = (draft && draft.problems) || [];
-    if (draft && draft.active) {
-      if (!problems.length) {
-        const ok = document.createElement("li");
-        ok.className = "is-ok";
-        ok.textContent = "校验通过，可以保存地图";
-        els.editorProblems.appendChild(ok);
-      } else {
-        problems.forEach((text) => {
-          const item = document.createElement("li");
-          item.textContent = text;
-          els.editorProblems.appendChild(item);
-        });
-      }
-    }
+    renderEditorProblems(draft);
 
     els.editorList.textContent = "";
     if (!draft || !draft.active) {
@@ -1006,6 +1028,8 @@
     }
     lockMissionDuringEditing(active);
     canvas.style.cursor = editorCursor();
+    // 进入 / 退出"区域/通道生成"也要立刻刷新校验结论（否则会一直显示校验通过）
+    renderEditorProblems(editor.draft);
     applyEditorMessage();
   }
 
@@ -1423,8 +1447,9 @@
       editorSay("当前没有正在编辑的地图", "bad");
       return;
     }
-    if (draft.problems && draft.problems.length) {
-      editorSay("还不能保存：" + draft.problems.join("；"), "bad");
+    const problems = editorPendingProblems().concat((draft && draft.problems) || []);
+    if (problems.length) {
+      editorSay("还不能保存：" + problems.join("；"), "bad");
       return;
     }
     const typed = els.editorName ? els.editorName.value.trim() : "";
@@ -1940,28 +1965,8 @@
     });
   }
 
-  function ensureZoneRows(zones) {
-    if (zoneRows.length === zones.length) return;
-    els.zoneList.textContent = "";
-    zoneRows = zones.map(() => {
-      const row = document.createElement("div");
-      row.className = "zone-item";
-      const name = document.createElement("span");
-      name.className = "zone-name";
-      const bar = document.createElement("div");
-      bar.className = "bar";
-      const fill = document.createElement("i");
-      bar.append(fill);
-      const pct = document.createElement("span");
-      pct.className = "zone-pct";
-      row.append(name, bar, pct);
-      els.zoneList.append(row);
-      return { row, name, fill, pct };
-    });
-  }
-
+  // “区域覆盖”面板已取消：这里只保留"割草区域"输入框的自动占位提示
   function updateZones(zones) {
-    ensureZoneRows(zones);
     const joined = zones.map((zone) => zone.id).join(",");
     if (zones.length && joined !== zoneAutoValue) {
       zoneAutoValue = joined;
@@ -1972,33 +1977,14 @@
         els.zoneOrder.placeholder = "自动（" + joined + "）";
       }
     }
-    zones.forEach((zone, index) => {
-      const target = zoneRows[index];
-      if (!target) return;
-      target.name.textContent = String(zone.id);
-      const pct = clamp(zone.coverage, 0, 1) * 100;
-      target.fill.style.width = pct.toFixed(2) + "%";
-      target.pct.textContent = pct.toFixed(2) + "%";
-      target.row.className =
-        "zone-item" +
-        (zone.current ? " current" : "") +
-        (zone.selected ? "" : " unselected");
-    });
   }
 
   function updateMission(task, state) {
-    const mapProgress = clamp(task.map_progress || 0, 0, 1);
-    const coverage = clamp(task.coverage || 0, 0, 1);
-    const overall = clamp(
-      typeof task.overall_coverage === "number" ? task.overall_coverage : coverage,
-      0,
-      1
-    );
-    els.mapFill.style.width = (mapProgress * 100).toFixed(2) + "%";
-    els.mapText.textContent = (mapProgress * 100).toFixed(2) + "%";
-    els.overallFill.style.width = (overall * 100).toFixed(2) + "%";
-    els.overallText.textContent = (overall * 100).toFixed(2) + "%";
-    els.missionMessage.textContent = task.message || "";
+    // 回放任务的提示（"开始回放日志 xxx：… 时长 149.6 s"）在任务栏里太长，
+    // 回放信息已经由右边的回放条显示，这里不再重复（空消息整块隐藏，给回放条腾地方）
+    const message = task && task.type === "replay" ? "" : task.message || "";
+    els.missionMessage.textContent = message;
+    els.missionMessage.hidden = !message;
     els.speedButtons.forEach((button) => {
       button.classList.toggle("active", Number(button.dataset.speed) === state.speed);
     });
@@ -2715,6 +2701,8 @@
     ctx.lineCap = "round";
     for (let index = 1; index < trail.length; index += 1) {
       const point = trail[index];
+      // 连续播放换日志处重新起笔：不跟上一段连线
+      if (point.gap) continue;
       const alpha = point.jump
         ? 0.7
         : bold
@@ -3267,7 +3255,8 @@
   const manualSpeed = { linear: 0.55, angular: 1.80 };
 
   function applyManualSpeedValues() {
-    manualSpeed.linear = clamp(Math.abs(parseFloat(els.manualLinear.value)) || 0.55, 0.10, 0.60);
+    // 手动档位线速度上限 3 m/s（自主任务仍按后端的 MAX_LINEAR 限速）
+    manualSpeed.linear = clamp(Math.abs(parseFloat(els.manualLinear.value)) || 0.55, 0.10, 3.00);
     manualSpeed.angular = clamp(Math.abs(parseFloat(els.manualAngular.value)) || 1.80, 0.20, 1.80);
     els.manualLinear.value = manualSpeed.linear.toFixed(2);
     els.manualAngular.value = manualSpeed.angular.toFixed(2);
@@ -3790,7 +3779,8 @@
     bagQueue = queue || null;
     if (!els.bagQueueInfo) return;
     const total = queue && queue.total ? queue.total : 0;
-    const index = queue && queue.total ? queue.index + 1 : 0;
+    // 队列跑完时 index 会等于 total，序号夹住免得显示成 "3/2"
+    const index = total ? Math.min(queue.index + 1, total) : 0;
     if (!total) {
       els.bagQueueInfo.textContent = bagOrder.length
         ? "顺序 " + bagOrder.length + " 个"
@@ -3808,6 +3798,7 @@
     if (els.bagBar) els.bagBar.classList.toggle("is-idle", !loaded);
     if (els.bagCurrentName) {
       els.bagCurrentName.textContent = loaded && bag.name ? bag.name : "未载入日志";
+      els.bagCurrentName.title = loaded && bag.name ? bag.name : "";
     }
     if (els.bagTime) {
       els.bagTime.textContent = loaded
@@ -3823,6 +3814,9 @@
       els.bagPlayBtn.textContent = paused ? "继续" : "播放";
     }
     if (els.bagPauseBtn) els.bagPauseBtn.disabled = !loaded || !bag.playing;
+    // 停止放在暂停后面：直接退出这次回放（日志仍在，可再点"播放"）
+    if (els.bagStopBtn) els.bagStopBtn.disabled = !loaded || (!bag.active && !bag.playing);
+    if (els.bagProgress) els.bagProgress.disabled = !loaded;
   }
 
   function renderBagState(state) {
@@ -3887,17 +3881,19 @@
         ? "（该日志没有地图数据，已切换为不限制区域的开阔场地）"
         : "";
       const paused = state.active && !state.playing && !state.finished;
-      setBagHint(
-        (state.playing
-          ? "回放中：青色线是仿真实际轨迹，红色细线是跳变（重定位/换日志）"
-          : state.finished
-          ? "回放结束，可拖动进度条重播或重新载入其他日志"
-          : paused
-          ? "已暂停，点“继续”从当前位置接着回放"
-          : "已载入，点“播放”开始把日志轨迹映射到仿真机器人上") + noMap,
-        0
-      );
+      if (els.bagHint) els.bagHint.classList.toggle("is-paused", paused);
+      // 任务栏空间有限：提示只留短句，完整说明放进 title（悬停可见）
+      const hint = state.playing
+        ? ["回放中", "青色线是仿真实际轨迹，红色细线是跳变（重定位/换日志）"]
+        : state.finished
+        ? ["回放结束", "可拖动进度条重播或重新载入其他日志"]
+        : paused
+        ? ["已暂停，点“继续”接着回放", "已暂停，点“继续”从当前位置接着回放"]
+        : ["已载入，点“播放”", "已载入，点“播放”开始把日志轨迹映射到仿真机器人上"];
+      setBagHint(hint[0] + noMap, 0);
+      if (els.bagHint) els.bagHint.title = hint[1] + noMap;
     } else {
+      if (els.bagHint) els.bagHint.classList.remove("is-paused");
       setBagHint("选择日志后点“载入”，再点“播放”；勾选多个可“连续播放”。", 0);
     }
     if (els.bagPlayBtn) {
@@ -4224,7 +4220,6 @@
   const moduleDefaults = {
     telemetry: true,
     manual: true,
-    zones: true,
     events: true,
     params: true,
     map: true,

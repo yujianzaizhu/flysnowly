@@ -53,7 +53,6 @@
         <div id="moduleMenu" class="module-menu-pop" hidden>
           <label><input type="checkbox" data-module-toggle="telemetry" checked /> 遥测数据</label>
           <label><input type="checkbox" data-module-toggle="manual" checked /> 手动控制</label>
-          <label><input type="checkbox" data-module-toggle="zones" checked /> 区域覆盖</label>
           <label><input type="checkbox" data-module-toggle="map" checked /> 地图功能</label>
           <label><input type="checkbox" data-module-toggle="events" checked /> 底部面板</label>
           <label><input type="checkbox" data-module-toggle="params" checked /> 参数设置</label>
@@ -140,23 +139,6 @@
           </div>
         </div>
 
-      </section>
-
-      <section class="panel" data-module="zones" data-drag-panel="zones" aria-label="区域覆盖">
-        <h2><span class="drag-grip" data-drag-handle title="拖动模块">⋮⋮</span>区域覆盖 <span>Zones</span></h2>
-        <div class="zone-progress">
-          <div class="progress">
-            <span>边界建图</span>
-            <div class="bar"><i id="mapFill"></i></div>
-            <em id="mapText">0%</em>
-          </div>
-          <div class="progress">
-            <span>总覆盖</span>
-            <div class="bar"><i id="overallFill"></i></div>
-            <em id="overallText">0.00%</em>
-          </div>
-        </div>
-        <div id="zoneList" class="zone-list"></div>
       </section>
 
       <section class="panel" data-module="params" data-drag-panel="params" aria-label="参数设置">
@@ -282,7 +264,7 @@
           <button class="pad-btn pad-btn--down" data-command="backward" aria-label="后退">▼</button>
         </div>
         <div class="manual-speed">
-          <label>线速度 (m/s)<input id="manualLinear" type="number" step="0.05" min="0.10" max="0.60" value="0.55" /></label>
+          <label>线速度 (m/s)<input id="manualLinear" type="number" step="0.05" min="0.10" max="3.00" value="0.55" /></label>
           <label>角速度 (rad/s)<input id="manualAngular" type="number" step="0.10" min="0.20" max="1.80" value="1.80" /></label>
         </div>
         <p id="manualMessage" class="hint manual-hint">
@@ -340,6 +322,10 @@
           <div id="bagBar" class="bag-bar" aria-label="日志回放">
             <button id="bagPlayBtn" class="bag-bar-btn" type="button" disabled>播放</button>
             <button id="bagPauseBtn" class="bag-bar-btn" type="button" disabled>暂停</button>
+            <button id="bagStopBtn" class="bag-bar-btn" type="button" disabled
+              title="停止回放，退出日志播放">停止</button>
+            <input id="bagProgress" class="bag-progress bag-bar-progress" type="range"
+              min="0" max="1000" value="0" step="1" title="拖动进度条定位回放时刻" disabled />
             <span id="bagCurrentName" class="bag-bar-name">未载入日志</span>
             <span id="bagTime" class="bag-bar-time">--</span>
             <span class="bag-bar-world">世界时间 <strong id="bagWorld">--</strong></span>
@@ -408,13 +394,9 @@
         <div class="bag-col bag-col--left">
           <div class="bag-row bag-row--play">
             <button id="bagLoadBtn" class="task-btn task-btn--primary" type="button">载入</button>
-            <button id="bagStopBtn" class="task-btn task-btn--ghost" type="button">停止</button>
             <button id="bagQueueBtn" class="task-btn" type="button" title="按勾选顺序连续播放">连续播放</button>
           </div>
-          <div class="bag-row bag-progress-row">
-            <input id="bagProgress" class="bag-progress" type="range" min="0" max="1000" value="0" step="1" />
-          </div>
-          <p class="bag-hud-note">回放状态（当前日志 / 回放时间 / 世界时间 / 播放暂停）在“任务操作”栏里；倍速用顶部的仿真倍速。</p>
+          <p class="bag-hud-note">回放状态（进度条 / 当前日志 / 回放时间 / 世界时间 / 播放暂停停止）在“任务操作”栏里；倍速用顶部的仿真倍速。</p>
           <div class="bag-row">
             <label class="bag-label" for="bagFolder">日志文件夹</label>
             <select id="bagFolder" class="bag-select"></select>

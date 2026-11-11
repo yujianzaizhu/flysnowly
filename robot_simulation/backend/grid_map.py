@@ -27,6 +27,10 @@ SURFACE_STAMP_SPAN = 2
 VERIFY_RADIUS = 0.06
 LARGE_OBSTACLE_EXTENT = 0.85
 LARGE_OBSTACLE_AREA = 5.0
+# 栅格超过这么多格（编辑用的 100 × 100 m 空白场地是 100 万格）时，障碍估计只扫车周围
+OBSTACLE_SCAN_CELL_LIMIT = 250000
+OBSTACLE_SCAN_RANGE = 6.0      # m
+
 MAX_OBSTACLE_CELLS = 1200
 MAX_OBSTACLE_EXTENT = 4.0
 SMALL_OBSTACLE_RADIUS = 0.45
@@ -42,6 +46,8 @@ class GridMap(object):
         self.data_version = 1
         self._circle_cache_version = -1
         self._circle_cache = []
+        # 车最近一次位姿：超大地图上障碍估计只扫车周围一圈（见 _compute_obstacle_circles）
+        self._last_pose = None
         self._boundary_cache_version = -1
         self._boundary_cache = 0.0
         self._wall_known = []
@@ -543,6 +549,7 @@ class GridMap(object):
 
     def update_from_scan(self, pose, readings, max_range):
         x, y, theta = pose
+        self._last_pose = (x, y)
         self._verify_footprint(x, y)
         cell = self.cell
         cols = self.cols
@@ -1573,11 +1580,54 @@ class GridMap(object):
             and expanded[1] <= circle["y"] <= expanded[3]
         ]
 
+    def _scan_occupied_bounds(self):
+        """占据格的联合外接框（按行切块查，100 万格也只要 ~0.7 ms）。
+
+        障碍轮廓以前是整张栅格逐格扫（编辑用的 100 × 100 m 空白场地 100 万格实测
+        250 ms）；编辑期间每 100 ms 一次 `/api/state` 都会因 data_version 变化重算，
+        单线程 HTTP 服务器把 `/api/command` 也堵在后面，手动控制就一顿一顿的。
+        """
+        cols = self.cols
+        data = self.data
+        col0 = col1 = row0 = row1 = None
+        for row in range(self.rows):
+            base = row * cols
+            chunk = data[base:base + cols]
+            try:
+                first = chunk.index(OCCUPIED)
+            except ValueError:
+                continue
+            last = chunk.rindex(OCCUPIED)
+            if row0 is None:
+                row0 = row
+            row1 = row
+            col0 = first if col0 is None else min(col0, first)
+            col1 = last if col1 is None else max(col1, last)
+        if col0 is None:
+            return None
+        return [col0, row0, col1, row1]
+
     def _compute_obstacle_circles(self):
         visited = set()
         circles = []
-        for row in range(self.rows):
-            for col in range(self.cols):
+        bounds = self._scan_occupied_bounds()
+        if bounds is None:
+            return circles
+        col_start = max(0, bounds[0])
+        col_end = min(self.cols - 1, bounds[2])
+        row_start = max(0, bounds[1])
+        row_end = min(self.rows - 1, bounds[3])
+        if self.cols * self.rows > OBSTACLE_SCAN_CELL_LIMIT and self._last_pose is not None:
+            # 超大地图（例如编辑用的 100 × 100 m 空白场地，100 万格）：只看车周围一圈，
+            # 远处障碍既不影响避障也不影响显示，没必要每次数据变动都重扫。
+            half = int(round(OBSTACLE_SCAN_RANGE / self.cell))
+            px_col, px_row = self.cell_of(*self._last_pose)
+            col_start = max(col_start, px_col - half)
+            col_end = min(col_end, px_col + half)
+            row_start = max(row_start, px_row - half)
+            row_end = min(row_end, px_row + half)
+        for row in range(row_start, row_end + 1):
+            for col in range(col_start, col_end + 1):
                 index = self.index(col, row)
                 if index in visited or self.data[index] != OCCUPIED:
                     continue

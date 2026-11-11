@@ -86,8 +86,9 @@ class ManualSpeedTest(unittest.TestCase):
         self.assertAlmostEqual(self.car.target_w, robot_car.COMMANDS["left"][1])
 
     def test_speed_is_clamped_to_limits(self):
+        # 手动控制走单独的限速（线速度上限 3 m/s），自主任务仍按 MAX_LINEAR
         self.car.handle_command("forward", linear=5.0, angular=9.0)
-        self.assertAlmostEqual(self.car.target_v, robot_car.MAX_LINEAR)
+        self.assertAlmostEqual(self.car.target_v, robot_car.MANUAL_MAX_LINEAR)
         self.car.handle_command("left", linear=5.0, angular=9.0)
         self.assertAlmostEqual(self.car.target_w, robot_car.MAX_ANGULAR)
 
