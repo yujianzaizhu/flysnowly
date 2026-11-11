@@ -23,6 +23,10 @@ class NavRobot(object):
         self.w = 0.0
         self.target_v = 0.0
         self.target_w = 0.0
+        # 导航速度源: 点到点任务期间由 tea cmd_vel 驱动, 与手动 drive 互斥
+        self.nav_mode = False
+        self.nav_v = 0.0
+        self.nav_w = 0.0
         self.sim_time = 0.0
         self.distance = 0.0
         self.battery = 100.0
@@ -35,8 +39,31 @@ class NavRobot(object):
 
     def drive(self, linear, angular):
         with self.lock:
+            if self.nav_mode:
+                # 导航期间手动输入由 server 409 拦截, 这里兜底忽略, 防止速度源打架
+                return
             self.target_v = max(-0.60, min(0.60, float(linear)))
             self.target_w = max(-1.80, min(1.80, float(angular)))
+
+    def drive_nav(self, linear, angular):
+        """导航速度源入口: 仅导航模式下生效, 限幅与手动一致。"""
+
+        with self.lock:
+            if not self.nav_mode:
+                return
+            self.nav_v = max(-0.60, min(0.60, float(linear)))
+            self.nav_w = max(-1.80, min(1.80, float(angular)))
+
+    def set_nav_mode(self, active):
+        """进入/退出导航模式。进入时清手动目标避免残留速度; 退出时清导航目标停车。"""
+
+        with self.lock:
+            self.nav_mode = bool(active)
+            if self.nav_mode:
+                self.target_v = 0.0
+                self.target_w = 0.0
+            self.nav_v = 0.0
+            self.nav_w = 0.0
 
     def stop(self):
         self.drive(0.0, 0.0)
@@ -44,8 +71,9 @@ class NavRobot(object):
     def step(self, dt):
         with self.lock:
             self.sim_time += dt
-            self.v = _approach(self.v, self.target_v, 1.3 * dt)
-            self.w = _approach(self.w, self.target_w, 4.5 * dt)
+            target_v, target_w = (self.nav_v, self.nav_w) if self.nav_mode else (self.target_v, self.target_w)
+            self.v = _approach(self.v, target_v, 1.3 * dt)
+            self.w = _approach(self.w, target_w, 4.5 * dt)
             x, y, theta = self.pose
             self.pose = [
                 x + self.v * math.cos(theta) * dt,

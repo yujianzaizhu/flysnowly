@@ -620,6 +620,109 @@ class ServerTest(unittest.TestCase):
             self.post("/api/bag/playlist", {"names": []})
         self.assertEqual(ctx.exception.code, 400)
 
+    def _wait_queue(self, timeout=30.0):
+        """等到连续播放队列跑完（active=False 且 index 走到队尾）。"""
+        deadline = time.time() + timeout
+        queue = {}
+        while time.time() < deadline:
+            queue = json.loads(self.get("/api/state")[1]).get("queue") or {}
+            total = queue.get("total") or 0
+            if total and not queue.get("active") and queue.get("index") >= total:
+                return queue
+            time.sleep(0.15)
+        return queue
+
+    def test_bag_playlist_skips_broken_bag(self):
+        """一条日志读不出来只跳过它，整条连续播放要能跑完。"""
+        tmp = tempfile.mkdtemp(prefix="robot-bagskip-")
+        group = os.path.join(tmp, "跳过")
+        os.makedirs(group)
+        bag_fixtures.build_bag(os.path.join(group, "ok1.bag"), samples=8, dt=0.1)
+        broken = os.path.join(group, "broken.bag")
+        with open(broken, "wb") as handle:
+            handle.write(b"not a sqlite database")
+        bag_fixtures.build_bag(os.path.join(group, "ok2.bag"), samples=8, dt=0.1)
+        names = [
+            os.path.join("跳过", "ok1.bag"),
+            os.path.join("跳过", "broken.bag"),
+            os.path.join("跳过", "ok2.bag"),
+        ]
+        try:
+            self.post("/api/bag/dir", {"path": tmp})
+            self.post("/api/speed", {"speed": 32})
+            _status, body = self.post("/api/bag/playlist", {"names": names})
+            self.assertEqual(body["queue"]["total"], 3)
+            queue = self._wait_queue()
+            self.assertFalse(queue.get("active"))
+            self.assertEqual(queue.get("index"), queue.get("total"))
+            self.assertFalse(queue.get("loading"))
+            failed = [os.path.basename(item) for item in queue.get("failed") or []]
+            self.assertEqual(failed, ["broken.bag"])
+        finally:
+            self.post("/api/bag/control", {"command": "stop"})
+            self.httpd.bag_queue = None
+            self.post("/api/speed", {"speed": 1})
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_continuous_playback_keeps_cloud_history(self):
+        """连续播放换包不清历史感知点云，「清理地图」才清。"""
+        tmp = tempfile.mkdtemp(prefix="robot-bagcloud-")
+        group = os.path.join(tmp, "点云")
+        os.makedirs(group)
+        bag_fixtures.build_map_frame_bag(
+            os.path.join(group, "cloud_a.bag"), samples=120, dt=0.1, clouds=True
+        )
+        bag_fixtures.build_map_frame_bag(
+            os.path.join(group, "cloud_b.bag"), samples=120, dt=0.1, clouds=True
+        )
+        names = [os.path.join("点云", "cloud_a.bag"), os.path.join("点云", "cloud_b.bag")]
+        try:
+            self.post("/api/bag/dir", {"path": tmp})
+            self.post("/api/speed", {"speed": 32})
+            self.post("/api/bag/playlist", {"names": names})
+            self._wait_queue()
+            cloud = json.loads(self.get("/api/bag/cloud?t=0")[1])["cloud"]
+            self.assertIsNotNone(cloud)
+            # 上一段日志的点云被留下来（换包不清）
+            self.assertGreaterEqual(cloud.get("bags") or 0, 1)
+            self.assertGreater(cloud.get("history") or 0, 0)
+            self.assertGreater(cloud.get("count") or 0, 0)
+
+            _status, cleared = self.post("/api/bag/cloud/clear", {})
+            self.assertTrue(cleared["ok"])
+            self.assertGreater(cleared["cleared"], 0)
+            cloud = json.loads(self.get("/api/bag/cloud?t=0")[1])["cloud"]
+            self.assertTrue(cloud is None or (cloud.get("history") or 0) == 0)
+        finally:
+            self.post("/api/bag/control", {"command": "stop"})
+            self.httpd.bag_queue = None
+            self.post("/api/map", {"map": 1})
+            self.post("/api/speed", {"speed": 1})
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_manual_load_clears_cloud_history(self):
+        """手动载入日志要把历史点云清掉（重新起笔）。"""
+        tmp = tempfile.mkdtemp(prefix="robot-bagcloudload-")
+        try:
+            bag_fixtures.build_map_frame_bag(
+                os.path.join(tmp, "one.bag"), samples=120, dt=0.1, clouds=True
+            )
+            bag_fixtures.build_map_frame_bag(
+                os.path.join(tmp, "two.bag"), samples=120, dt=0.1, clouds=True
+            )
+            self.post("/api/bag/dir", {"path": tmp})
+            self.post("/api/bag/load", {"name": "one.bag"})
+            # 直接灌一段历史，模拟连续播放换包后的累积
+            archived = self.httpd.manager.replay.cloud_at(float("inf"), max_points=6000)
+            server.cloud_history(self.httpd).append(list(archived["points"]))
+            self.assertGreater(len(server.cloud_history(self.httpd)), 0)
+            self.post("/api/bag/load", {"name": "two.bag"})
+            self.assertEqual(server.cloud_history(self.httpd), [])
+        finally:
+            self.post("/api/bag/control", {"command": "stop"})
+            self.post("/api/map", {"map": 1})
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_static_traversal_is_blocked(self):
         with self.assertRaises(urllib.error.HTTPError) as context:
             self.get("/../backend/server.py")

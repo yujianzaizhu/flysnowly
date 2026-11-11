@@ -16,6 +16,7 @@
   let funcTab = "build";
   let fitNext = true;
   let logSignature = "";
+  let pickingGoal = false;
   let refreshBusy = false;
   let refreshFailures = 0;
   const view = { x: 0, y: 0, scale: 70 };
@@ -71,8 +72,10 @@
     $("batteryFill").style.width = Number(state.battery || 0) + "%";
     if (!paramsDirty) loadConfig(state.config || {});
     updateWorkarea(state);
+    updateNav(state);
     renderLog(state.log || []);
     fetchMap(state.workarea);
+    updateMapEmptyHint();
   }
 
   function loadConfig(values) {
@@ -89,8 +92,13 @@
     $("teaStatus").textContent = !tea.enabled ? "导航进程未启用" : tea.connected ? "导航进程已连接" : "等待导航进程响应";
     $("teaAddress").textContent = "record_path · " + (tea.host || "--") + ":" + (tea.record_port || "--");
     $("waStatus").textContent = building ? "正在构建" : (tea.last_error || "空闲");
+    // 构建度量来自 tea get_area_info 话题: 通道(type=2)为长度, 区域/禁区为面积
+    const measureText = building && tea.build_measure != null
+      ? (session.type === 2 ? "长度 " + Number(tea.build_measure).toFixed(2) + " m"
+                            : "面积 " + Number(tea.build_measure).toFixed(2) + " m²")
+      : "";
     $("waSessionInfo").textContent = building
-      ? "轨迹 " + Number(tea.trail_len || 0).toFixed(1) + " m · 位姿发布 " + Number(tea.pub_count || 0)
+      ? (measureText ? measureText + " · " : "") + "轨迹 " + Number(tea.trail_len || 0).toFixed(1) + " m · 位姿发布 " + Number(tea.pub_count || 0)
       : "地图版本 " + Number(tea.map_version || 0) + " · 位姿发布 " + Number(tea.pub_count || 0);
     [$("teaStatusDot"), $("waStatusDot")].forEach((dot) => {
       dot.className = "status-dot" + (building ? " busy" : tea.last_error ? " error" : tea.connected ? " online" : "");
@@ -104,10 +112,87 @@
       ? "进入后由真实导航进程记录区域、通道或禁区轨迹。"
       : "导航进程桥不可用（" + (tea.reason || "未启用") + "）。";
     startButtons.forEach((button) => { button.disabled = !tea.enabled || building; });
-    driveButtons.forEach((button) => { button.disabled = !tea.enabled; });
+    // 点到点导航中速度源归 tea, 手动方向盘锁定(后端 /api/nav/drive 也会 409)
+    const navActive = !!(state.nav && state.nav.active);
+    driveButtons.forEach((button) => { button.disabled = !tea.enabled || navActive; });
     $("waSaveBtn").disabled = !building;
     $("waCancelBtn").disabled = !building;
+    // 删除当前图是编辑命令: 桥可用且不在构建中才允许(与 tea 状态机放行范围一致)
+    $("waClearBtn").disabled = !tea.enabled || !tea.connected || building;
     $("exitWorkareaBtn").disabled = building;
+  }
+
+  // ----------------------------------------------------------- 点到点任务
+  // 选点 -> POST /api/nav/goal -> tea 规划导航并下发 cmd_vel, 桥订阅驱动机器人;
+  // 取消/暂停/继续走 nav_task_action, 终态由 nav_task_action_result 话题判定。
+  function updateNav(state) {
+    const nav = state.nav || { active: false };
+    const tea = state.workarea || { enabled: false };
+    const pickBtn = $("pickGoalBtn");
+    if (pickingGoal && nav.active) {
+      // 目标已受理, 退出选点姿态(正常流程 pickGoalAt 已清, 这里兜底)
+      pickingGoal = false;
+      canvas.classList.remove("picking");
+    }
+    pickBtn.textContent = pickingGoal ? "取消选点" : "选目标点";
+    pickBtn.disabled = !tea.enabled || nav.active;
+    $("goalPauseBtn").disabled = !nav.active || nav.paused;
+    $("goalContinueBtn").disabled = !nav.active || !nav.paused;
+    $("goalCancelBtn").disabled = !nav.active;
+    const hint = $("navTaskHint");
+    const goal = nav.goal;
+    if (pickingGoal) {
+      hint.textContent = "选点中：在地图上单击确定目标点，点“取消选点”退出。";
+    } else if (nav.active && goal) {
+      hint.textContent = (nav.paused ? "已暂停 → " : "导航中 → ")
+        + "(" + Number(goal.x).toFixed(2) + ", " + Number(goal.y).toFixed(2) + ")"
+        + "，手动遥控已锁定。";
+    } else if (nav.last_result) {
+      const names = { 0: "已结束", 1: "已到达", 2: "失败" };
+      hint.textContent = "上次任务" + (names[nav.last_result.outcome] || "已结束")
+        + (nav.last_result.text ? "：" + nav.last_result.text : "") + "。";
+    } else {
+      hint.textContent = "点“选目标点”后在地图上单击确定目标，由 tea 规划导航。";
+    }
+  }
+
+  async function navAction(path, payload) {
+    try {
+      const state = await post(path, payload || {});
+      ingest(state);
+      const result = state.nav_action_result || {};
+      if (result.ok === false) {
+        $("navTaskHint").textContent = "操作失败: " + (result.info || result.error || ("status=" + result.status));
+      }
+    } catch (error) {
+      $("navTaskHint").textContent = error.message;
+    }
+  }
+
+  $("pickGoalBtn").addEventListener("click", () => {
+    pickingGoal = !pickingGoal;
+    canvas.classList.toggle("picking", pickingGoal);
+    if (current) updateNav(current);
+  });
+  [["goalCancelBtn", "cancel"], ["goalPauseBtn", "pause"], ["goalContinueBtn", "continue"]].forEach((pair) => {
+    $(pair[0]).addEventListener("click", () => navAction("/api/nav/goal/" + pair[1]));
+  });
+
+  function canvasWorld(event) {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: view.x + (event.clientX - rect.left - rect.width / 2) / view.scale,
+      y: view.y - (event.clientY - rect.top - rect.height / 2) / view.scale,
+    };
+  }
+
+  function pickGoalAt(event) {
+    const point = canvasWorld(event);
+    pickingGoal = false;
+    canvas.classList.remove("picking");
+    if (current) updateNav(current);
+    $("navTaskHint").textContent = "目标点 (" + point.x.toFixed(2) + ", " + point.y.toFixed(2) + ") 下发中…";
+    navAction("/api/nav/goal", { x: point.x, y: point.y });
   }
 
   async function fetchMap(tea) {
@@ -125,12 +210,25 @@
         workareaMap = result.map || null;
         mapVersion = Number(result.version || version);
         fitNext = true;
+        updateMapEmptyHint();
       }
     } catch (error) {
       /* 下一轮状态轮询重试。 */
     } finally {
       mapBusy = false;
     }
+  }
+
+  // 空图提示: 桥在线且 tea 已确认读图成功(map_checked, 接入/刷新拉图后置位)仍没有
+  // 任何子图时, 在画布中央提示; 构建中(轨迹正在录制)不提示, 避免干扰首次建图。
+  function updateMapEmptyHint() {
+    const hint = $("mapEmptyHint");
+    if (!hint) return;
+    const tea = (current && current.workarea) || { enabled: false };
+    const building = !!(tea.session && tea.session.state === "building");
+    const empty = !workareaMap || !Array.isArray(workareaMap.sub_maps) || workareaMap.sub_maps.length === 0;
+    hint.hidden = !(!!tea.enabled && !!tea.connected && !!tea.map_checked && !building && empty);
+    hint.textContent = workareaMap ? "工作区地图为空" : "暂未获取到工作区地图";
   }
 
   async function action(path, payload) {
@@ -181,8 +279,56 @@
     button.addEventListener("pointercancel", release);
     button.addEventListener("lostpointercapture", release);
   });
+  // 键盘遥控: W/A/S/D 行驶, Q/E 左右圆弧, 方向键同 W/A/S/D, 空格急停。
+  // 与按钮同语义: 按下发一次速度指令, 松开停止; 焦点在输入框/下拉时忽略。
+  const KEY_COMMANDS = {
+    ArrowUp: "fwd", ArrowDown: "back", ArrowLeft: "left", ArrowRight: "right",
+    w: "fwd", s: "back", a: "left", d: "right",
+    q: "arc_left", e: "arc_right",
+  };
+  const heldKeys = new Set();
+  function keyName(event) {
+    return event.key.length === 1 ? event.key.toLowerCase() : event.key;
+  }
+  function buttonForKind(kind) {
+    return driveButtons.find((button) => button.dataset.drive === kind) || null;
+  }
+  document.addEventListener("keydown", (event) => {
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    const tag = (document.activeElement && document.activeElement.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    const key = keyName(event);
+    if (key === " ") {
+      event.preventDefault();
+      if (heldKeys.size) {
+        heldKeys.clear();
+        driveButtons.forEach((button) => button.classList.remove("pressed"));
+        drive("stop");
+      }
+      return;
+    }
+    const kind = KEY_COMMANDS[key];
+    if (!kind) return;
+    const button = buttonForKind(kind);
+    if (button && button.disabled) return;
+    // 长按重复事件也要拦, 否则方向键会滚动页面。
+    event.preventDefault();
+    if (heldKeys.has(key)) return;
+    heldKeys.add(key);
+    if (button) button.classList.add("pressed");
+    drive(kind);
+  });
+  document.addEventListener("keyup", (event) => {
+    const key = keyName(event);
+    if (!heldKeys.has(key)) return;
+    heldKeys.delete(key);
+    driveButtons.forEach((button) => button.classList.remove("pressed"));
+    drive("stop");
+  });
+
   window.addEventListener("blur", () => {
     held.clear();
+    heldKeys.clear();
     driveButtons.forEach((button) => button.classList.remove("pressed"));
     drive("stop");
   });
@@ -215,6 +361,11 @@
   startButtons.forEach((button) => button.addEventListener("click", () => action("/api/nav/workarea/start", { type: Number(button.dataset.waStart), check: true })));
   $("waSaveBtn").addEventListener("click", () => action("/api/nav/workarea/save", { check: true }));
   $("waCancelBtn").addEventListener("click", () => action("/api/nav/workarea/cancel", {}));
+  // 删除当前图: 不带 id = 老协议整图清空(CLEAR_MAP, 成功码 result=1), 后端成功后自动刷新地图缓存
+  $("waClearBtn").addEventListener("click", () => {
+    if (!window.confirm("删除当前图将删除当前工作区地图的全部区域/通道/禁区，且不可恢复。确定删除？")) return;
+    action("/api/nav/workarea/clear", {});
+  });
 
   function renderLog(entries) {
     const visible = entries.slice(-100);
@@ -265,6 +416,8 @@
     }
     const trail = (current && current.workarea && current.workarea.trail) || [];
     trail.forEach((point) => points.push(point));
+    const chargePose = (current && current.workarea && current.workarea.charge_pose) || null;
+    if (chargePose && (chargePose.x || chargePose.y)) points.push([chargePose.x, chargePose.y]);
     if (current && current.pose) points.push([current.pose.x, current.pose.y]);
     return points;
   }
@@ -322,6 +475,15 @@
     if (workareaMap && workareaMap.station_pose) {
       ctx.beginPath(); ctx.arc(sx(workareaMap.station_pose[0]), sy(workareaMap.station_pose[1]), 7, 0, Math.PI * 2); ctx.fillStyle = "#4fc3ff"; ctx.fill();
     }
+    // 充电桩/回充点(charge_pose 话题, 紫色圆环 + 朝向短线; 零值=无桩不画)
+    const chargePose = (current && current.workarea && current.workarea.charge_pose) || null;
+    if (chargePose && (chargePose.x || chargePose.y)) {
+      const cx = sx(chargePose.x), cy = sy(chargePose.y);
+      ctx.beginPath(); ctx.arc(cx, cy, 7, 0, Math.PI * 2); ctx.strokeStyle = "#b388ff"; ctx.lineWidth = 2; ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + Math.cos(chargePose.yaw) * 12, cy - Math.sin(chargePose.yaw) * 12);
+      ctx.stroke();
+    }
     const trail = (current && current.workarea && current.workarea.trail) || [];
     if (trail.length > 1) {
       ctx.beginPath();
@@ -333,23 +495,116 @@
       ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fillStyle = "rgba(79,195,255,.25)"; ctx.fill(); ctx.strokeStyle = "#4fc3ff"; ctx.lineWidth = 2; ctx.stroke();
       ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(pose.theta) * radius * 1.5, y - Math.sin(pose.theta) * radius * 1.5); ctx.stroke();
     }
+    // 点到点目标: 机器人->目标虚线 + 旗标(琥珀色, 与通道同色系的任务色)
+    const nav = (current && current.nav) || {};
+    if (nav.active && nav.goal) {
+      const gx = sx(nav.goal.x), gy = sy(nav.goal.y);
+      if (current && current.pose) {
+        ctx.beginPath(); ctx.setLineDash([5, 4]);
+        ctx.moveTo(sx(current.pose.x), sy(current.pose.y)); ctx.lineTo(gx, gy);
+        ctx.strokeStyle = "#ffd166"; ctx.lineWidth = 1.4; ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      ctx.beginPath(); ctx.arc(gx, gy, 7, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255,209,102,.25)"; ctx.fill();
+      ctx.strokeStyle = "#ffd166"; ctx.lineWidth = 2; ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(gx - 4, gy); ctx.lineTo(gx + 4, gy); ctx.moveTo(gx, gy - 4); ctx.lineTo(gx, gy + 4); ctx.stroke();
+    }
     ctx.fillStyle = muted; ctx.font = "10px sans-serif"; ctx.fillText("1 m = " + view.scale.toFixed(0) + " px", 12, 18);
     window.requestAnimationFrame(draw);
   }
 
   let drag = null;
-  canvas.addEventListener("pointerdown", (event) => { drag = { x: event.clientX, y: event.clientY }; canvas.setPointerCapture(event.pointerId); });
+  canvas.addEventListener("pointerdown", (event) => { drag = { x: event.clientX, y: event.clientY, ox: event.clientX, oy: event.clientY, moved: false }; canvas.setPointerCapture(event.pointerId); });
   canvas.addEventListener("pointermove", (event) => {
     if (!drag) return;
+    // 距按下点的位移超过阈值判为平移手势, 否则抬起时按单击处理(选点用)
+    if (Math.abs(event.clientX - drag.ox) + Math.abs(event.clientY - drag.oy) > 4) drag.moved = true;
     view.x -= (event.clientX - drag.x) / view.scale;
     view.y += (event.clientY - drag.y) / view.scale;
-    drag = { x: event.clientX, y: event.clientY };
+    drag.x = event.clientX; drag.y = event.clientY;
   });
-  canvas.addEventListener("pointerup", () => { drag = null; });
+  canvas.addEventListener("pointerup", (event) => {
+    const wasClick = drag && !drag.moved;
+    drag = null;
+    if (pickingGoal && wasClick) pickGoalAt(event);
+  });
   canvas.addEventListener("pointercancel", () => { drag = null; });
   canvas.addEventListener("wheel", (event) => { event.preventDefault(); view.scale = Math.max(4, Math.min(240, view.scale * (event.deltaY < 0 ? 1.15 : 0.87))); }, { passive: false });
   canvas.addEventListener("dblclick", () => { fitNext = true; });
   $("resetViewBtn").addEventListener("click", () => { fitNext = true; });
+  // 刷新地图: 触发 tea 重新发布当前 map_info 并回填桥缓存, 成功时 map_version 递增,
+  // 随后的状态轮询会拉到新地图; 失败信息写回提示区(下次轮询会被覆盖, 日志里保留)。
+  // 功能区文字按钮与地图右上角 ⟳ 共用同一逻辑; 构建中刷新不会打断会话。
+  let mapRefreshBusy = false;
+  async function refreshWorkareaMap() {
+    if (mapRefreshBusy) return;
+    mapRefreshBusy = true;
+    document.querySelectorAll("[data-refresh-map]").forEach((button) => { button.disabled = true; });
+    try {
+      const state = await post("/api/nav/workarea/refresh_map", {});
+      ingest(state);
+      const result = state.workarea_result || {};
+      if (result.ok === false || result.map_error) {
+        $("workareaHint").textContent = "刷新地图失败: " + (result.info || result.map_error || ("result=" + result.result));
+      }
+    } catch (error) {
+      $("workareaHint").textContent = error.message;
+    } finally {
+      mapRefreshBusy = false;
+      document.querySelectorAll("[data-refresh-map]").forEach((button) => { button.disabled = false; });
+    }
+  }
+  document.querySelectorAll("[data-refresh-map]").forEach((button) => {
+    button.addEventListener("click", refreshWorkareaMap);
+  });
+
+  // ------------------------------------------------------------- 左侧栏收起
+  // 与内部仿真同交互: 顶栏/侧栏把手/左侧标签三处切换, 状态存 localStorage。
+  const SIDE_KEY = "navSideHiddenV1";
+  const layoutEl = document.querySelector(".layout");
+  let sideHidden = false;
+  try { sideHidden = localStorage.getItem(SIDE_KEY) === "1"; } catch (error) { sideHidden = false; }
+  function applySidebarHidden(hidden) {
+    if (!layoutEl) return;
+    layoutEl.classList.toggle("is-side-hidden", !!hidden);
+    const toggle = $("sidebarToggleBtn");
+    if (toggle) {
+      toggle.setAttribute("aria-pressed", hidden ? "true" : "false");
+      toggle.textContent = hidden ? "◨ 侧栏" : "◧ 侧栏";
+    }
+    const tab = $("sidebarTab");
+    if (tab) tab.hidden = !hidden;
+    try { localStorage.setItem(SIDE_KEY, hidden ? "1" : "0"); } catch (error) { /* 忽略隐私模式 */ }
+  }
+  function toggleSidebar() {
+    sideHidden = !sideHidden;
+    applySidebarHidden(sideHidden);
+  }
+  applySidebarHidden(sideHidden);
+  ["sidebarToggleBtn", "sidebarHandle", "sidebarTab"].forEach((id) => {
+    const element = $(id);
+    if (element) element.addEventListener("click", toggleSidebar);
+  });
+
+  // ------------------------------------------------------------- 面板单独折叠
+  // 与内部仿真同交互: 点面板标题收起/展开, 状态按 data-panel 键存 localStorage。
+  const PANEL_KEY = "navPanelCollapsedV1";
+  let panelCollapsed = {};
+  try {
+    panelCollapsed = JSON.parse(localStorage.getItem(PANEL_KEY) || "{}") || {};
+  } catch (error) { panelCollapsed = {}; }
+  document.querySelectorAll("[data-panel]").forEach((panel) => {
+    const key = panel.dataset.panel;
+    const heading = panel.querySelector("h2");
+    if (!heading) return;
+    panel.classList.toggle("is-collapsed", panelCollapsed[key] === true);
+    heading.addEventListener("click", () => {
+      panelCollapsed[key] = !panelCollapsed[key];
+      panel.classList.toggle("is-collapsed", panelCollapsed[key] === true);
+      try { localStorage.setItem(PANEL_KEY, JSON.stringify(panelCollapsed)); } catch (error) { /* 忽略隐私模式 */ }
+    });
+  });
 
   refresh();
   window.setInterval(refresh, 250);

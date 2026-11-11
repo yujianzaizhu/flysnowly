@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>1.0.8 机器人控制台 · Mower Console</title>
+  <title>1.0.9 机器人控制台 · Mower Console</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='26' fill='%230b1020' stroke='%2337e0a0' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='9' fill='%2337e0a0'/%3E%3C/svg%3E" />
   <script>
     try {
@@ -25,7 +25,7 @@
   <header class="topbar">
     <div class="brand">
       <span class="brand-mark" aria-hidden="true"></span>
-      <span class="brand-title">1.0.8 机器人控制台</span>
+      <span class="brand-title">1.0.9 机器人控制台</span>
       <span class="brand-sub">Vision Mower Console</span>
       <label class="sim-mode-picker" title="选择独立运行的仿真应用">
         仿真
@@ -395,6 +395,8 @@
           <div class="bag-row bag-row--play">
             <button id="bagLoadBtn" class="task-btn task-btn--primary" type="button">载入</button>
             <button id="bagQueueBtn" class="task-btn" type="button" title="按勾选顺序连续播放">连续播放</button>
+            <button id="bagClearBtn" class="task-btn task-btn--ghost" type="button"
+              title="清除地图上的回放轨迹与已累积的感知点云（连续播放换包不会自动清）">清理地图</button>
           </div>
           <p class="bag-hud-note">回放状态（进度条 / 当前日志 / 回放时间 / 世界时间 / 播放暂停停止）在“任务操作”栏里；倍速用顶部的仿真倍速。</p>
           <div class="bag-row">

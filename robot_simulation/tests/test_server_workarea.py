@@ -27,13 +27,16 @@ class FakeTeaBridge:
         }
         self.building = False
         self.session_type = None
+        # 镜像"在线桥"的真实 opts: create_server/_workarea_connect 启用的桥 enabled=True,
+        # connect 幂等判断要求两侧一致(否则会被误判为参数变化而重建)
         self.opts = dict(tea_bridge.DEFAULT_OPTS)
+        self.opts["enabled"] = True
 
     def start(self):
-        pass
+        self.calls.append(("start",))
 
     def stop(self):
-        pass
+        self.calls.append(("stop",))
 
     def tick(self, robot):
         pass
@@ -75,6 +78,12 @@ class FakeTeaBridge:
             return {"version": version, "unchanged": True}
         return snap
 
+    def latest_cmd_vel(self):
+        return None
+
+    def latest_nav_result(self):
+        return None
+
     def summary(self):
         return {
             "enabled": True,
@@ -90,6 +99,7 @@ class FakeTeaBridge:
             "trail": [[0, 0], [1, 1]] if self.building else [],
             "trail_len": 1.4,
             "map_version": 3,
+            "map_checked": True,
             "pub_count": 0,
         }
 
@@ -115,6 +125,8 @@ class WorkareaRouteTest(unittest.TestCase):
         self.httpd.tea = self.tea
         self.httpd.simulator.tea = self.tea
         self.httpd.activity = "work"
+        self.httpd.nav.update({"active": False, "paused": False, "goal": None, "since": 0.0})
+        self.httpd.robot.set_nav_mode(False)
         self.httpd.robot.stop()
         config.reset()
 
@@ -231,6 +243,16 @@ class WorkareaRouteTest(unittest.TestCase):
         self.assertIn(("get_map", tea_bridge.MAP_CMD_LOAD), self.tea.calls)
         self.assertEqual(body["session"]["state"], "idle")
 
+    def test_manual_refresh_map_while_building(self):
+        self._post("/api/nav/workarea/start", {"type": 1})
+        _status, body = self._post("/api/nav/workarea/refresh_map", {})
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["map_version"], 3)
+        self.assertIn(("get_map", tea_bridge.MAP_CMD_LOAD), self.tea.calls)
+        # 纯读命令, 不打断构建会话。
+        self.assertTrue(self.tea.building)
+        self.assertTrue(any("手动刷新" in message for message in self._logs()))
+
     def test_clear_load_and_raw(self):
         _status, body = self._post("/api/nav/workarea/clear", {"ids": [2, 5]})
         self.assertTrue(body["ok"])
@@ -241,6 +263,52 @@ class WorkareaRouteTest(unittest.TestCase):
         kinds = [call[:2] for call in self.tea.calls]
         self.assertIn(("record", tea_bridge.CMD_LOAD), kinds)
         self.assertIn(("record", tea_bridge.CMD_POINT), kinds)
+
+    def test_clear_without_ids_is_whole_map(self):
+        """页面"删除当前图"按钮不带 id: deleted_ids 为空 = 老协议整图清空, 成功后刷新地图。"""
+
+        _status, body = self._post("/api/nav/workarea/clear", {})
+        self.assertTrue(body["ok"])
+        records = [call for call in self.tea.calls if call[0] == "record"]
+        self.assertEqual(records[-1][1], tea_bridge.CMD_CLEAR)
+        self.assertIsNone(records[-1][3])
+        self.assertIn(("get_map", tea_bridge.MAP_CMD_LOAD), self.tea.calls)
+        self.assertTrue(any("整图清空" in message and "成功" in message for message in self._logs()))
+
+    def test_initial_map_fetch_empty_reports_empty(self):
+        """接入自动拉图: tea 确认读图成功但无子图 -> 日志给出"地图为空"。"""
+
+        self.tea.map_snapshot_data = {"version": 1, "map": {"res": 0.05, "sub_maps": []}}
+        resp = server._fetch_initial_map(self.tea, self.httpd.robot.log)
+        self.assertTrue(resp["ok"])
+        self.assertIn(("get_map", tea_bridge.MAP_CMD_LOAD), self.tea.calls)
+        self.assertTrue(any("工作区地图为空" in message for message in self._logs()))
+
+    def test_initial_map_fetch_reports_submaps(self):
+        resp = server._fetch_initial_map(self.tea, self.httpd.robot.log)
+        self.assertTrue(resp["ok"])
+        self.assertTrue(any("1 个子图" in message for message in self._logs()))
+
+    def test_initial_map_fetch_retries_then_warns(self):
+        """tea 未就绪时按重试次数重拉, 仍失败记 warn 并放弃(可由页面刷新补拉)。"""
+
+        original = server.AUTO_MAP_FETCH_INTERVAL
+        server.AUTO_MAP_FETCH_INTERVAL = 0
+        try:
+            self.tea.map_resp = {"ok": False, "result": None, "info": "服务无响应"}
+            resp = server._fetch_initial_map(self.tea, self.httpd.robot.log)
+        finally:
+            server.AUTO_MAP_FETCH_INTERVAL = original
+        self.assertFalse(resp["ok"])
+        gets = [call for call in self.tea.calls if call[0] == "get_map"]
+        self.assertEqual(len(gets), server.AUTO_MAP_FETCH_RETRIES)
+        self.assertTrue(any("自动获取工作区地图失败" in message for message in self._logs()))
+
+    def test_auto_fetch_map_runs_in_background(self):
+        thread = server._auto_fetch_map(self.tea, self.httpd.robot)
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertIn(("get_map", tea_bridge.MAP_CMD_LOAD), self.tea.calls)
 
     def test_map_endpoint_version_short_circuit(self):
         snap = self._get_json("/api/nav/workarea/map")
@@ -255,6 +323,45 @@ class WorkareaRouteTest(unittest.TestCase):
         self._post("/api/nav/workarea/start", {"type": 1}, expect_error=400)
         self._post("/api/nav/activity", {"activity": "workarea"}, expect_error=400)
         self._post("/api/task", {"task": "map"}, expect_error=404)
+
+    def test_connect_with_same_opts_is_idempotent(self):
+        """同参数 connect 不重建桥: 重建会拆掉已绑定的内嵌 proxy(run.sh 开机 connect 实测踩坑)。"""
+
+        _status, summary = self._post("/api/nav/workarea/connect", {})
+        self.assertTrue(summary["enabled"])
+        self.assertIs(self.httpd.tea, self.tea)
+        self.assertNotIn(("stop",), self.tea.calls)
+        self.assertFalse(any(call[0] == "get_map" for call in self.tea.calls))
+
+    def test_connect_with_new_opts_recreates_bridge(self):
+        # proxy/话题端口用空闲端口, 避免测试期 connect 到真实 10001/10002(共享机串线)
+        import socket as _socket
+
+        def _free_port():
+            with _socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                return sock.getsockname()[1]
+
+        try:
+            self._post(
+                "/api/nav/workarea/connect",
+                {
+                    "record_port": 21515,
+                    "run_proxy": False,
+                    "proxy_pub_port": _free_port(),
+                    "proxy_sub_port": _free_port(),
+                },
+            )
+            self.assertIn(("stop",), self.tea.calls)
+            self.assertIsNot(self.httpd.tea, self.tea)
+            if hasattr(self.httpd.tea, "opts"):
+                self.assertEqual(self.httpd.tea.opts["record_port"], 21515)
+        finally:
+            # 必须停掉重建出的真实桥: 泄漏的 SUB 线程会钉住其 zmq context,
+            # 之后任意测试触发 GC 时 context.__del__/term() 会永久阻塞
+            self.httpd.tea.stop()
+            self.httpd.tea = self.tea
+            self.httpd.simulator.tea = self.tea
 
     def test_activity_and_building_guard(self):
         _status, state = self._post("/api/nav/activity", {"activity": "workarea"})

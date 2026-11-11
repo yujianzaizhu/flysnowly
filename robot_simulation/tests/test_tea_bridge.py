@@ -135,6 +135,50 @@ class FakeTea:
         info = self.map_info_builder(self.msgs_pb)
         self.pub.send_multipart([b"map_info", info.SerializeToString()])
 
+    def publish_topic(self, topic, payload):
+        if self.pub is not None:
+            self.pub.send_multipart([topic, payload])
+
+    def publish_traj_pose(self, x, y, yaw=0.0):
+        """trajectory_pose_test: PoseStamped(构建轨迹点)。"""
+
+        from proto_msg import geometry_msgs_pb2
+
+        msg = geometry_msgs_pb2.PoseStamped()
+        msg.pose.position.x = float(x)
+        msg.pose.position.y = float(y)
+        qx, qy, qz, qw = tea_bridge.yaw_to_quat(float(yaw))
+        msg.pose.orientation.x = qx
+        msg.pose.orientation.y = qy
+        msg.pose.orientation.z = qz
+        msg.pose.orientation.w = qw
+        self.publish_topic(tea_bridge.TRAJ_POSE_TOPIC.encode(), msg.SerializeToString())
+
+    def publish_area_info(self, value):
+        """get_area_info: Float32(构建中面积/长度)。"""
+
+        from proto_msg import std_msgs_pb2
+
+        msg = std_msgs_pb2.Float32()
+        msg.data = float(value)
+        self.publish_topic(tea_bridge.AREA_INFO_TOPIC.encode(), msg.SerializeToString())
+
+    def publish_charge_pose(self, x=0.0, y=0.0, yaw=0.0, lat=0.0, lon=0.0, alt=0.0):
+        """charge_pose: ChargeStationPose(桩位/回充点, 无桩发零值)。"""
+
+        msg = self.msgs_pb.ChargeStationPose()
+        msg.return_pose.position.x = float(x)
+        msg.return_pose.position.y = float(y)
+        qx, qy, qz, qw = tea_bridge.yaw_to_quat(float(yaw))
+        msg.return_pose.orientation.x = qx
+        msg.return_pose.orientation.y = qy
+        msg.return_pose.orientation.z = qz
+        msg.return_pose.orientation.w = qw
+        msg.base_latitude = float(lat)
+        msg.base_longitude = float(lon)
+        msg.base_altitude = float(alt)
+        self.publish_topic(tea_bridge.CHARGE_POSE_TOPIC.encode(), msg.SerializeToString())
+
     def stop(self):
         self._stop.set()
         for thread in self.threads:
@@ -169,7 +213,7 @@ class TeaBridgeTest(unittest.TestCase):
         self.proxy.start()
 
         self.fake = FakeTea(self.zmq, self.proxy_pub)
-        _, svc_pb, msgs_pb, _, _ = tea_bridge._import_deps()
+        _, svc_pb, msgs_pb, _, _, _ = tea_bridge._import_deps()
         self.fake.start(self.record_port, self.map_port, msgs_pb, svc_pb)
 
         self.bridge = tea_bridge.TeaBridge(
@@ -343,6 +387,108 @@ class TeaBridgeTest(unittest.TestCase):
         self.assertEqual(result.get("map_version"), 2)
         self.assertEqual(len(self.fake.map_requests), 2, "快速到达的话题不应触发额外重试")
 
+    def test_map_checked_after_successful_get_map_info(self):
+        """map_checked 仅在 tea 确认读图成功后置位, 供上层区分"未拉过"与"已确认为空"。"""
+
+        self.assertFalse(self.bridge.summary()["map_checked"])
+        self.assertTrue(self.bridge.get_map_info()["ok"])
+        self.assertTrue(self.bridge.summary()["map_checked"])
+
+    def test_get_map_info_read_fail_keeps_unchecked(self):
+        self.fake.map_result = 1
+        result = self.bridge.get_map_info()
+        self.assertFalse(result["ok"])
+        self.assertFalse(self.bridge.summary()["map_checked"])
+
+    def test_empty_map_info_yields_empty_submaps(self):
+        """tea 空图(启动即建空图)发布后缓存为空 sub_maps, 不等于没拉到数据。"""
+
+        self.fake.map_info_builder = lambda msgs_pb: msgs_pb.MapInfo()
+        result = self.bridge.get_map_info()
+        self.assertTrue(result["ok"])
+        snap = self.bridge.map_snapshot()
+        self.assertEqual(snap["map"]["sub_maps"], [])
+        self.assertEqual(snap["map"]["station_pose"], [0.0, 0.0])
+
+    def _hold_port_then_release(self, port, hold_seconds):
+        """占用 XSUB 端口 hold_seconds 后释放(模拟旧桥实例的拆解窗口)。"""
+
+        def _hold():
+            ctx = self.zmq.Context(1)
+            sock = ctx.socket(self.zmq.XSUB)
+            try:
+                sock.bind("tcp://127.0.0.1:%d" % port)
+            except Exception:
+                ctx.term()
+                return
+            time.sleep(hold_seconds)
+            sock.close(linger=0)
+            ctx.term()
+
+        threading.Thread(target=_hold, daemon=True).start()
+
+    def test_probe_bind_retries_until_free(self):
+        """探测撞上占用窗口: 重试到端口释放后内嵌 proxy 应成功启动, 不降级。
+
+        全程用全新端口, 与 setUp 桥的端口无纠缠。
+        """
+
+        pub, sub = _free_port(), _free_port()
+        self._hold_port_then_release(pub, 0.8)
+        base = len(self.logs)
+        bridge = tea_bridge.TeaBridge(
+            {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "proxy_pub_port": pub,
+                "proxy_sub_port": sub,
+                "record_port": self.record_port,
+                "map_port": self.map_port,
+                "run_proxy": True,
+                "service_timeout": 1.0,
+            },
+            log_fn=lambda level, msg: self.logs.append((level, msg)),
+        )
+        try:
+            bridge.start()
+            messages = [msg for _level, msg in self.logs[base:]]
+            self.assertTrue(any("内嵌 zmq proxy 已启动" in msg for msg in messages))
+            self.assertFalse(any("降级" in msg for msg in messages))
+        finally:
+            bridge.stop()
+
+    def test_probe_bind_gives_up_and_degrades(self):
+        """端口持续被占: 重试耗尽后降级, 且明确写日志(不静默)。"""
+
+        pub, sub = _free_port(), _free_port()
+        ctx = self.zmq.Context(1)
+        sock = ctx.socket(self.zmq.XSUB)
+        sock.bind("tcp://127.0.0.1:%d" % pub)
+        base = len(self.logs)
+        try:
+            bridge = tea_bridge.TeaBridge(
+                {
+                    "enabled": True,
+                    "host": "127.0.0.1",
+                    "proxy_pub_port": pub,
+                    "proxy_sub_port": sub,
+                    "record_port": self.record_port,
+                    "map_port": self.map_port,
+                    "run_proxy": True,
+                    "service_timeout": 1.0,
+                },
+                log_fn=lambda level, msg: self.logs.append((level, msg)),
+            )
+            try:
+                bridge.start()
+                messages = [msg for _level, msg in self.logs[base:]]
+                self.assertTrue(any("proxy 端口绑定失败" in msg and "降级" in msg for msg in messages))
+            finally:
+                bridge.stop()
+        finally:
+            sock.close(linger=0)
+            ctx.term()
+
     def test_get_map_info_topic_timeout_reports_error(self):
         old_wait = tea_bridge.MAP_TOPIC_WAIT
         tea_bridge.MAP_TOPIC_WAIT = 0.15
@@ -381,23 +527,50 @@ class TeaBridgeTest(unittest.TestCase):
         self.assertTrue(result["ok"])
 
     def test_session_and_trail(self):
+        """构建轨迹线来自 tea trajectory_pose_test 话题(仅 building 会话累积)。"""
+
         self.bridge.begin_session(1)
-        robot = FakeRobot(0.0, 0.0, 0.0)
-        for i in range(20):
-            robot.sim_time = i * 0.1
-            robot.pose = [i * 0.07, 0.0, 0.0]
-            self.bridge.tick(robot)
+        for i in range(1, 21):
+            self.fake.publish_traj_pose(i * 0.11, 0.0)
+            time.sleep(0.02)  # SUB HWM=10, 留出消费节奏防丢帧
         summary = self.bridge.summary()
         self.assertEqual(summary["session"]["state"], "building")
         self.assertEqual(summary["session"]["type"], 1)
-        # 0.07m 步进, 0.05m 门限 -> 全部记录
         self.assertEqual(len(summary["trail"]), 20)
-        self.assertGreater(summary["trail_len"], 1.0)
+        self.assertAlmostEqual(summary["trail_len"], 2.2, delta=0.15)  # summary 按 0.1m 取整
 
         self.bridge.end_session()
         summary = self.bridge.summary()
         self.assertEqual(summary["session"]["state"], "idle")
         self.assertEqual(summary["trail"], [])
+        self.assertIsNone(summary["build_measure"])
+
+    def test_build_topics_area_and_charge(self):
+        """get_area_info/charge_pose 话题消费: summary 暴露构建度量与桩位。"""
+
+        self.bridge.begin_session(2)  # 通道: 度量语义为长度
+        self.fake.publish_area_info(6.25)
+        self.fake.publish_charge_pose(4.0, 0.0, yaw=1.5708, lat=22.5431, lon=114.0579, alt=15.2)
+        summary = self.bridge.summary()
+        deadline = time.time() + 2.0
+        while time.time() < deadline and (
+            summary["build_measure"] is None or summary["charge_pose"] is None
+        ):
+            time.sleep(0.05)
+            summary = self.bridge.summary()
+        self.assertAlmostEqual(summary["build_measure"], 6.25, places=3)
+        self.assertAlmostEqual(summary["charge_pose"]["x"], 4.0)
+        self.assertAlmostEqual(summary["charge_pose"]["y"], 0.0)
+        self.assertAlmostEqual(summary["charge_pose"]["yaw"], 1.5708, places=3)
+        self.assertAlmostEqual(summary["charge_pose"]["lat"], 22.5431, places=4)
+        self.assertAlmostEqual(summary["charge_pose"]["lon"], 114.0579, places=4)
+        self.assertAlmostEqual(summary["charge_pose"]["alt"], 15.2, places=3)
+
+        # 会话结束: 度量清空(轨迹线), 桩位保留(随地图持续发布)
+        self.bridge.end_session()
+        summary = self.bridge.summary()
+        self.assertIsNone(summary["build_measure"])
+        self.assertIsNotNone(summary["charge_pose"])
 
     def test_disabled_bridge(self):
         disabled = tea_bridge.DisabledBridge("test")

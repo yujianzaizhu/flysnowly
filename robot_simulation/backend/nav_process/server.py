@@ -6,6 +6,7 @@
 import argparse
 import gzip
 import json
+import math
 import os
 import sys
 import threading
@@ -37,6 +38,69 @@ CONTENT_TYPES = {
 }
 MAX_BODY_BYTES = 1024 * 1024
 
+# 接入后自动拉图: get_map_info 触发 tea 发布 map_info 回填桥缓存; 失败重试几次
+# (tea 可能比仿真后端晚启动), 仍失败则记日志放弃, 可由页面"刷新工作区地图"补拉
+AUTO_MAP_FETCH_RETRIES = 3
+AUTO_MAP_FETCH_INTERVAL = 2.0  # 重试间隔(s)
+
+
+def _fetch_map(tea, log, context, retries=0, retry_interval=0.0):
+    """统一 get_map_info 调用与结果判定: ok 且无 map_error 才算成功。
+
+    成功返回 resp(调用方追加各自的"已刷新/已获取"日志);
+    失败与"读成功但地图数据未更新"(map_error, 桥缓存可能是旧数据)统一在这里记 warn,
+    保证 _refresh_map 与接入自动拉图两条路径行为一致。
+    """
+
+    resp = {}
+    for attempt in range(1, max(retries, 1) + 1):
+        resp = tea.get_map_info()
+        if resp.get("ok") and not resp.get("map_error"):
+            break
+        if attempt < max(retries, 1):
+            time.sleep(retry_interval)
+    if not resp.get("ok"):
+        log("warn", "[工作区] {}失败: {}".format(context, resp.get("info") or "无响应"))
+    elif resp.get("map_error"):
+        log("warn", "[工作区] {}: 地图数据未更新({})".format(context, resp.get("info") or "map_error"))
+    return resp
+
+
+def _fetch_initial_map(tea, log):
+    """同步触发一次 get_map_info 并按结果写日志; 供接入流程与测试直接调用。
+
+    map_error(读成功但数据未更新)视为未获取, 不从旧快照得出"已获取"的误导日志。
+    """
+
+    resp = _fetch_map(
+        tea, log, "接入后自动获取工作区地图",
+        retries=AUTO_MAP_FETCH_RETRIES, retry_interval=AUTO_MAP_FETCH_INTERVAL,
+    )
+    if not (resp.get("ok") and not resp.get("map_error")):
+        return resp
+    snapshot = tea.map_snapshot()
+    data = snapshot.get("map") if isinstance(snapshot, dict) else None
+    subs = data.get("sub_maps") if isinstance(data, dict) else None
+    if subs:
+        log(
+            "event",
+            "[工作区] 接入后已获取工作区地图: {} 个子图(版本 {})".format(len(subs), resp.get("map_version")),
+        )
+    else:
+        # tea 启动时会自动建空图, 这里即"地图为空"而非"还没拉到"
+        log("event", "[工作区] 接入后工作区地图为空(暂无区域/通道/禁区)")
+    return resp
+
+
+def _auto_fetch_map(tea, robot):
+    """接入(tea 桥启动)后后台拉一次当前工作区地图, 不阻塞启动/连接响应; 返回线程供测试等待。"""
+
+    thread = threading.Thread(
+        target=lambda: _fetch_initial_map(tea, robot.log), name="tea-map-warmup", daemon=True
+    )
+    thread.start()
+    return thread
+
 
 class ConflictError(ValueError):
     http_status = 409
@@ -50,6 +114,8 @@ class NavSimulator(threading.Thread):
         self.tick_size = tick
         self.lock = threading.RLock()
         self._stop_event = threading.Event()
+        # 点到点任务状态(dict, 由 server 持有并注入); 线程内只读改 active/paused
+        self.nav = None
 
     def run(self):
         last = time.monotonic()
@@ -60,6 +126,7 @@ class NavSimulator(threading.Thread):
             last = now
             try:
                 with self.lock:
+                    self._apply_nav_cmd()
                     while accumulator >= self.tick_size:
                         self.robot.step(self.tick_size)
                         accumulator -= self.tick_size
@@ -67,6 +134,32 @@ class NavSimulator(threading.Thread):
             except Exception:
                 traceback.print_exc()
             self._stop_event.wait(0.005)
+
+    def _apply_nav_cmd(self):
+        """点到点速度闭环: tea cmd_vel -> 机器人导航速度源; 超时清零, 终态自动退出。"""
+
+        nav = self.nav
+        if not nav or not nav.get("active"):
+            return
+        cmd = self.tea.latest_cmd_vel()
+        if cmd and cmd["age"] <= tea_bridge.CMD_VEL_TIMEOUT:
+            self.robot.drive_nav(cmd["linear"], cmd["angular"])
+        else:
+            # cmd_vel 超过超时未更新(暂停/断链)即清零, 对齐真机底盘保护
+            self.robot.drive_nav(0.0, 0.0)
+        result = self.tea.latest_nav_result()
+        if result and result.get("at", 0.0) > nav.get("since", 0.0):
+            outcome = result.get("outcome", 0)
+            nav["active"] = False
+            nav["paused"] = False
+            self.robot.set_nav_mode(False)
+            self.robot.log(
+                "event" if outcome == 1 else "warn",
+                "[导航] 点到点任务结束: {}({})".format(
+                    tea_bridge.NAV_OUTCOME_NAMES.get(outcome, outcome),
+                    result.get("text") or "-",
+                ),
+            )
 
     def stop(self):
         self._stop_event.set()
@@ -103,9 +196,25 @@ class NavRequestHandler(BaseHTTPRequestHandler):
         try:
             payload = self._read_json()
             if path == "/api/nav/drive":
+                if self.server.nav.get("active"):
+                    raise ConflictError("点到点导航中，手动遥控已锁定")
                 self.server.robot.drive(payload.get("v", 0.0), payload.get("w", 0.0))
             elif path == "/api/nav/stop":
+                if self.server.nav.get("active"):
+                    raise ConflictError("点到点导航中，请先取消导航任务")
                 self.server.robot.stop()
+            elif path == "/api/nav/goal":
+                result = self._nav_goal(payload)
+                state = self._state()
+                state["nav_action_result"] = result
+                self._send_json(state)
+                return
+            elif path in ("/api/nav/goal/cancel", "/api/nav/goal/pause", "/api/nav/goal/continue"):
+                result = self._nav_goal_cmd(path.rsplit("/", 1)[-1])
+                state = self._state()
+                state["nav_action_result"] = result
+                self._send_json(state)
+                return
             elif path == "/api/nav/activity":
                 self._set_activity(str(payload.get("activity") or ""))
             elif path == "/api/nav/config":
@@ -140,6 +249,9 @@ class NavRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("活动状态仅支持 work/workarea")
         if self.server.tea.is_building():
             raise ConflictError("工作区构建中，请先保存或取消")
+        if activity == "workarea" and self.server.nav.get("active"):
+            # tea 在 MapEdit 状态会拒绝导航任务, 这里提前拦截保持一致
+            raise ConflictError("点到点导航中，请先取消导航任务再进入工作区")
         if activity == "workarea" and not self.server.tea.summary().get("enabled"):
             raise ValueError("导航进程桥不可用，无法进入工作区构建")
         self.server.robot.stop()
@@ -200,7 +312,8 @@ class NavRequestHandler(BaseHTTPRequestHandler):
         if action == "clear":
             ids = [int(item) for item in (payload.get("ids") or [])]
             resp = tea.record_path(tea_bridge.CMD_CLEAR, deleted_ids=ids or None)
-            self._log_record(tea_bridge.CMD_CLEAR, "删除地图元素", resp)
+            # 老协议约定: 不带 ids = 整图清空(成功码 result=1)
+            self._log_record(tea_bridge.CMD_CLEAR, "整图清空" if not ids else "删除地图元素 {}".format(ids), resp)
             if resp.get("ok"):
                 refresh = self._refresh_map("删除")
                 resp["map_version"] = refresh.get("map_version")
@@ -221,6 +334,10 @@ class NavRequestHandler(BaseHTTPRequestHandler):
                 "[工作区] 导航进程{}".format("在线" if resp.get("connected") else "离线"),
             )
             return resp
+
+        if action == "refresh_map":
+            # 构建中也可调: get_map_info 是纯读命令, 触发 tea 发布当前地图并回填桥缓存
+            return self._refresh_map("手动刷新")
 
         if action == "raw":
             service = str(payload.get("service") or "record_path")
@@ -246,12 +363,26 @@ class NavRequestHandler(BaseHTTPRequestHandler):
     def _workarea_connect(self, payload):
         current = self.server.tea
         opts = dict(getattr(current, "opts", None) or dict(tea_bridge.DEFAULT_OPTS))
-        for key in ("host", "proxy_pub_port", "proxy_sub_port", "record_port", "map_port", "nav_port"):
+        for key in (
+            "host",
+            "proxy_pub_port",
+            "proxy_sub_port",
+            "record_port",
+            "map_port",
+            "nav_port",
+            "cmd_vel_topic",
+            "nav_result_topic",
+        ):
             if payload.get(key) is not None:
                 opts[key] = payload[key]
         if payload.get("run_proxy") is not None:
             opts["run_proxy"] = bool(payload["run_proxy"])
         opts["enabled"] = bool(payload.get("enabled", True))
+        # 幂等连接: 目标参数与当前桥一致且已启用时不重建——重建会拆掉已绑定
+        # 10001/10002 的内嵌 proxy, 紧随其后的二次探测会撞上拆解窗口而永久降级
+        # (run.sh 开机 connect 曾因此让话题层全断, 构建轨迹采不到位姿)
+        if opts == getattr(current, "opts", None) and current.summary().get("enabled"):
+            return current.summary()
         current.stop()
         tea = tea_bridge.create(
             opts,
@@ -259,6 +390,7 @@ class NavRequestHandler(BaseHTTPRequestHandler):
         )
         if opts["enabled"]:
             tea.start()
+            _auto_fetch_map(tea, self.server.robot)
         self.server.tea = tea
         self.server.simulator.tea = tea
         self.server.robot.stop()
@@ -280,23 +412,108 @@ class NavRequestHandler(BaseHTTPRequestHandler):
             )
 
     def _refresh_map(self, context):
-        resp = self.server.tea.get_map_info()
-        if not resp.get("ok"):
-            self.server.robot.log("warn", "[工作区] {}后刷新地图失败".format(context))
-        elif resp.get("map_error"):
-            self.server.robot.log("warn", "[工作区] {}后地图数据未更新".format(context))
-        else:
+        resp = _fetch_map(self.server.tea, self.server.robot.log, "{}后刷新地图".format(context))
+        if resp.get("ok") and not resp.get("map_error"):
             self.server.robot.log("event", "[工作区] {}后地图已刷新".format(context))
         return resp
 
+    # ------------------------------------------------------------ 点到点导航
+
+    def _nav_goal(self, payload):
+        """下发点到点目标: START + NAVIGATION + target_pose。tea 拒绝/离线时返回 ok=False。"""
+
+        tea = self.server.tea
+        if not tea.summary().get("enabled"):
+            raise ValueError("导航进程桥未启用: {}".format(tea.summary().get("reason", "")))
+        if tea.is_building() or self.server.activity == "workarea":
+            raise ConflictError("工作区构建/编辑中，tea 会拒绝导航任务，请先退出工作区")
+        nav = self.server.nav
+        if nav.get("active"):
+            raise ConflictError("已有进行中的点到点任务，请先取消")
+        try:
+            x = float(payload["x"])
+            y = float(payload["y"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("目标点坐标缺失或非法")
+        yaw = payload.get("yaw")
+        if yaw is None:
+            # 默认朝向: 当前位姿指向目标点, 与 tea goal 话题入口的默认行为一致
+            pose = self.server.robot.pose
+            yaw = math.atan2(y - pose[1], x - pose[0])
+        yaw = float(yaw)
+        resp = tea.nav_action(
+            tea_bridge.ACTION_START,
+            {"mode": tea_bridge.TASK_MODE_NAVIGATION, "target_pose": {"x": x, "y": y, "yaw": yaw}},
+        )
+        if not resp.get("ok"):
+            self.server.robot.log("warn", "[导航] 目标点下发失败: {}".format(resp.get("info") or resp.get("error")))
+            return {"ok": False, "info": resp.get("info") or resp.get("error") or "桥调用失败"}
+        if resp.get("status") != tea_bridge.NAV_RESULT_SUCCEED:
+            self.server.robot.log("warn", "[导航] 目标点被 tea 拒绝: {}".format(resp.get("msgs") or resp.get("status")))
+            return {"ok": False, "status": resp.get("status"), "info": resp.get("msgs") or "tea 拒绝目标点"}
+        nav.update(
+            {
+                "active": True,
+                "paused": False,
+                "goal": {"x": round(x, 3), "y": round(y, 3), "yaw": round(yaw, 3)},
+                "since": time.monotonic(),
+            }
+        )
+        self.server.robot.set_nav_mode(True)
+        self.server.robot.log("event", "[导航] 点到点任务已下发: ({:.2f}, {:.2f})".format(x, y))
+        return {"ok": True, "goal": nav["goal"]}
+
+    def _nav_goal_cmd(self, action):
+        """取消/暂停/继续进行中的点到点任务。"""
+
+        tea = self.server.tea
+        nav = self.server.nav
+        if not nav.get("active"):
+            raise ConflictError("当前没有进行中的点到点任务")
+        cmd = {
+            "cancel": tea_bridge.ACTION_CANCEL,
+            "pause": tea_bridge.ACTION_PAUSE,
+            "continue": tea_bridge.ACTION_CONTINUE,
+        }[action]
+        resp = tea.nav_action(cmd)
+        if not resp.get("ok"):
+            self.server.robot.log("warn", "[导航] {} 失败: {}".format(action, resp.get("info") or resp.get("error")))
+            return {"ok": False, "info": resp.get("info") or resp.get("error") or "桥调用失败"}
+        if resp.get("status") != tea_bridge.NAV_RESULT_SUCCEED:
+            self.server.robot.log("warn", "[导航] {} 被 tea 拒绝: {}".format(action, resp.get("msgs") or resp.get("status")))
+            return {"ok": False, "status": resp.get("status"), "info": resp.get("msgs") or "tea 拒绝"}
+        if action == "cancel":
+            nav.update({"active": False, "paused": False})
+            self.server.robot.set_nav_mode(False)
+            self.server.robot.stop()
+            self.server.robot.log("event", "[导航] 点到点任务已取消")
+        elif action == "pause":
+            nav["paused"] = True
+            self.server.robot.log("event", "[导航] 点到点任务已暂停")
+        else:
+            nav["paused"] = False
+            self.server.robot.log("event", "[导航] 点到点任务继续")
+        return {"ok": True, "action": action}
+
     def _state(self):
         state = self.server.robot.get_state()
+        cmd_vel = self.server.tea.latest_cmd_vel()
+        result = self.server.tea.latest_nav_result()
         state.update(
             {
                 "sim_mode": "nav_process",
                 "activity": self.server.activity,
                 "config": dict(config.settings.__dict__),
                 "workarea": self.server.tea.summary(),
+                "nav": {
+                    "active": bool(self.server.nav.get("active")),
+                    "paused": bool(self.server.nav.get("paused")),
+                    "goal": self.server.nav.get("goal"),
+                    "cmd_vel_age": round(cmd_vel["age"], 2) if cmd_vel else None,
+                    "last_result": (
+                        {"outcome": result["outcome"], "text": result["text"]} if result else None
+                    ),
+                },
             }
         )
         return state
@@ -375,6 +592,7 @@ class NavHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def stop_application(self):
+        self.robot.set_nav_mode(False)
         self.robot.stop()
         self.simulator.stop()
         self.tea.stop()
@@ -396,10 +614,13 @@ def create_server(host="127.0.0.1", port=8000, tea_opts=None):
     httpd.robot = robot
     httpd.tea = tea
     httpd.activity = "work"
+    httpd.nav = {"active": False, "paused": False, "goal": None, "since": 0.0}
     httpd.simulator = NavSimulator(robot, tea)
+    httpd.simulator.nav = httpd.nav
     httpd.simulator.start()
     if tea.summary().get("enabled"):
         tea.start()
+        _auto_fetch_map(tea, robot)
     return httpd
 
 

@@ -54,12 +54,42 @@ h2 { margin: 0 0 12px; font-size: 13px; } h2 span, .log-head span { margin-left:
 .mission-head { justify-content: flex-start; margin-bottom: 8px; }.func-tabs { display: flex; gap: 4px; margin-left: 8px; }.func-tabs button { border: 1px solid var(--line); border-radius: 999px; padding: 3px 12px; background: transparent; color: var(--muted); cursor: pointer; font-size: 11px; }.func-tabs button.is-active { background: var(--cyan); color: #062033; border-color: transparent; font-weight: 700; }
 .tea-card { padding: 5px 9px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-soft); font-size: 11px; }.tea-card > span:last-of-type { color: var(--muted); }
 .status-dot { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }.status-dot.online { background: var(--green); }.status-dot.busy { background: var(--amber); }.status-dot.error { background: var(--red); }
-.workarea-pane { display: flex; flex-direction: column; gap: 8px; }.workarea-status > span:nth-of-type(2) { color: var(--muted); font-size: 11px; }.workarea-status button { margin-left: auto; }
+.workarea-pane { display: flex; flex-direction: column; gap: 8px; }.workarea-status > span:nth-of-type(2) { color: var(--muted); font-size: 11px; }
+/* 状态行右侧动作组: 刷新推到最右并紧挨退出, 其余按钮普通间距 */
+.workarea-status button { margin-left: 8px; }.workarea-status button[data-refresh-map] { margin-left: auto; }
 .workarea-box { padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-soft); }.workarea-box > strong { font-size: 11px; }
+/* 编辑区: 轨迹轮廓构建框 + 旁边裸删除按钮(不拉伸不带框), 右侧自然留白 */
+.workarea-edit-row { display: flex; align-items: center; gap: 14px; }
+.workarea-edit-row > .workarea-box { flex: 1 1 auto; max-width: 640px; min-width: 0; }
+.workarea-edit-row > #waClearBtn { flex: none; }
 .stage { position: relative; flex: 1; min-height: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--well); }
 #arena { display: block; width: 100%; height: 100%; cursor: grab; }#arena:active { cursor: grabbing; }
+/* 点到点选点姿态: 十字光标提示单击选目标 */
+#arena.picking, #arena.picking:active { cursor: crosshair; }
 .stage-label { position: absolute; top: 12px; left: 12px; padding: 4px 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--cyan); font-size: 11px; }
 .map-tools { position: absolute; top: 12px; right: 12px; }.legend { position: absolute; left: 12px; bottom: 34px; display: flex; gap: 12px; padding: 5px 9px; border-radius: 8px; background: var(--panel); color: var(--muted); font-size: 10px; }.legend span { display: flex; align-items: center; gap: 4px; }.dot { width: 7px; height: 7px; border-radius: 50%; }.dot.region { background: var(--green); }.dot.channel { background: var(--amber); }.dot.nogo { background: var(--red); }.dot.robot { background: var(--cyan); }
 .tips { position: absolute; right: 12px; bottom: 10px; color: var(--muted); font-size: 10px; }
+/* 工作区地图为空的画布居中提示: 接入拉图确认为空(或未拉到数据)后显示, 构建中隐藏 */
+.map-empty-hint { position: absolute; left: 50%; top: 12px; transform: translateX(-50%); padding: 9px 16px; border: 1px dashed var(--line); border-radius: 10px; background: var(--panel); color: var(--muted); font-size: 12px; pointer-events: none; }
 .log-dock { flex: 0 0 150px; margin: 0 10px 10px; overflow: hidden; }.log-dock.folded { flex-basis: 39px; }.log-dock.folded .log-list { display: none; }.log-head { height: 38px; display: flex; align-items: center; gap: 10px; padding: 0 12px; border-bottom: 1px solid var(--line); }.log-head > span { margin-left: auto; }.log-list { height: 110px; overflow-y: auto; margin: 0; padding: 6px 12px; list-style: none; font: 11px/1.55 ui-monospace, monospace; }.log-list li { display: grid; grid-template-columns: 62px 48px 1fr; gap: 8px; }.log-list time, .log-list .level { color: var(--muted); }.log-list .warn { color: var(--amber); }
 @media (max-width: 900px) { .layout { grid-template-columns: 250px minmax(0,1fr); }.brand-sub { display: none; }.telemetry-grid { grid-template-columns: 1fr; } }
+
+/* 面板单独折叠：点标题收起/展开（与内部仿真同交互），状态存 localStorage */
+.panel > h2 { position: relative; padding-right: 16px; cursor: pointer; user-select: none; }
+.panel > h2::after { content: "▾"; position: absolute; right: 0; top: 0; color: var(--muted); font-size: 11px; }
+.panel.is-collapsed > h2::after { content: "▸"; }
+.panel.is-collapsed > h2 { margin-bottom: 0; }
+.panel.is-collapsed > *:not(h2) { display: none !important; }
+
+/* 收起左侧栏：侧栏不参与布局，工作区独占整行（与内部仿真同交互） */
+.layout.is-side-hidden { grid-template-columns: minmax(0, 1fr); }
+.layout.is-side-hidden .sidebar { display: none; }
+.chip--ghost { background: transparent; color: var(--muted); }
+.chip--ghost[aria-pressed="true"] { color: var(--text); border-color: var(--green); }
+.sidebar-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 4px; }
+.sidebar-head-title { font-size: 10px; letter-spacing: 2px; text-transform: uppercase; color: var(--muted); opacity: .7; }
+.side-handle { padding: 2px 8px; border-radius: 7px; border: 1px solid var(--line-strong); background: var(--well); color: var(--muted); font-size: 10px; line-height: 1.4; cursor: pointer; white-space: nowrap; }
+.side-handle:hover { color: var(--text); border-color: var(--green); }
+.side-tab { position: fixed; left: 0; top: 50%; transform: translateY(-50%); z-index: 12; width: 16px; height: 74px; padding: 0; border-radius: 0 8px 8px 0; border: 1px solid var(--line-strong); border-left: none; background: var(--panel); color: var(--muted); font-size: 11px; cursor: pointer; display: none; }
+.side-tab:hover { color: var(--text); }
+.layout.is-side-hidden ~ .side-tab { display: block; }

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>1.0.8 机器人控制台 · 接入导航进程</title>
+  <title>1.0.9 机器人控制台 · 接入导航进程</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='26' fill='%230b1020' stroke='%2337e0a0' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='9' fill='%2337e0a0'/%3E%3C/svg%3E" />
   <script>
     try { document.documentElement.dataset.theme = localStorage.getItem("mowerThemeV1") || "dark"; }
@@ -14,14 +14,14 @@
     html[data-theme="light"] { background: #edf2f8; }
     html[data-theme="warm"] { background: #211a17; }
   </style>
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="styles.css?v=20261110f" />
   <link rel="stylesheet" href="shared/mode_switch.css?v=20261107" />
 </head>
 <body data-sim-mode="nav_process">
   <header class="topbar">
     <div class="brand">
       <span class="brand-mark" aria-hidden="true"></span>
-      <span class="brand-title">1.0.8 机器人控制台</span>
+      <span class="brand-title">1.0.9 机器人控制台</span>
       <span class="brand-sub">Vision Mower Console</span>
       <label class="sim-mode-picker" title="选择独立运行的仿真应用">
         仿真
@@ -34,6 +34,8 @@
     <div class="status-chips">
       <span class="chip chip--mow">导航进程</span>
       <span id="linkChip" class="chip chip--ok">已连接</span>
+      <button id="sidebarToggleBtn" class="chip chip--ghost" type="button" aria-pressed="false"
+        title="收起 / 展开左侧栏（遥测、参数、手动控制）">◧ 侧栏</button>
       <label class="theme-picker">主题
         <select id="themeSelect" aria-label="界面配色">
           <option value="dark">深色</option><option value="light">浅色</option><option value="warm">暖色</option>
@@ -45,7 +47,11 @@
 
   <main class="layout">
     <aside class="sidebar">
-      <section class="panel" aria-label="遥测数据">
+      <div class="sidebar-head">
+        <span class="sidebar-head-title">侧栏</span>
+        <button id="sidebarHandle" class="side-handle" type="button" title="向左收起左侧栏">« 收起</button>
+      </div>
+      <section class="panel" data-panel="telemetry" aria-label="遥测数据">
         <h2>遥测 <span>Telemetry</span></h2>
         <div class="battery"><span>电量</span><div class="battery-track"><i id="batteryFill"></i></div><strong id="batteryText">100%</strong></div>
         <div class="telemetry-grid">
@@ -56,7 +62,7 @@
         </div>
       </section>
 
-      <section class="panel" aria-label="导航遥控参数">
+      <section class="panel" data-panel="params" aria-label="导航遥控参数">
         <h2>参数 <span>Navigation</span></h2>
         <div class="param-grid">
           <label>圆弧速度 (m/s)<input type="number" data-config="arc_speed" min="0.05" max="0.60" step="0.05" /></label>
@@ -68,7 +74,7 @@
         <p id="paramMessage" class="hint">参数仅属于导航进程仿真，不修改内部仿真配置。</p>
       </section>
 
-      <section class="panel" aria-label="手动控制">
+      <section class="panel" data-panel="manual" aria-label="手动控制">
         <h2>手动控制 <span>Manual</span></h2>
         <div class="dpad">
           <button class="pad-btn arc" data-drive="arc_left" aria-label="左前圆弧" title="左前圆弧（按住）">
@@ -83,7 +89,7 @@
           <button class="pad-btn right" data-drive="right" aria-label="右转">▶</button>
           <button class="pad-btn down" data-drive="back" aria-label="后退">▼</button>
         </div>
-        <p class="hint">按住行驶，松开停止；速度参数由本页面独立管理。</p>
+        <p class="hint">按住行驶，松开停止；键盘 W/A/S/D 行驶、Q/E 左右圆弧、空格急停。</p>
       </section>
     </aside>
 
@@ -95,10 +101,23 @@
           <button id="enterWorkareaBtn" class="task-btn task-btn--primary">工作区地图构建</button>
           <span id="workareaHint" class="hint">由真实导航进程记录轨迹。</span>
         </div>
-        <div id="navTaskPane" class="mission-row" hidden><span class="hint">导航任务尚未接入，当前版本不提供本地任务替代。</span><button class="task-btn task-btn--primary" disabled>启动</button><button class="task-btn" disabled>暂停</button></div>
+        <div id="navTaskPane" class="mission-row" hidden>
+          <button id="pickGoalBtn" class="task-btn task-btn--primary">选目标点</button>
+          <button id="goalPauseBtn" class="task-btn" disabled>暂停</button>
+          <button id="goalContinueBtn" class="task-btn" disabled>继续</button>
+          <button id="goalCancelBtn" class="task-btn" disabled>取消任务</button>
+          <span id="navTaskHint" class="hint">点“选目标点”后在地图上单击确定目标，由 tea 规划导航。</span>
+        </div>
         <div id="workareaPane" class="workarea-pane" hidden>
-          <div class="workarea-status"><span id="waStatusDot" class="status-dot"></span><strong id="waStatus">空闲</strong><span id="waSessionInfo">地图版本 0</span><button id="exitWorkareaBtn" class="task-btn">退出工作区</button></div>
-          <div class="workarea-box"><strong>轨迹轮廓构建</strong><div class="button-row"><button class="task-btn" data-wa-start="1">区域起点</button><button class="task-btn" data-wa-start="2">通道起点</button><button class="task-btn" data-wa-start="3">禁区起点</button><button id="waSaveBtn" class="task-btn task-btn--primary">保存</button><button id="waCancelBtn" class="task-btn">取消</button></div><p class="hint">点击起点后使用左侧遥控行驶；保存或取消由导航进程确认。</p></div>
+          <div class="workarea-status"><span id="waStatusDot" class="status-dot"></span><strong id="waStatus">空闲</strong><span id="waSessionInfo">地图版本 0</span><button class="task-btn" data-refresh-map title="触发 tea 重新发布当前地图并回填缓存；构建中也可刷新，不打断当前构建">刷新工作区地图</button><button id="exitWorkareaBtn" class="task-btn">退出编辑</button></div>
+          <div class="workarea-edit-row">
+            <div class="workarea-box">
+              <strong>轨迹轮廓构建</strong>
+              <div class="button-row"><button class="task-btn" data-wa-start="1">区域起点</button><button class="task-btn" data-wa-start="2">通道起点</button><button class="task-btn" data-wa-start="3">禁区起点</button><button id="waSaveBtn" class="task-btn task-btn--primary">保存</button><button id="waCancelBtn" class="task-btn">取消</button></div>
+              <p class="hint">点击起点后使用左侧遥控行驶；保存或取消由导航进程确认。</p>
+            </div>
+            <button id="waClearBtn" class="task-btn" title="删除当前图：删除当前工作区地图的全部区域/通道/禁区（整图清空，需二次确认）">删除当前图</button>
+          </div>
         </div>
       </section>
 
@@ -106,11 +125,14 @@
         <canvas id="arena"></canvas>
         <div class="stage-label">导航进程 · 独立视图</div>
         <div class="map-tools"><button id="resetViewBtn" class="chip" title="复位视图">⌂</button></div>
+        <div id="mapEmptyHint" class="map-empty-hint" hidden>工作区地图为空</div>
         <div class="legend"><span><i class="dot region"></i>区域</span><span><i class="dot channel"></i>通道</span><span><i class="dot nogo"></i>禁区</span><span><i class="dot robot"></i>机器人</span></div>
         <div class="tips">滚轮缩放 · 拖动平移 · 双击复位</div>
       </section>
     </div>
   </main>
+
+  <button id="sidebarTab" class="side-tab" type="button" title="展开左侧栏" hidden>»</button>
 
   <section class="log-dock" aria-label="事件日志">
     <div class="log-head"><strong>事件日志 <span>Events</span></strong><span id="logCount">0 条</span><button id="logToggleBtn" class="chip">收起</button></div>
@@ -118,6 +140,6 @@
   </section>
 
   <script src="shared/mode_switch.js?v=20261107"></script>
-  <script src="app.js?v=20261106"></script>
+  <script src="app.js?v=20261110b"></script>
 </body>
 </html>

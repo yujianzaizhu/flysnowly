@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import gzip
+import math
 import os
 import sys
 import tempfile
@@ -493,6 +494,87 @@ def load_bag(httpd, name, use_log_map=True):
     return manager, info, path
 
 
+# 连续播放时历史感知点云一直留着：换包只换"当前这一段"，前面的点云不清。
+# 界面上的「清理地图」才会真正清掉（顺便清掉轨迹）。
+CLOUD_HISTORY_POINTS = 24000
+CLOUD_MAX_POINTS = 6000
+
+
+def cloud_history(server):
+    history = getattr(server, "bag_cloud_history", None)
+    if history is None:
+        history = []
+        server.bag_cloud_history = history
+    return history
+
+
+def archive_replay_cloud(server):
+    """换包前把当前这段日志的点云整段存进历史。"""
+    manager = getattr(server, "manager", None)
+    replay = getattr(manager, "replay", None) if manager is not None else None
+    if replay is None:
+        return 0
+    try:
+        cloud = replay.cloud_at(float("inf"), max_points=6000)
+    except Exception:
+        return 0
+    points = (cloud or {}).get("points") or []
+    if not points:
+        return 0
+    history = cloud_history(server)
+    history.append([float(value) for value in points])
+    total = sum(len(chunk) // 2 for chunk in history)
+    while len(history) > 1 and total > CLOUD_HISTORY_POINTS:
+        total -= len(history.pop(0)) // 2
+    return len(points) // 2
+
+
+def clear_cloud_history(server):
+    server.bag_cloud_history = []
+
+
+def _downsample_cloud(points, max_points):
+    total = len(points) // 2
+    if total <= max_points or max_points <= 0:
+        return points, total
+    stride = int(math.ceil(total / float(max_points)))
+    picked = []
+    for index in range(0, total, stride):
+        picked.append(points[index * 2])
+        picked.append(points[index * 2 + 1])
+    return picked, total
+
+
+def combined_cloud(server, time_value):
+    """历史点云（前面几段日志）+ 当前日志截至 ``time_value`` 的点云。"""
+    manager = getattr(server, "manager", None)
+    replay = getattr(manager, "replay", None) if manager is not None else None
+    history = list(cloud_history(server))
+    current = None
+    if replay is not None:
+        try:
+            current = replay.cloud_at(time_value)
+        except Exception:
+            current = None
+    current_points = list((current or {}).get("points") or [])
+    if not history and not current_points:
+        return None
+    points = []
+    for chunk in history:
+        points.extend(chunk)
+    history_points = len(points) // 2
+    points.extend(current_points)
+    picked, total = _downsample_cloud(points, CLOUD_MAX_POINTS)
+    return {
+        "points": picked,
+        "count": len(picked) // 2,
+        "total": total,
+        "frames": int((current or {}).get("frames") or 0),
+        "history": history_points,
+        "bags": len(history),
+    }
+
+
 def bag_queue_snapshot(server):
     queue = getattr(server, "bag_queue", None) or {}
     names = list(queue.get("names") or [])
@@ -506,29 +588,52 @@ def bag_queue_snapshot(server):
         "total": len(names),
         "current": current if active else None,
         "use_log_map": bool(queue.get("use_log_map", True)),
+        "loading": bool(queue.get("loading")),
+        "failed": list(queue.get("failed") or []),
     }
 
 
-def _queue_worker(server):
-    """后台线程：载入队列里的下一条日志并自动播放。"""
+def _queue_worker(server, owner=None):
+    """后台线程：载入队列里的下一条日志并自动播放。
+
+    单条日志载入失败只跳过这一条，不会把整个队列终止掉（以前一条坏包就把
+    “连续播放”整条打死，界面看起来就是“有时候播到一半就不动了”）。
+    ``owner`` 是发起这次载入的队列对象：期间如果又起了新队列（或按了停止），
+    旧线程收尾时不能去改新队列的 ``loading``，否则新队列会被误判成“已在载入”。
+    """
+    if owner is None:
+        owner = getattr(server, "bag_queue", None)
     try:
-        queue = getattr(server, "bag_queue", {}) or {}
-        names = queue.get("names") or []
-        index = queue.get("index", 0)
-        if not queue.get("active") or index >= len(names):
-            queue["active"] = False
-            return
-        manager, _info, _path = load_bag(server, names[index], queue.get("use_log_map", True))
-        manager.start_replay()
-    except Exception as exc:
-        print("连续播放失败：{}".format(exc))
-        queue = getattr(server, "bag_queue", None)
-        if queue is not None:
-            queue["active"] = False
+        while True:
+            queue = getattr(server, "bag_queue", None)
+            if queue is None or queue is not owner or not queue.get("active"):
+                return
+            names = queue.get("names") or []
+            index = int(queue.get("index") or 0)
+            if index >= len(names):
+                queue["active"] = False
+                return
+            try:
+                if index > 0:
+                    # 换包前把上一段日志的感知点云存进历史：连续播放不清历史点云
+                    archive_replay_cloud(server)
+                manager, _info, _path = load_bag(
+                    server, names[index], queue.get("use_log_map", True)
+                )
+                manager.start_replay()
+                return
+            except Exception as exc:
+                print("连续播放失败（{}）：{}".format(names[index], exc))
+                failed = queue.setdefault("failed", [])
+                if names[index] not in failed:
+                    failed.append(names[index])
+                queue["index"] = index + 1
+                if queue["index"] >= len(names):
+                    queue["active"] = False
+                    return
     finally:
-        queue = getattr(server, "bag_queue", None)
-        if queue is not None:
-            queue["loading"] = False
+        if getattr(server, "bag_queue", None) is owner:
+            owner["loading"] = False
 
 
 def start_bag_queue(server, names, use_log_map=True):
@@ -536,16 +641,29 @@ def start_bag_queue(server, names, use_log_map=True):
     cleaned = [str(item) for item in (names or []) if str(item).strip()]
     if not cleaned:
         raise ValueError("请先勾选要连续播放的日志")
+    failed = []
+    playable = []
     for name in cleaned:
-        resolve_bag(server, name)
+        try:
+            resolve_bag(server, name)
+            playable.append(name)
+        except Exception:
+            # 找不到的文件只跳过它，不要让整条队列起不来
+            if name not in failed:
+                failed.append(name)
+    if not playable:
+        raise ValueError("勾选的日志都找不到，无法连续播放")
     server.bag_queue = {
-        "names": cleaned,
+        "names": playable,
         "index": 0,
         "active": True,
         "use_log_map": bool(use_log_map),
         "loading": True,
+        "failed": failed,
     }
-    threading.Thread(target=_queue_worker, args=(server,), daemon=True).start()
+    threading.Thread(
+        target=_queue_worker, args=(server, server.bag_queue), daemon=True
+    ).start()
     return bag_queue_snapshot(server)
 
 
@@ -563,7 +681,7 @@ def poll_bag_queue(server):
         queue["active"] = False
         return
     queue["loading"] = True
-    threading.Thread(target=_queue_worker, args=(server,), daemon=True).start()
+    threading.Thread(target=_queue_worker, args=(server, queue), daemon=True).start()
 
 
 class Simulator(threading.Thread):
@@ -691,8 +809,7 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                 time_value = float((query.get("t") or ["0"])[0])
             except ValueError:
                 time_value = 0.0
-            replay = self.server.manager.replay
-            self._send_json({"cloud": replay.cloud_at(time_value)})
+            self._send_json({"cloud": combined_cloud(self.server, time_value)})
         elif path == "/api/reports":
             entries = list_reports()
             self._send_json(
@@ -759,6 +876,7 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                 manager.request_resume()
             elif path == "/api/reset":
                 self.server.bag_queue = None
+                clear_cloud_history(self.server)
                 manager.clear_replay()
                 self.server.robot.reset()
                 self.server.grid.reset_map()
@@ -769,6 +887,7 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                 map_id = int(payload.get("map", 1))
                 if map_id not in world.MAPS:
                     raise ValueError("未知地图: {}".format(map_id))
+                clear_cloud_history(self.server)
                 with self.server.simulator.lock:
                     world.select_map(map_id)
                     robot = RobotCar()
@@ -1052,6 +1171,8 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                     if not name:
                         raise ValueError("请选择日志文件")
                     self.server.bag_queue = None
+                    # 手动载入日志：历史点云与轨迹一起重新起笔
+                    clear_cloud_history(self.server)
                     manager, info, bag_path = load_bag(
                         self.server, name, payload.get("use_log_map", True)
                     )
@@ -1091,6 +1212,12 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                         payload.get("use_log_map", True),
                     )
                     self._send_json({"queue": snapshot, "state": manager.replay_state()})
+                    return
+                if action == "cloud/clear":
+                    # 「清理地图」：把累积的历史点云清掉（轨迹在界面上一起清）
+                    cleared = sum(len(chunk) // 2 for chunk in cloud_history(self.server))
+                    clear_cloud_history(self.server)
+                    self._send_json({"ok": True, "cleared": cleared})
                     return
                 if action == "control":
                     command = str(payload.get("command") or "")
@@ -1448,6 +1575,7 @@ def create_server(host="127.0.0.1", port=8000):
     httpd.manager = manager
     httpd.bag_roots = [BAG_DIR]
     httpd.bag_queue = None
+    httpd.bag_cloud_history = []
     httpd.editor = None
     httpd.simulator = Simulator(manager)
     httpd.simulator.on_cycle = lambda: poll_bag_queue(httpd)

@@ -31,8 +31,17 @@ PUB_MIN_INTERVAL = 0.05  # 位姿发布的最小仿真时间间隔(s), 倍速下
 TF_TOPIC = "tf_dynamic"
 TF_MAP_FRAME = "map"         # tf 目标系(全局地图系)
 TF_BASE_FRAME = "base_link"  # tf 源系(机器人基系)
+# 里程计发布(对齐 tea robot_cfg: odom_topic, tea PoseSource_Odom 采点定位来源)
+ODOM_TOPIC = "odom_data"
+
+# 建图过程话题(对齐 tea top_cfg: trajectory_pose_pub_topic/area_info_pub_topic/charge_pose_pub_topic)
+TRAJ_POSE_TOPIC = "trajectory_pose_test"  # PoseStamped: 构建中距上一点 >=0.10m 才发布, 轨迹线数据源
+AREA_INFO_TOPIC = "get_area_info"         # Float32: 构建中 1Hz, 通道发长度(m) 其余发面积(m²)
+CHARGE_POSE_TOPIC = "charge_pose"         # ChargeStationPose: 5Hz 无条件, 无桩发零值
 MAP_TOPIC_WAIT = 1.5  # get_map_info 成功后等待 map_info 话题的时长(s)
 SUB_RETRY_INTERVAL = 2.0  # SUB 线程断线重连间隔(s)
+PROBE_BIND_RETRIES = 3  # 内嵌 proxy 探测绑定重试次数
+PROBE_BIND_RETRY_INTERVAL = 0.4  # 重试间隔(s): 覆盖旧桥实例的拆解窗口
 
 ELEMENT_NAMES = {1: "区域", 2: "通道", 3: "禁区"}
 
@@ -92,6 +101,22 @@ CMD_NAMES = {
 MAP_CMD_LOAD = 1
 MAP_CMD_CHANGE = 2
 
+# nav_task_action: usr_define_basics.ActionType / usr_define_actions.TaskMode(点到点)
+ACTION_START = 1
+ACTION_CANCEL = 2
+ACTION_PAUSE = 3
+ACTION_CONTINUE = 4
+ACTION_NAMES = {
+    ACTION_START: "START",
+    ACTION_CANCEL: "CANCEL",
+    ACTION_PAUSE: "PAUSE",
+    ACTION_CONTINUE: "CONTINUE",
+}
+TASK_MODE_NAVIGATION = 10  # TaskMode.NAVIGATION(点到点, tea 侧建 Task_Type_P2P)
+NAV_RESULT_SUCCEED = 0  # ActionResponse.status: ResultStatus.SUCCEED
+NAV_OUTCOME_NAMES = {0: "UNKNOWN", 1: "SUCCESS", 2: "FAILURE"}
+CMD_VEL_TIMEOUT = 0.5  # cmd_vel 超时(s): 超过未收到新帧即清零导航速度(对齐真机底盘保护)
+
 DEFAULT_OPTS = {
     "enabled": False,
     "host": "127.0.0.1",
@@ -102,6 +127,8 @@ DEFAULT_OPTS = {
     "nav_port": 25009,  # nav_task_action 动作服务(raw 通道用)
     "run_proxy": True,  # 内嵌 zmq proxy(端口被占时自动降级为仅连接已有 proxy)
     "service_timeout": 2.0,
+    "cmd_vel_topic": "cmd_vel",  # tea 底盘速度下发话题(robot_cfg vel_pub_topic)
+    "nav_result_topic": "nav_task_action_result",  # 导航结果话题(top_cfg task_result_pub_topic)
 }
 
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -123,7 +150,7 @@ def _import_deps():
     if proto_dir not in sys.path:
         sys.path.insert(0, proto_dir)
     try:
-        from proto_msg import geometry_msgs_pb2, tf2_msgs_pb2
+        from proto_msg import geometry_msgs_pb2, std_msgs_pb2, tf2_msgs_pb2
         from proto_usr_define import usr_define_msgs_pb2, usr_define_services_pb2
     except Exception as exc:
         raise ImportError(
@@ -131,7 +158,7 @@ def _import_deps():
         )
     import zmq
 
-    return zmq, usr_define_services_pb2, usr_define_msgs_pb2, geometry_msgs_pb2, tf2_msgs_pb2
+    return zmq, usr_define_services_pb2, usr_define_msgs_pb2, geometry_msgs_pb2, tf2_msgs_pb2, std_msgs_pb2
 
 
 def yaw_to_quat(yaw):
@@ -165,6 +192,10 @@ class ZmqProxyThread(threading.Thread):
     zmq.proxy 在 libzmq 内部阻塞, 外部 term 无法可靠唤醒, 服务停机时会挂住
     shutdown; 这里用 poll 循环手动双向转发(XSUB<->XPUB 的订阅帧按普通消息
     透传即可), stop 只需置位 + 等一个 poll 周期。
+
+    绑定在本线程内完成并带重试: 启动期可能撞上旧桥实例的拆解窗口
+    (EADDRINUSE 只是暂态), 一次失败就放弃会在"没有已有 proxy"的环境里
+    让话题层永久静默。绑定结果经 bound/failed 事件回传给 start()。
     """
 
     def __init__(self, zmq_mod, host, pub_port, sub_port):
@@ -175,19 +206,42 @@ class ZmqProxyThread(threading.Thread):
         self.sub_port = sub_port
         self.context = None
         self._stop_event = threading.Event()
+        self.bound = threading.Event()
+        self.failed = threading.Event()
+        self.bind_error = None
 
     def run(self):
         frontend = None
         backend = None
         try:
             self.context = self.zmq_mod.Context(1)
-            frontend = self.context.socket(self.zmq_mod.XSUB)
-            frontend.set(self.zmq_mod.LINGER, 0)
-            frontend.bind("tcp://%s:%d" % (self.host, self.pub_port))
-            backend = self.context.socket(self.zmq_mod.XPUB)
-            backend.set(self.zmq_mod.LINGER, 0)
-            backend.bind("tcp://%s:%d" % (self.host, self.sub_port))
             poller = self.zmq_mod.Poller()
+            attempts_left = PROBE_BIND_RETRIES
+            while not self._stop_event.is_set():
+                try:
+                    frontend = self.context.socket(self.zmq_mod.XSUB)
+                    frontend.set(self.zmq_mod.LINGER, 0)
+                    frontend.bind("tcp://%s:%d" % (self.host, self.pub_port))
+                    backend = self.context.socket(self.zmq_mod.XPUB)
+                    backend.set(self.zmq_mod.LINGER, 0)
+                    backend.bind("tcp://%s:%d" % (self.host, self.sub_port))
+                    break
+                except Exception as exc:
+                    for sock in (frontend, backend):
+                        if sock is not None:
+                            try:
+                                sock.close(linger=0)
+                            except Exception:
+                                pass
+                    frontend = backend = None
+                    self.bind_error = exc
+                    attempts_left -= 1
+                    if attempts_left <= 0 or self._stop_event.wait(PROBE_BIND_RETRY_INTERVAL):
+                        self.failed.set()
+                        return
+            if self._stop_event.is_set():
+                return
+            self.bound.set()
             poller.register(frontend, self.zmq_mod.POLLIN)
             poller.register(backend, self.zmq_mod.POLLIN)
             while not self._stop_event.is_set():
@@ -205,9 +259,10 @@ class ZmqProxyThread(threading.Thread):
                         except self.zmq_mod.ZMQError:
                             pass
         except Exception:
-            # stop() 关闭 context 时走到这里, 属正常退出; 其余异常由 start() 侧
-            # bind 预检兜底, 这里静默结束线程
-            pass
+            # stop() 关闭 context 时走到这里, 属正常退出; 其余异常置 failed
+            # 并由 start() 侧记日志, 这里静默结束线程
+            if not self.bound.is_set():
+                self.failed.set()
         finally:
             for sock in (frontend, backend):
                 if sock is not None:
@@ -220,6 +275,18 @@ class ZmqProxyThread(threading.Thread):
                     self.context.term()
                 except Exception:
                     pass
+
+    def wait_bound(self, timeout):
+        """等待绑定结果: True=已绑定; False=失败或超时(错误详情在 bind_error)。"""
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.bound.is_set():
+                return True
+            if self.failed.is_set():
+                return False
+            time.sleep(0.02)
+        return self.bound.is_set()
 
     def stop(self):
         self._stop_event.set()
@@ -248,6 +315,10 @@ class ZmqServiceClient:
                 self._socket.close(linger=0)
             except Exception:
                 pass
+        if self._context.closed:
+            # stop() 与进行中的调用竞态时, 不得在已销毁的 context 上重建 socket:
+            # 泄漏的 socket 会让 context.__del__/term() 永久阻塞(GC 卡死整个进程)
+            raise RuntimeError("服务端通道已关闭")
         sock = self._context.socket(self.zmq_mod.REQ)
         sock.set(self.zmq_mod.LINGER, 0)
         sock.connect(self.endpoint)
@@ -298,7 +369,7 @@ class TeaBridge:
         self.opts = merged
         self.log_fn = log_fn or (lambda level, msg: None)
 
-        self.zmq_mod, self.svc_pb, self.msgs_pb, self.geo_pb, self.tf_pb = _import_deps()
+        self.zmq_mod, self.svc_pb, self.msgs_pb, self.geo_pb, self.tf_pb, self.std_pb = _import_deps()
         from proto_usr_define import usr_define_actions_pb2
 
         self.act_pb = usr_define_actions_pb2
@@ -312,20 +383,28 @@ class TeaBridge:
         self._last_pub_sim = None
         self._pub_count = 0
         self._tf_pub_count = 0
+        self._odom_pub_count = 0
 
         self._state_lock = threading.Lock()
-        self._trail = []  # [[x, y], ...] 构建轨迹(仅 building 时累积)
+        self._trail = []  # [[x, y], ...] 构建轨迹(来源 tea trajectory_pose_test 话题, 仅 building 时累积)
         self._trail_len = 0.0
+        self._build_measure = None  # get_area_info 最新值: 构建中面积(m²)或通道长度(m); 会话结束清空
+        self._charge_pose = None  # charge_pose 最新: {"x","y","yaw","lat","lon","alt"}; 零值=无桩
 
         self._map_lock = threading.Lock()
         self._map_cond = threading.Condition(self._map_lock)
         self._map_cache = None  # 转成 dict 的 MapInfo
         self._map_version = 0
+        self._map_checked = False  # 是否至少成功触发过一次 get_map_info(用于前端区分"未拉过"与"已确认为空")
 
         self._call_lock = threading.Lock()
         self._record_client = None
         self._map_client = None
         self._nav_client = None
+
+        self._nav_lock = threading.Lock()
+        self._cmd_vel = None  # (linear, angular, monotonic 收到时刻) tea 速度指令
+        self._nav_result = None  # {"outcome", "text", "at"} 最近一次导航结果
 
         self._sub_stop = threading.Event()
         self._sub_thread = None
@@ -338,22 +417,22 @@ class TeaBridge:
         if self._started:
             return
         if self.opts["run_proxy"]:
-            try:
-                probe_ctx = self.zmq_mod.Context(1)
-                sock = probe_ctx.socket(self.zmq_mod.XSUB)
-                sock.bind("tcp://%s:%d" % (self.opts["host"], self.opts["proxy_pub_port"]))
-                sock.close(linger=0)
-                probe_ctx.term()
-                self._proxy = ZmqProxyThread(
-                    self.zmq_mod, self.opts["host"], self.opts["proxy_pub_port"], self.opts["proxy_sub_port"]
-                )
-                self._proxy.start()
+            # 绑定在 proxy 线程内完成并带重试(见 ZmqProxyThread): start() 不再
+            # 自建一次性探测 context, 避免额外 context 生命周期引入 GC-term 风险
+            self._proxy = ZmqProxyThread(
+                self.zmq_mod, self.opts["host"], self.opts["proxy_pub_port"], self.opts["proxy_sub_port"]
+            )
+            self._proxy.start()
+            wait = PROBE_BIND_RETRIES * PROBE_BIND_RETRY_INTERVAL + 1.0
+            if self._proxy.wait_bound(wait):
                 self.log("event", "[工作区] 内嵌 zmq proxy 已启动(10001/10002)")
-            except Exception as exc:
+            else:
+                error = self._proxy.bind_error or "绑定超时"
+                self._proxy.stop()
                 self._proxy = None
                 self.log(
                     "warn",
-                    "[工作区] proxy 端口绑定失败(%s), 降级为连接已有 proxy" % exc,
+                    "[工作区] proxy 端口绑定失败(%s), 降级为连接已有 proxy" % error,
                 )
         try:
             ctx = self.zmq_mod.Context(1)
@@ -397,6 +476,11 @@ class TeaBridge:
         for client in (self._record_client, self._map_client, self._nav_client):
             if client is not None:
                 client.close()
+        # 置空引用: 并发中的调用线程下一次进入即走"桥未启动"短路, 不会在
+        # 已销毁的 context 上重建 socket(参见 ZmqServiceClient._connect 防护)
+        self._record_client = None
+        self._map_client = None
+        self._nav_client = None
         with self._pub_lock:
             if self._pub_socket is not None:
                 try:
@@ -413,6 +497,9 @@ class TeaBridge:
                 self._pub_context = None
         if self._proxy is not None:
             self._proxy.stop()
+            # join 至线程退出: 确保 10001/10002 的监听 socket 已释放,
+            # 否则紧随其后的重建/探测会撞上未释放的端口
+            self._proxy.join(timeout=1.0)
             self._proxy = None
         self.log("event", "[工作区] tea 桥已停止")
 
@@ -446,10 +533,32 @@ class TeaBridge:
             return
         self._last_pub_sim = sim_time
         self._publish_tf(pose, sim_time)
+        self._publish_odom(pose, sim_time)
         self._publish_combined(pose)
-        with self._state_lock:
-            if self.session["state"] == "building":
-                self._append_trail(pose[0], pose[1])
+
+    def _publish_odom(self, pose, sim_time):
+        """odom_data: usr_define_msgs/Odom(tea robot_cfg odom_topic)。
+        tea 位姿来源 PoseSource_Odom( tea_cfg/slam pose_source=0 )经 chss odomCallBack
+        解析本话题; 仿真中 odom 系与全局地图系重合, 直接发仿真位姿。"""
+
+        msg = self.msgs_pb.Odom()
+        msg.header.stamp = int(sim_time * 1e6)  # us, 与 tea tic::StampUs 约定一致
+        msg.child_frame_id = TF_BASE_FRAME.encode()
+        msg.pose.position.x = float(pose[0])
+        msg.pose.position.y = float(pose[1])
+        qx, qy, qz, qw = yaw_to_quat(float(pose[2]))
+        msg.pose.orientation.x = qx
+        msg.pose.orientation.y = qy
+        msg.pose.orientation.z = qz
+        msg.pose.orientation.w = qw
+        with self._pub_lock:
+            if self._pub_socket is None:
+                return
+            try:
+                self._pub_socket.send_multipart([ODOM_TOPIC.encode(), msg.SerializeToString()])
+                self._odom_pub_count += 1
+            except Exception as exc:
+                self.last_error = "odom_data 发布失败: %s" % exc
 
     def _publish_tf(self, pose, sim_time):
         """tf_dynamic: TFMessage 携带一条 map → base_link 变换(tea slam PoseSource_Tf)。"""
@@ -496,6 +605,8 @@ class TeaBridge:
                 self.last_error = "combined 发布失败: %s" % exc
 
     def _append_trail(self, x, y):
+        """累积构建轨迹线(trajectory_pose_test 话题回调, 仅 building 时调用)。"""
+
         if self._trail:
             last = self._trail[-1]
             if math.hypot(x - last[0], y - last[1]) < TRAIL_MIN_STEP:
@@ -582,6 +693,9 @@ class TeaBridge:
         if response.result != 0:
             return {"ok": False, "result": int(response.result), "info": "读图失败"}
 
+        # tea 侧确认读图成功: 后续"缓存为空"才能解读为"工作区地图为空"而非"还没拉过"
+        self._map_checked = True
+
         if not wait:
             return {"ok": True, "result": 0}
         # 等待"本次调用之后"的新发布(按版本号增量), 避免命中调用前的旧缓存
@@ -625,6 +739,12 @@ class TeaBridge:
                 pose = request.goal.target_pose.pose
                 pose.position.x = float(target.get("x", 0.0))
                 pose.position.y = float(target.get("y", 0.0))
+                # 目标朝向(可选, 默认 0): tea 用到达朝向做终点位姿对齐
+                qx, qy, qz, qw = yaw_to_quat(float(target.get("yaw", 0.0)))
+                pose.orientation.x = qx
+                pose.orientation.y = qy
+                pose.orientation.z = qz
+                pose.orientation.w = qw
         try:
             with self._call_lock:
                 if self._nav_client is None:
@@ -645,12 +765,14 @@ class TeaBridge:
             self.session = {"state": "building", "type": type_, "stale": False, "since": time.time()}
             self._trail = []
             self._trail_len = 0.0
+            self._build_measure = None
 
     def end_session(self):
         with self._state_lock:
             self.session = {"state": "idle", "type": None, "stale": False, "since": None}
             self._trail = []
             self._trail_len = 0.0
+            self._build_measure = None
 
     def mark_stale(self):
         with self._state_lock:
@@ -660,11 +782,16 @@ class TeaBridge:
         with self._state_lock:
             return self.session["state"] == "building"
 
-    # ------------------------------------------------------------ map 订阅
+    # ------------------------------------------------- 话题订阅(map/cmd_vel/结果)
 
     def _sub_loop(self):
         sub = None
         ctx = None
+        cmd_vel_topic = self.opts["cmd_vel_topic"].encode()
+        nav_result_topic = self.opts["nav_result_topic"].encode()
+        traj_pose_topic = TRAJ_POSE_TOPIC.encode()
+        area_info_topic = AREA_INFO_TOPIC.encode()
+        charge_pose_topic = CHARGE_POSE_TOPIC.encode()
         try:
             while not self._sub_stop.is_set():
                 try:
@@ -674,20 +801,68 @@ class TeaBridge:
                         sub.set(self.zmq_mod.LINGER, 0)
                         sub.set(self.zmq_mod.RCVHWM, 10)
                         sub.set(self.zmq_mod.SUBSCRIBE, b"map_info")
+                        sub.set(self.zmq_mod.SUBSCRIBE, cmd_vel_topic)
+                        sub.set(self.zmq_mod.SUBSCRIBE, nav_result_topic)
+                        sub.set(self.zmq_mod.SUBSCRIBE, traj_pose_topic)
+                        sub.set(self.zmq_mod.SUBSCRIBE, area_info_topic)
+                        sub.set(self.zmq_mod.SUBSCRIBE, charge_pose_topic)
                         sub.connect("tcp://%s:%d" % (self.opts["host"], self.opts["proxy_sub_port"]))
                     if not sub.poll(500):
                         continue
                     frames = sub.recv_multipart()
-                    if len(frames) < 2 or frames[0] != b"map_info":
+                    if len(frames) < 2:
                         continue
-                    info = self.msgs_pb.MapInfo.FromString(frames[1])
-                    parsed = self._map_info_to_dict(info)
-                    with self._map_cond:
-                        self._map_cache = parsed
-                        self._map_version += 1
-                        self._map_cond.notify_all()
+                    topic = frames[0]
+                    if topic == b"map_info":
+                        info = self.msgs_pb.MapInfo.FromString(frames[1])
+                        parsed = self._map_info_to_dict(info)
+                        with self._map_cond:
+                            self._map_cache = parsed
+                            self._map_version += 1
+                            self._map_cond.notify_all()
+                    elif topic == cmd_vel_topic:
+                        twist = self.geo_pb.Twist.FromString(frames[1])
+                        with self._nav_lock:
+                            self._cmd_vel = (
+                                float(twist.linear.x),
+                                float(twist.angular.z),
+                                time.monotonic(),
+                            )
+                    elif topic == nav_result_topic:
+                        result = self.act_pb.NavTaskActionResult.FromString(frames[1])
+                        with self._nav_lock:
+                            self._nav_result = {
+                                "outcome": int(result.result.outcome),
+                                "text": result.status.text or "",
+                                "at": time.monotonic(),
+                            }
+                    elif topic == traj_pose_topic:
+                        traj_pose = self.geo_pb.PoseStamped.FromString(frames[1])
+                        with self._state_lock:
+                            if self.session["state"] == "building":
+                                self._append_trail(
+                                    float(traj_pose.pose.position.x), float(traj_pose.pose.position.y)
+                                )
+                    elif topic == area_info_topic:
+                        area_info = self.std_pb.Float32.FromString(frames[1])
+                        with self._state_lock:
+                            self._build_measure = float(area_info.data)
+                    elif topic == charge_pose_topic:
+                        charge = self.msgs_pb.ChargeStationPose.FromString(frames[1])
+                        with self._state_lock:
+                            self._charge_pose = {
+                                "x": float(charge.return_pose.position.x),
+                                "y": float(charge.return_pose.position.y),
+                                "yaw": quat_to_yaw(charge.return_pose.orientation.x,
+                                                   charge.return_pose.orientation.y,
+                                                   charge.return_pose.orientation.z,
+                                                   charge.return_pose.orientation.w),
+                                "lat": float(charge.base_latitude),
+                                "lon": float(charge.base_longitude),
+                                "alt": float(charge.base_altitude),
+                            }
                 except Exception:
-                    self.last_error = "map_info 订阅中断, %ds 后重连" % int(SUB_RETRY_INTERVAL)
+                    self.last_error = "话题订阅中断, %ds 后重连" % int(SUB_RETRY_INTERVAL)
                     if sub is not None:
                         try:
                             sub.close(linger=0)
@@ -761,6 +936,26 @@ class TeaBridge:
                 return {"version": self._map_version, "unchanged": True}
             return {"version": self._map_version, "map": self._map_cache}
 
+    # ------------------------------------------------------- 点到点导航数据
+
+    def latest_cmd_vel(self):
+        """最近一次 tea 速度指令: {"linear", "angular", "age"}; 从未收到返回 None。"""
+
+        with self._nav_lock:
+            if self._cmd_vel is None:
+                return None
+            linear, angular, at = self._cmd_vel
+        return {"linear": linear, "angular": angular, "age": time.monotonic() - at}
+
+    def latest_nav_result(self):
+        """最近一次 nav_task_action_result: {"outcome", "text", "at"}; 无则 None。
+
+        "at" 为 monotonic 时刻, server 用它判断是否晚于任务下发时间(避免旧结果误终态)。
+        """
+
+        with self._nav_lock:
+            return dict(self._nav_result) if self._nav_result else None
+
     # ---------------------------------------------------------------- 摘要
 
     def summary(self):
@@ -768,6 +963,9 @@ class TeaBridge:
             session = dict(self.session)
             trail = list(self._trail)
             trail_len = self._trail_len
+            build_measure = self._build_measure
+            charge_pose = self._charge_pose
+        cmd_vel = self.latest_cmd_vel()
         return {
             "enabled": True,
             "connected": self.connected,
@@ -778,10 +976,16 @@ class TeaBridge:
             "session": session,
             "trail": trail,
             "trail_len": round(trail_len, 1),
+            "build_measure": build_measure,
+            "charge_pose": charge_pose,
             "map_version": self._map_version,
+            "map_checked": self._map_checked,
             "pub_count": self._pub_count,
             "tf_pub_count": self._tf_pub_count,
+            "odom_pub_count": self._odom_pub_count,
             "last_error": self.last_error,
+            "cmd_vel_age": cmd_vel["age"] if cmd_vel else None,
+            "nav_result": self.latest_nav_result(),
         }
 
 
@@ -827,8 +1031,24 @@ class DisabledBridge:
     def map_snapshot(self, version=None):
         return {"version": 0, "map": None}
 
+    def latest_cmd_vel(self):
+        return None
+
+    def latest_nav_result(self):
+        return None
+
     def summary(self):
-        return {"enabled": False, "connected": False, "reason": self.reason, "session": {"state": "idle", "type": None, "stale": False, "since": None}}
+        return {
+            "enabled": False,
+            "connected": False,
+            "reason": self.reason,
+            "session": {"state": "idle", "type": None, "stale": False, "since": None},
+            "trail": [],
+            "trail_len": 0.0,
+            "build_measure": None,
+            "charge_pose": None,
+            "map_checked": False,
+        }
 
 
 def create(opts=None, log_fn=None):

@@ -97,6 +97,7 @@
     bagFolder: document.getElementById("bagFolder"),
     bagList: document.getElementById("bagList"),
     bagQueueBtn: document.getElementById("bagQueueBtn"),
+    bagClearBtn: document.getElementById("bagClearBtn"),
     bagQueueInfo: document.getElementById("bagQueueInfo"),
     sidebarToggleBtn: document.getElementById("sidebarToggleBtn"),
     missionPanel: document.querySelector(".mission"),
@@ -419,8 +420,10 @@
       lastRestarts = restarts;
       lastBagActive = !!bag.active;
     } else if (restarts > lastRestarts) {
-      // 拖了进度条：从当前位置重新起笔画，不画"初始跳线"
-      trail = [];
+      // 拖了进度条 / 重新播放：从当前位置重新起笔，不画"初始跳线"。
+      // 连续播放换包时 start() 也会让 restarts +1，这一段轨迹不能清掉。
+      if (queuePlaying) strokeBreakPending = true;
+      else trail = [];
     } else if (!!bag.active && !lastBagActive && !queuePlaying) {
       trail = [];
     }
@@ -3726,7 +3729,7 @@
   const LAYER_LABELS = {
     pose: "仿真实际轨迹（跳变处画细线）",
     costmap: "日志局部代价地图（窗口随车滚动时机器人会落在窗口里；否则按日志自己的坐标摆放，和真实地图逐格对齐）",
-    cloud: "障碍物点云（深度相机 obstaclecloud，已换算到地图坐标，随回放累积）",
+    cloud: "障碍物点云（深度相机 obstaclecloud，已换算到地图坐标，连续播放时跨日志累积）",
     static_costmap: "静态代价地图（当前未叠加显示）",
     image: "日志图像窗口",
     map: "日志真实地图（已作为仿真场地，不能隐藏）",
@@ -3787,7 +3790,11 @@
         : "队列 --";
       return;
     }
-    els.bagQueueInfo.textContent = (queue.active ? "连续播放 " : "队列 ") + index + "/" + total;
+    const failed = (queue && queue.failed) || [];
+    els.bagQueueInfo.textContent =
+      (queue.active ? "连续播放 " : "队列 ") + index + "/" + total +
+      (failed.length ? " · 跳过 " + failed.length : "");
+    els.bagQueueInfo.title = failed.length ? "载入失败已跳过：" + failed.join("、") : "";
   }
 
   // 任务操作栏里的回放条：平时禁用，载入日志后才可用。
@@ -3922,7 +3929,9 @@
   async function refreshCloud(force) {
     const state = bagState;
     if (!state || !state.loaded) {
-      cloudPoints = null;
+      // 连续播放换包的空档（新包还没载入）不要把点云清掉：历史点云要留着。
+      // 只有手动载入 / 复位 / 「清理地图」才会清。
+      if (!(bagQueue && bagQueue.active)) cloudPoints = null;
       return;
     }
     const time = state.time || 0;
@@ -3959,8 +3968,9 @@
   async function refreshCostmap(force) {
     const state = bagState;
     if (!state || !state.loaded) {
+      // 换包空档里代价地图跟着新的一帧重算，点云交给 refreshCloud 决定留不留
       costmapLayer = null;
-      cloudPoints = null;
+      refreshCloud(force);
       return;
     }
     refreshCloud(force);
@@ -4109,6 +4119,14 @@
       const data = await request("/api/bag/playlist", { names: queueNames });
       renderBagQueue(data.queue);
       renderBagState(data.state);
+      const queue = data.queue || {};
+      if (queue.failed && queue.failed.length) {
+        setBagHint(
+          "连续播放：" + queue.failed.length + " 个日志载入失败已跳过（" +
+            queue.failed[0] + (queue.failed.length > 1 ? " 等" : "") + "）",
+          8000
+        );
+      }
     } catch (error) {
       setBagHint("连续播放失败：" + error.message, 6000);
     }
@@ -4122,6 +4140,32 @@
     } catch (error) {
       setBagHint("操作失败：" + error.message, 6000);
     }
+  }
+
+  // 「清理地图」：主动清掉回放轨迹与累积的感知点云（连续播放换包不会自动清）
+  async function clearBagMap() {
+    trail = [];
+    lastTeleportsMark = 0;
+    strokeBreakPending = false;
+    cloudPoints = null;
+    cloudTime = -1;
+    cloudPollAt = 0;
+    costmapLayer = null;
+    costmapTime = -1;
+    costmapPollAt = 0;
+    let cleared = 0;
+    try {
+      const data = await request("/api/bag/cloud/clear", {});
+      cleared = Number(data.cleared || 0);
+    } catch (error) {
+      /* 后端没清成功也不影响界面：本地已经清空 */
+    }
+    setBagHint(
+      cleared
+        ? "已清理地图：轨迹与 " + cleared + " 个历史点云点已清除"
+        : "已清理地图：轨迹与点云已清除",
+      5000
+    );
   }
 
   if (els.bagSelectAll) {
@@ -4184,6 +4228,7 @@
     els.bagRefreshBtn.addEventListener("click", refreshBags);
     els.bagLoadBtn.addEventListener("click", loadBag);
     els.bagQueueBtn.addEventListener("click", startBagQueue);
+    if (els.bagClearBtn) els.bagClearBtn.addEventListener("click", clearBagMap);
     els.bagFolder.addEventListener("change", renderBagList);
     els.bagPlayBtn.addEventListener("click", () => {
       // 暂停/拖动后点"继续"是从当前位置接着放，不是从头重播
