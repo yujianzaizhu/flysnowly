@@ -597,6 +597,192 @@ class ServerTest(unittest.TestCase):
             self.post("/api/map", {"map": 1})
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_continuous_play_keeps_position_across_bags(self):
+        """同一批"无地图"日志连续播放：换包时机器人不该跳到别处。
+
+        这批日志是分段录的，前后段的位姿首尾相接，但它们没有 whole_map，回放只能
+        把轨迹居中摆到开阔场地里。以前每包各自居中 → 换包就跳一段；现在沿用上一包
+        的换算，绝对位置保持连续。
+        """
+        tmp = tempfile.mkdtemp(prefix="robot-bagqueue-")
+        first = os.path.join(tmp, "zmqbag_1_2026-08-29-06-20-18.bag")
+        second = os.path.join(tmp, "zmqbag_2_2026-08-29-06-27-04.bag")
+        bag_fixtures.build_bag(first, samples=20, origin=(0.0, 0.0))
+        bag_fixtures.build_bag(second, samples=20, origin=(5.0, 3.0))
+        queue = {
+            "names": [first, second],
+            "index": 0,
+            "active": True,
+            "use_log_map": True,
+            "loading": False,
+            "failed": [],
+        }
+        self.httpd.bag_queue = queue
+        try:
+            manager, _info, _path = server.load_bag(self.httpd, first, True)
+            first_offset = manager.replay.offset
+            tail = manager.replay.track[-1]
+            manager, _info, _path = server.load_bag(self.httpd, second, True)
+            self.assertAlmostEqual(manager.replay.offset[0], first_offset[0], places=4)
+            self.assertAlmostEqual(manager.replay.offset[1], first_offset[1], places=4)
+            head = manager.replay.track[0]
+            # 位姿按日志坐标系平移：两包在日志里差 (5, 3)，仿真里也应差 (5, 3)
+            self.assertAlmostEqual(head[1] - tail[1], 5.0, delta=0.6)
+            self.assertAlmostEqual(head[2] - tail[2], 3.0, delta=0.6)
+        finally:
+            self.httpd.bag_queue = None
+            self.post("/api/bag/control", {"command": "stop"})
+            self.post("/api/map", {"map": 1})
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_continuous_play_clears_map_when_next_bag_has_no_map(self):
+        """连播时下一包没有地图（机器删图重建）：清掉前一张地图，切空白场地。"""
+        tmp = tempfile.mkdtemp(prefix="robot-bagclearmap-")
+        with_map = os.path.join(tmp, "zmqbag_1_2026-09-15-07-04-14.bag")
+        no_map = os.path.join(tmp, "zmqbag_2_2026-09-15-07-05-14.bag")
+        bag_fixtures.build_map_frame_bag(with_map, samples=20)
+        bag_fixtures.build_bag(no_map, samples=20)
+        self.httpd.bag_queue = {
+            "names": [with_map, no_map],
+            "index": 0,
+            "active": True,
+            "use_log_map": True,
+            "loading": False,
+            "failed": [],
+        }
+        try:
+            server.load_bag(self.httpd, with_map, True)
+            epoch = world.MAP_EPOCH
+            self.assertNotIn("无地图", world.MAP_NAME)
+            manager, _info, _path = server.load_bag(self.httpd, no_map, True)
+            # 前一张地图作废：空白场地 + 纪元 +1 + 历史点云清空
+            self.assertIn("无地图", world.MAP_NAME)
+            self.assertEqual(world.MAP_EPOCH, epoch + 1)
+            self.assertEqual(getattr(self.httpd, "bag_cloud_history", []), [])
+            # 机器人摆在空白场地中心附近
+            first = manager.replay.track[0]
+            self.assertAlmostEqual(first[1], world.WIDTH / 2.0, delta=4.0)
+            self.assertAlmostEqual(first[2], world.HEIGHT / 2.0, delta=4.0)
+        finally:
+            self.httpd.bag_queue = None
+            self.post("/api/bag/control", {"command": "stop"})
+            self.post("/api/map", {"map": 1})
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_continuous_play_keeps_epoch_for_same_map(self):
+        """同一张地图的相邻两包换算只差几毫米：不该判成"换了场地"（不能清轨迹/点云）。"""
+        tmp = tempfile.mkdtemp(prefix="robot-bagsameepoch-")
+        first = os.path.join(tmp, "zmqbag_1_2026-09-15-07-04-14.bag")
+        second = os.path.join(tmp, "zmqbag_2_2026-09-15-07-05-14.bag")
+        bag_fixtures.build_map_frame_bag(first, samples=20)
+        bag_fixtures.build_map_frame_bag(second, samples=20, wall_offset_ns=10 ** 9)
+        self.httpd.bag_queue = {
+            "names": [first, second],
+            "index": 0,
+            "active": True,
+            "use_log_map": True,
+            "loading": False,
+            "failed": [],
+        }
+        try:
+            server.load_bag(self.httpd, first, True)
+            epoch = world.MAP_EPOCH
+            self.httpd.bag_cloud_history = [[1.0, 2.0]]
+            server.load_bag(self.httpd, second, True)
+            self.assertEqual(world.MAP_EPOCH, epoch)
+            self.assertEqual(self.httpd.bag_cloud_history, [[1.0, 2.0]])
+        finally:
+            self.httpd.bag_queue = None
+            self.httpd.bag_cloud_history = []
+            self.post("/api/bag/control", {"command": "stop"})
+            self.post("/api/map", {"map": 1})
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_continuous_play_imports_map_when_bag_has_map(self):
+        """连播时后面那包带地图（建图完成）：把它的地图重新导进来。"""
+        tmp = tempfile.mkdtemp(prefix="robot-bagmapback-")
+        no_map = os.path.join(tmp, "zmqbag_1_2026-09-15-07-04-14.bag")
+        with_map = os.path.join(tmp, "zmqbag_2_2026-09-15-07-05-14.bag")
+        bag_fixtures.build_bag(no_map, samples=20)
+        bag_fixtures.build_map_frame_bag(with_map, samples=20)
+        self.httpd.bag_queue = {
+            "names": [no_map, with_map],
+            "index": 0,
+            "active": True,
+            "use_log_map": True,
+            "loading": False,
+            "failed": [],
+        }
+        try:
+            server.load_bag(self.httpd, no_map, True)
+            self.assertIn("无地图", world.MAP_NAME)
+            server.load_bag(self.httpd, with_map, True)
+            self.assertNotIn("无地图", world.MAP_NAME)
+            self.assertGreater(len(world.POLYGON), 3)
+        finally:
+            self.httpd.bag_queue = None
+            self.post("/api/bag/control", {"command": "stop"})
+            self.post("/api/map", {"map": 1})
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_single_bag_load_recenters_track(self):
+        """单包载入（不在连续播放里）仍把轨迹居中摆到场地：改动只针对连续播放。"""
+        tmp = tempfile.mkdtemp(prefix="robot-bagsingle-")
+        path = os.path.join(tmp, "nomap.bag")
+        bag_fixtures.build_bag(path, samples=20, origin=(40.0, 40.0))
+        try:
+            server.load_bag(self.httpd, path, True)
+            _status, body = self.get("/api/state")
+            state = json.loads(body)
+            definition = state["world"]
+            self.assertAlmostEqual(
+                state["pose"]["x"], definition["width"] / 2.0, delta=4.0
+            )
+            self.assertAlmostEqual(
+                state["pose"]["y"], definition["height"] / 2.0, delta=4.0
+            )
+        finally:
+            self.post("/api/bag/control", {"command": "stop"})
+            self.post("/api/map", {"map": 1})
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_replay_hides_dock_when_bag_has_no_dock_pose(self):
+        """日志里没有明确的桩位 → 回放时地图上不放桩；有桩位话题 → 按日志摆放并显示。"""
+        tmp = tempfile.mkdtemp(prefix="robot-bagdock-")
+        plain = os.path.join(tmp, "plain.bag")
+        withdock = os.path.join(tmp, "withdock.bag")
+        bag_fixtures.build_bag(plain)
+        bag_fixtures.build_dock_bag(withdock, dock=(3.25, 2.5))
+        try:
+            self.post("/api/bag/dir", {"path": tmp})
+            _status, data = self.post("/api/bag/load", {"name": "plain.bag"})
+            self.assertFalse(data["state"]["dock_visible"])
+            _status, raw = self.get("/api/state")
+            self.assertFalse(json.loads(raw)["world"]["dock_visible"])
+
+            _status, data = self.post("/api/bag/load", {"name": "withdock.bag"})
+            self.assertTrue(data["state"]["dock_visible"])
+            _status, raw = self.get("/api/state")
+            state = json.loads(raw)
+            self.assertTrue(state["world"]["dock_visible"])
+            dock = state["world"]["dock"]
+            # 桩位按日志坐标换算到仿真坐标：和日志里的 (3.25, 2.5) 对得上（+回放平移）
+            replay = self.httpd.manager.replay
+            scale = replay.scale if replay.transform else 1.0
+            dx, dy = replay.map_offset if replay.transform else replay.offset
+            self.assertAlmostEqual(dock["x"], 3.25 * scale + dx, places=2)
+            self.assertAlmostEqual(dock["y"], 2.5 * scale + dy, places=2)
+
+            # 复位后桩照常显示（回到仿真自己的场地）
+            self.post("/api/bag/control", {"command": "stop"})
+            self.post("/api/reset", {})
+            _status, raw = self.get("/api/state")
+            self.assertTrue(json.loads(raw)["world"]["dock_visible"])
+        finally:
+            self.post("/api/bag/control", {"command": "stop"})
+            self.post("/api/reset", {})
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_bag_topics_expose_layers(self):
         tmp = tempfile.mkdtemp(prefix="robot-baglayer-")
         bag_fixtures.build_map_bag(os.path.join(tmp, "layer.bag"))
@@ -687,12 +873,48 @@ class ServerTest(unittest.TestCase):
             self.assertGreaterEqual(cloud.get("bags") or 0, 1)
             self.assertGreater(cloud.get("history") or 0, 0)
             self.assertGreater(cloud.get("count") or 0, 0)
+            # 每个点带年龄（前端据它淡出），并下发淡出窗口
+            self.assertEqual(len(cloud.get("ages") or []), cloud.get("count"))
+            self.assertGreater(cloud.get("fade") or 0, 0)
 
             _status, cleared = self.post("/api/bag/cloud/clear", {})
             self.assertTrue(cleared["ok"])
             self.assertGreater(cleared["cleared"], 0)
             cloud = json.loads(self.get("/api/bag/cloud?t=0")[1])["cloud"]
             self.assertTrue(cloud is None or (cloud.get("history") or 0) == 0)
+        finally:
+            self.post("/api/bag/control", {"command": "stop"})
+            self.httpd.bag_queue = None
+            self.post("/api/map", {"map": 1})
+            self.post("/api/speed", {"speed": 1})
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_history_cloud_expires_by_wall_clock(self):
+        """跨包历史点云也受 60 s 约束：两段日志录制时间差太多 → 换包后不再显示。"""
+        tmp = tempfile.mkdtemp(prefix="robot-bagcloudage-")
+        group = os.path.join(tmp, "点云老化")
+        os.makedirs(group)
+        bag_fixtures.build_map_frame_bag(
+            os.path.join(group, "cloud_a.bag"), samples=120, dt=0.1, clouds=True
+        )
+        # 第二段日志的墙钟比第一段晚 2 分钟（真实日志也是一包接一包、间隔几分钟）
+        bag_fixtures.build_map_frame_bag(
+            os.path.join(group, "cloud_b.bag"), samples=120, dt=0.1, clouds=True,
+            wall_offset_ns=120 * 10 ** 9,
+        )
+        names = [os.path.join("点云老化", "cloud_a.bag"), os.path.join("点云老化", "cloud_b.bag")]
+        try:
+            self.post("/api/bag/dir", {"path": tmp})
+            self.post("/api/speed", {"speed": 32})
+            self.post("/api/bag/playlist", {"names": names})
+            self._wait_queue()
+            cloud = json.loads(self.get("/api/bag/cloud?t=0")[1])["cloud"]
+            # 上一包的点云已经超过留存窗口：不再出现在返回里
+            if cloud is not None:
+                self.assertEqual(cloud.get("history") or 0, 0)
+                self.assertEqual(cloud.get("bags") or 0, 0)
+                for age in cloud.get("ages") or []:
+                    self.assertLess(age, server.bag_player.CLOUD_FADE_SECONDS)
         finally:
             self.post("/api/bag/control", {"command": "stop"})
             self.httpd.bag_queue = None

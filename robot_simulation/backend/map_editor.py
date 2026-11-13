@@ -30,6 +30,51 @@ DOCK_RADIUS = 0.45
 DOCK_CLEARANCE = 0.20
 # 画笔默认半径（静态障碍涂抹）
 BRUSH_RADIUS = 0.25
+# 充电桩 3 m 内不许放禁区 / 障碍物（车端协议 FORBIDDEN_NEAR_STATION 的要求，
+# 这里按本系统的场地尺度放宽到 3 m，给回桩留出转向与对桩空间）
+DOCK_KEEPOUT = 3.0
+
+# 错误码：编号沿用上级系统（车端地图协议）的编码，只挑出本编辑器用得上的那些，
+# 界面上按「E11 创建禁区失败：…」显示，日志/测试也能按名字断言。
+ERROR_CODES = {
+    "NO_ENOUGH_WORKAREA_BEFORE_CREATE_TIE": (1, "创建通道前请先画至少一个区域"),
+    "START_POINT_OF_TIE_IS_OUT_OF_MAP": (3, "通道起点在场地范围外"),
+    "CURRENT_POINT_IS_OUT_OF_MAP": (5, "位置在地图范围外：请把点落在 100 × 100 m 场地内"),
+    "TOO_FEW_POINTS_BEFORE_SAVE_MAP": (6, "保存地图失败：有效面积太小（小于 1 m²）"),
+    "NO_MAP_AND_CREATE_NOT_WORKAREA": (7, "还没有工作区：请先画至少一个区域"),
+    "PATH_EMPTY_WHEN_SAVE_MAP": (8, "保存地图失败：地图数据为空"),
+    "FORBIDDEN_CROSSING_PATH": (10, "创建禁区失败：禁区不能压到通道"),
+    "FORBIDDEN_NEAR_STATION": (11, "充电桩 3 m 范围内不能设置禁区或障碍物"),
+    "PATH_CROSSING_FORBIDDEN": (12, "创建通道失败：通道不能穿过禁区"),
+    "END_POINT_OF_TIE_IS_OUT_OF_MAP": (13, "通道终点在场地范围外"),
+    "WRONG_DATA_STRUCT": (16, "保存地图失败：地图数据异常"),
+    "CANT_FIND_SPECIFIC_ID": (17, "删除失败：没有找到对应的元素"),
+    "DELETE_SINGLE_MAP_FAIL": (18, "删除地图失败"),
+    "LOAD_MAP_FAIL": (19, "加载地图失败"),
+    "CREATE_CHARGE_STATION_FAIL": (20, "创建充电桩失败"),
+    "START_AND_END_POINT_OF_TUNNEL_NOT_IN_DIFFERENT_AREAS": (
+        22,
+        "创建通道错误：通道两端必须分别落在两个不同的区域内",
+    ),
+}
+
+
+class EditorError(ValueError):
+    """带错误码的编辑错误（错误码沿用上级系统协议，见 ERROR_CODES）。
+
+    文案统一成 "E11 规则（具体对象）" 的形式，界面直接显示 ``str(err)`` 即可。
+    """
+
+    def __init__(self, code, detail=None):
+        number, text = ERROR_CODES.get(code, (0, code))
+        self.code = code
+        self.number = number
+        self.detail = detail
+        if detail and detail != text:
+            message = "E{:02d} {}（{}）".format(number, text, detail)
+        else:
+            message = "E{:02d} {}".format(number, text)
+        super().__init__(message)
 
 # 最多记住多少步编辑（供"撤销"用）
 UNDO_LIMIT = 30
@@ -94,6 +139,37 @@ def _distance_to_polyline(x, y, points):
         if distance < best:
             best = distance
     return best
+
+
+def _distance_point_to_rect(x, y, rect):
+    """点到矩形（x0, y0, x1, y1）的最短距离，点在矩形内为 0。"""
+    x0, y0, x1, y1 = rect
+    dx = max(x0 - x, 0.0, x - x1)
+    dy = max(y0 - y, 0.0, y - y1)
+    return math.hypot(dx, dy)
+
+
+def _polyline_hits_rect(points, rect, half=0.0):
+    """折线（按半径 half 加粗）是否压到矩形。"""
+    x0, y0, x1, y1 = rect
+    x0, y0 = x0 - half, y0 - half
+    x1, y1 = x1 + half, y1 + half
+    if not points:
+        return False
+    if len(points) == 1:
+        x, y = points[0]
+        return x0 <= x <= x1 and y0 <= y <= y1
+    for index in range(len(points) - 1):
+        ax, ay = points[index]
+        bx, by = points[index + 1]
+        steps = max(1, int(math.hypot(bx - ax, by - ay) / 0.1))
+        for step in range(steps + 1):
+            t = step / float(steps)
+            x = ax + (bx - ax) * t
+            y = ay + (by - ay) * t
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return True
+    return False
 
 
 def _densify(points, step=0.05):
@@ -433,6 +509,40 @@ class Draft(object):
                 return region
         return None
 
+    def _keeper_hit(self, x, y):
+        """(x, y) 落在充电桩 3 m 内的禁区/障碍物吗？返回提示文字，否则 None。"""
+        keep = DOCK_KEEPOUT
+        for zone in self.no_gos:
+            rect = (zone["x0"], zone["y0"], zone["x1"], zone["y1"])
+            if _distance_point_to_rect(x, y, rect) < keep:
+                return "充电桩 {} m 范围内有禁区 #{}".format(int(keep), zone["id"])
+        for item in self.static:
+            if _distance_to_polyline(x, y, item["points"]) - item["r"] < keep:
+                return "充电桩 {} m 范围内有障碍物 #{}".format(int(keep), item["id"])
+        for item in self.poly_obstacles:
+            if _point_in_polygon(x, y, item["points"]) or (
+                _distance_to_boundary(x, y, item["points"]) < keep
+            ):
+                return "充电桩 {} m 范围内有障碍物 #{}".format(int(keep), item["id"])
+        for item in self.dynamic:
+            if math.hypot(x - item["x"], y - item["y"]) - item["r"] < keep:
+                return "充电桩 {} m 范围内有动态障碍物 #{}".format(int(keep), item["id"])
+        return None
+
+    def _dock_keepout_hit(self, points, radius=0.0):
+        """这条笔迹/轮廓是否进了充电桩的 3 m 净空：进了就返回 (桩, 距离)。"""
+        if not self.docks:
+            return None
+        dock = self.docks[0]
+        if len(points) >= 3 and _point_in_polygon(dock["x"], dock["y"], points):
+            distance = 0.0
+        else:
+            distance = _distance_to_polyline(dock["x"], dock["y"], points)
+        distance = max(0.0, distance - radius)
+        if distance < DOCK_KEEPOUT:
+            return dock, distance
+        return None
+
     def _obstacle_hit(self, x, y, padding=0.0):
         for item in self.static:
             if _distance_to_polyline(x, y, item["points"]) <= item["r"] + padding:
@@ -475,15 +585,35 @@ class Draft(object):
 
     def add_passage(self, points):
         self._push_history()
+        if not self.regions:
+            raise EditorError("NO_ENOUGH_WORKAREA_BEFORE_CREATE_TIE")
         cleaned = _clean_points(points)
         if len(cleaned) < 2:
-            raise ValueError("通道轨迹太短：请从区域 A 开进区域 B 再保存")
+            raise EditorError(
+                "START_AND_END_POINT_OF_TUNNEL_NOT_IN_DIFFERENT_AREAS",
+                "通道轨迹太短，请从区域 A 开进区域 B 再保存",
+            )
+        if not self._inside_canvas(cleaned[0][0], cleaned[0][1]):
+            raise EditorError("START_POINT_OF_TIE_IS_OUT_OF_MAP")
+        if not self._inside_canvas(cleaned[-1][0], cleaned[-1][1]):
+            raise EditorError("END_POINT_OF_TIE_IS_OUT_OF_MAP")
+        for zone in self.no_gos:
+            rect = (zone["x0"], zone["y0"], zone["x1"], zone["y1"])
+            if _polyline_hits_rect(cleaned, rect, PASSAGE_HALF_WIDTH):
+                raise EditorError("PATH_CROSSING_FORBIDDEN", "禁区 #{}".format(zone["id"]))
         start_region = self.region_at(cleaned[0][0], cleaned[0][1])
         end_region = self.region_at(cleaned[-1][0], cleaned[-1][1])
         if start_region is None or end_region is None:
-            raise ValueError("通道两端必须分别落在两个区域内部")
+            where = "起点" if start_region is None else "终点"
+            raise EditorError(
+                "START_AND_END_POINT_OF_TUNNEL_NOT_IN_DIFFERENT_AREAS",
+                where + "不在任何区域内部",
+            )
         if start_region["id"] == end_region["id"]:
-            raise ValueError("通道要连接两个不同的区域，不能只在同一个区域内部")
+            raise EditorError(
+                "START_AND_END_POINT_OF_TUNNEL_NOT_IN_DIFFERENT_AREAS",
+                "两端都落在区域 #{} 里".format(start_region["id"]),
+            )
         corridor = {
             "id": self._id(),
             "kind": "passage",
@@ -512,6 +642,9 @@ class Draft(object):
         for item in self.dynamic:
             if math.hypot(x - item["x"], y - item["y"]) <= radius + item["r"] + DOCK_CLEARANCE:
                 raise ValueError("充电桩范围内有动态障碍物，请换一个位置")
+        close = self._keeper_hit(x, y)
+        if close is not None:
+            raise EditorError("CREATE_CHARGE_STATION_FAIL", close)
         dock = {
             "id": self._id(),
             "kind": "dock",
@@ -530,8 +663,24 @@ class Draft(object):
             x0, x1 = x1, x0
         if y1 < y0:
             y0, y1 = y1, y0
+        if not self.regions:
+            raise EditorError("NO_MAP_AND_CREATE_NOT_WORKAREA")
         if x1 - x0 < 0.4 or y1 - y0 < 0.4:
             raise ValueError("禁区太小：请拖出至少 0.4 m × 0.4 m 的矩形")
+        if not (self._inside_canvas(x0, y0) and self._inside_canvas(x1, y1)):
+            raise EditorError("CURRENT_POINT_IS_OUT_OF_MAP")
+        rect = (x0, y0, x1, y1)
+        for corridor in self.passages:
+            if _polyline_hits_rect(corridor["points"], rect, corridor["half"]):
+                raise EditorError("FORBIDDEN_CROSSING_PATH", "通道 #{}".format(corridor["id"]))
+        if self.docks:
+            dock = self.docks[0]
+            distance = _distance_point_to_rect(dock["x"], dock["y"], rect)
+            if distance < DOCK_KEEPOUT:
+                raise EditorError(
+                    "FORBIDDEN_NEAR_STATION",
+                    "禁区离充电桩 #{:.0f} 只有 {:.1f} m".format(dock["id"], distance),
+                )
         item = {
             "id": self._id(),
             "kind": "no_go",
@@ -554,7 +703,14 @@ class Draft(object):
         cleaned = _clean_points(points)
         cleaned = [point for point in cleaned if self._inside_canvas(point[0], point[1], 0.0)]
         if not cleaned:
-            raise ValueError("涂抹位置没有落在空白地图范围内")
+            raise EditorError("CURRENT_POINT_IS_OUT_OF_MAP")
+        close = self._dock_keepout_hit(cleaned, radius)
+        if close is not None:
+            dock, distance = close
+            raise EditorError(
+                "FORBIDDEN_NEAR_STATION",
+                "障碍物离充电桩 #{:.0f} 只有 {:.1f} m".format(dock["id"], distance),
+            )
         last_id = None
         for item in self.static:
             if abs(item["r"] - radius) > 1e-6:
@@ -600,12 +756,12 @@ class Draft(object):
         span = 1.6 if span is None else float(span)
         span = max(0.4, min(6.0, span))
         if not self._inside_canvas(x, y, 0.4):
-            raise ValueError("动态障碍物要放在空白地图范围内")
+            raise EditorError("CURRENT_POINT_IS_OUT_OF_MAP")
         if ax is not None and bx is not None:
             ax, ay = float(ax), float(ay)
             bx, by = float(bx), float(by)
             if not (self._inside_canvas(ax, ay, 0.3) and self._inside_canvas(bx, by, 0.3)):
-                raise ValueError("动态障碍物的巡逻端点要放在地图范围内")
+                raise EditorError("CURRENT_POINT_IS_OUT_OF_MAP")
             if math.hypot(bx - ax, by - ay) < 0.4:
                 raise ValueError("动态障碍物路径太短，至少 0.4 m")
             x = (ax + bx) / 2.0
@@ -620,6 +776,14 @@ class Draft(object):
             ay = max(0.4, min(self.height - 0.4, y - dy))
             bx = max(0.4, min(self.width - 0.4, x + dx))
             by = max(0.4, min(self.height - 0.4, y + dy))
+        path = [(ax, ay), (bx, by)]
+        close = self._dock_keepout_hit(path, radius)
+        if close is not None:
+            dock, distance = close
+            raise EditorError(
+                "FORBIDDEN_NEAR_STATION",
+                "动态障碍物离充电桩 #{:.0f} 只有 {:.1f} m".format(dock["id"], distance),
+            )
         item = {
             "id": self._id(),
             "kind": "dynamic",
@@ -660,6 +824,13 @@ class Draft(object):
                 raise ValueError("动态障碍物的巡逻端点要放在地图范围内")
             if math.hypot(bx - ax, by - ay) < 0.4:
                 raise ValueError("动态障碍物路径太短，至少 0.4 m")
+            close = self._dock_keepout_hit([(ax, ay), (bx, by)], target["r"])
+            if close is not None:
+                dock, distance = close
+                raise EditorError(
+                    "FORBIDDEN_NEAR_STATION",
+                    "动态障碍物离充电桩 #{:.0f} 只有 {:.1f} m".format(dock["id"], distance),
+                )
             target["ax"] = round(ax, _ROUND)
             target["ay"] = round(ay, _ROUND)
             target["bx"] = round(bx, _ROUND)
@@ -683,6 +854,16 @@ class Draft(object):
         area = _polygon_area(cleaned)
         if area < 0.05:
             raise ValueError("障碍轮廓面积太小")
+        for point in cleaned:
+            if not self._inside_canvas(point[0], point[1]):
+                raise EditorError("CURRENT_POINT_IS_OUT_OF_MAP")
+        close = self._dock_keepout_hit(cleaned)
+        if close is not None:
+            dock, distance = close
+            raise EditorError(
+                "FORBIDDEN_NEAR_STATION",
+                "障碍物离充电桩 #{:.0f} 只有 {:.1f} m".format(dock["id"], distance),
+            )
         item = {
             "id": self._id(),
             "kind": "obstacle",
@@ -698,7 +879,7 @@ class Draft(object):
         try:
             item_id = int(item_id)
         except (TypeError, ValueError):
-            raise ValueError("要删除的元素编号无效")
+            raise EditorError("CANT_FIND_SPECIFIC_ID", "要删除的元素编号无效")
         buckets = {
             "region": self.regions,
             "passage": self.passages,
@@ -725,7 +906,7 @@ class Draft(object):
                     self.passages = keep
                     return {"deleted": item, "removed_passages": removed}
                 return {"deleted": item, "removed_passages": 0}
-        raise ValueError("没有找到要删除的元素")
+        raise EditorError("CANT_FIND_SPECIFIC_ID")
 
     def hit_test(self, x, y):
         """按"越小越优先"的顺序命中测试，供界面点击删除使用。"""
@@ -1042,7 +1223,17 @@ class Draft(object):
         issues = self.problems()
         if issues:
             raise ValueError("；".join(issues))
-        width, height, mask, ox, oy = self.rasterize()
+        if not self.regions:
+            raise EditorError("PATH_EMPTY_WHEN_SAVE_MAP")
+        area = sum(float(region.get("area") or 0.0) for region in self.regions)
+        if area < 1.0:
+            raise EditorError("TOO_FEW_POINTS_BEFORE_SAVE_MAP")
+        try:
+            width, height, mask, ox, oy = self.rasterize()
+        except (ValueError, IndexError, TypeError) as error:
+            raise EditorError("WRONG_DATA_STRUCT", str(error))
+        if not any(mask):
+            raise EditorError("WRONG_DATA_STRUCT", "栅格化之后没有任何可通行区域")
         map_name = str(name or self.name or "自定义地图").strip() or "自定义地图"
         definition = map_import.build_map_from_mask(
             width,
@@ -1253,7 +1444,7 @@ class Draft(object):
         这里按同一个比例换算，编辑后保存出来尺寸才和原图一致。
         """
         if not definition:
-            raise ValueError("没有找到要编辑的地图")
+            raise EditorError("LOAD_MAP_FAIL", "没有找到要编辑的地图")
         padding = map_import.PADDING if definition.get("imported") else 0.0
         scale = float(scale) if scale else 1.0
 

@@ -135,6 +135,12 @@ OBSTACLES = []
 OBSTACLE_POLYGONS = []
 DOCK_RADIUS = 0.70
 DOCK = {"x": 0.0, "y": 0.0, "r": DOCK_RADIUS}
+# 是否在地图上画充电桩：日志回放时**日志里没有明确的桩位**就不画
+# （内部 DOCK 仍然保留一个锚点，任务照常能"回充"）
+DOCK_VISIBLE = True
+# "地图纪元"：场地被清空成**空白地图**（无地图的建图日志重新起笔）时 +1。
+# 前端靠它判断"前一张地图已经被清掉"，把轨迹/点云这些属于旧地图的东西一起清掉。
+MAP_EPOCH = 0
 START = {"x": 0.0, "y": 0.0, "theta": 0.0}
 IMPORTED_MAPS = {}
 NEXT_IMPORTED_ID = 101
@@ -233,11 +239,19 @@ def wrap_angle(angle):
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
+def bump_map_epoch():
+    """场地被清空成空白地图时调用：让前端把属于上一张地图的绘制内容清掉。"""
+    global MAP_EPOCH
+    MAP_EPOCH += 1
+    return MAP_EPOCH
+
+
 def select_map(map_id):
     """切换当前场地；调用方负责重建 GridMap / TaskManager。"""
     global MAP_ID, MAP_NAME, WIDTH, HEIGHT, COLS, ROWS, ACTIVE_SCALE
     global POLYGON, POLYGON_SEGMENTS, OBSTACLE_SEGMENTS
     global OBSTACLE_SHAPES, OBSTACLE_OUTLINES, OBSTACLES, OBSTACLE_POLYGONS, DOCK, START
+    global DOCK_VISIBLE
     global BASE_SHAPES, DYNAMIC, NO_GO, PASSAGES, REGIONS
     definition = MAPS[int(map_id)]
     MAP_ID = definition["id"]
@@ -300,6 +314,8 @@ def select_map(map_id):
         "y": definition["dock"]["y"] * scale,
         "r": DOCK_RADIUS,
     }
+    # 换地图一律先把桩显示出来；日志回放没有桩位时由 server.load_bag 再关掉
+    DOCK_VISIBLE = True
     START = {
         "x": definition["start"]["x"] * scale,
         "y": definition["start"]["y"] * scale,
@@ -1060,6 +1076,10 @@ def world_dict():
         _WORLD_CACHE.update(cache)
     result = dict(cache)
     result.pop("version", None)
+    # 桩可见性会随回放变化，不进静态缓存
+    result["dock_visible"] = DOCK_VISIBLE
+    # 地图纪元也随回放变化（没地图的日志会把场地清成空白地图）
+    result["epoch"] = MAP_EPOCH
     result["obstacles"] = OBSTACLES
     result["dynamic"] = [
         {

@@ -9,9 +9,11 @@
 * ``cmd_vel``     field1 -> linear(x,y,z)，field2 -> angular(x,y,z)
 """
 
+import datetime
 import glob
 import math
 import os
+import re
 import sqlite3
 import struct
 
@@ -26,6 +28,10 @@ TF_POSE_CHILDREN = ("base_link1", "base_link", "base_car_link", "wio_link_local"
 TF_MIN_SPAN = 2.0
 TF_MIN_FREE_RATIO = 0.90
 TF_MAX_WINDOW_GAP = 0.60
+# 代价地图窗口"随车滚动"的判定：原点跨度超过这么多就算滚动窗口
+COSTMAP_MIN_ROLL = 1.0
+# 一帧代价地图至少要有这么多"非致命格"才算有内容（全致命 = 空窗口）
+COSTMAP_MIN_INFORMATION = 0.2
 # 地图 / 代价地图话题（都在 Zmqmsg 表里，消息体是带 map_info 的占据栅格）
 MAP_TOPICS = ("whole_map", "grid_costmap", "static_costmap")
 COSTMAP_TOPIC = "grid_costmap"
@@ -46,12 +52,17 @@ TOPIC_LAYERS = {
 }
 # 电量话题的关键字（日志里有就按它显示，没有就保持 100%）
 BATTERY_HINTS = ("battery", "battery_state", "batt", "power", "soc", "bms")
+# 充电桩位置话题的关键字：日志里**明确**发布桩位才在图上放桩，否则不画
+DOCK_HINTS = (
+    "dock", "docking", "charger", "charging_pile", "charge_pile",
+    "charge_station", "charging_station", "base_station", "homestation",
+)
 # 障碍物点云话题（PointCloud2：x/y/z + label，按 camera 帧发布）
 CLOUD_TOPIC = "obstaclecloud"
 # 深度相机在车体上的安装偏移（base_link1 → depth_camera，米）
 CLOUD_CAMERA_OFFSET = (0.35, 0.04)
-MAX_CLOUD_FRAMES = 240
-MAX_CLOUD_POINTS = 90
+# 点云帧：空帧也要留（它决定"这一片重新看过、没有障碍"），所以上限按消息条数给
+MAX_CLOUD_FRAMES = 4000
 # 视锥角点用 z = -2 占位，不是真实障碍点
 CLOUD_FRUSTUM_Z = -2.0
 # 同一时刻重复的位姿（odom_data 里大量存在，TI 差 <1 ms）：只留最后一条，
@@ -483,6 +494,63 @@ def _read_images(con, tables, start):
     }
 
 
+def _pick_dock_topic(available):
+    """挑一个"充电桩位置"话题；日志里没有就返回 None（界面上就不放桩）。"""
+    for hint in DOCK_HINTS:
+        for name in available:
+            if hint in name.lower():
+                return name
+    return None
+
+
+def _decode_dock(blob):
+    """从常见的位姿/点消息里解出一个 ``(x, y)``；解不出来返回 None。"""
+    try:
+        top = _parse_message(blob)
+    except (BagError, IndexError, struct.error):
+        return None
+    for field in (3, 2, 1):
+        body = _first_bytes(top, field)
+        if body is None:
+            continue
+        try:
+            items = _parse_message(body)
+        except (BagError, IndexError, struct.error):
+            continue
+        # Pose / PoseWithCovariance：1 = position{x,y,z}，2 = orientation
+        position = _first_bytes(items, 1)
+        if position is not None:
+            try:
+                pos = _numbers(_parse_message(position))
+            except (BagError, IndexError, struct.error):
+                pos = {}
+            if 1 in pos and 2 in pos:
+                return (float(pos[1]), float(pos[2]))
+        # 直接就是 Point{x,y,z}
+        try:
+            pos = _numbers(items)
+        except (BagError, IndexError, struct.error):
+            pos = {}
+        if 1 in pos and 2 in pos:
+            return (float(pos[1]), float(pos[2]))
+    return None
+
+
+def read_dock(con, topic):
+    """读日志里明确发布的充电桩位置（取最后一条能解出坐标的消息）。"""
+    if not topic:
+        return None
+    try:
+        rows = list(_topic_rows(con, topic))
+    except sqlite3.Error:
+        return None
+    for _stamp, blob in reversed(rows):
+        pose = _decode_dock(blob)
+        if pose is not None:
+            return pose
+    return None
+
+
 def _pick_battery_topic(available):
     for hint in BATTERY_HINTS:
         for name in available:
@@ -561,6 +629,30 @@ def _read_battery(con, topic, start):
     return best[1]
 
 
+_RECORD_STAMP = re.compile(r"(\d{4})-(\d{2})-(\d{2})-(\d{2})-(\d{2})-(\d{2})")
+
+
+def record_stamp(path):
+    """日志开始录制的时间（Unix 秒）：录制程序把起始时间写进了文件名。
+
+    文件名里没有可信时间戳（比如 ``zmqbag_1_1970-01-01-00-00-08.bag``）时返回
+    ``None``，由调用方决定怎么排。
+    """
+    match = _RECORD_STAMP.search(os.path.basename(str(path)))
+    if not match:
+        return None
+    try:
+        moment = datetime.datetime(*[int(part) for part in match.groups()])
+    except ValueError:
+        return None
+    if moment.year < 2000:
+        return None
+    try:
+        return moment.timestamp()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 def _bag_entry(path, key, group):
     try:
         stat = os.stat(path)
@@ -573,6 +665,7 @@ def _bag_entry(path, key, group):
         "path": path,
         "size": stat.st_size,
         "mtime": stat.st_mtime,
+        "stamp": record_stamp(path),
     }
 
 
@@ -602,7 +695,18 @@ def list_bags(directory):
         entry = _bag_entry(path, os.path.basename(path), "")
         if entry is not None:
             bags.append(entry)
-    bags.sort(key=lambda item: (item["group"], item["mtime"]), reverse=False)
+    # 按录制时间排序：连续播放就是按时间往下播。同一批日志是分段录的，段与段的
+    # 位姿首尾相接，按录制时间播才不会在切换时"跳到别处"（按文件修改时间排是
+    # 拷贝顺序，经常是倒着的）。取不到录制时间的排在本组最后，按修改时间排。
+    bags.sort(
+        key=lambda item: (
+            item["group"],
+            item["stamp"] is None,
+            item["stamp"] if item["stamp"] is not None else 0.0,
+            item["mtime"],
+            item["name"],
+        )
+    )
     return bags
 
 
@@ -629,21 +733,42 @@ def _costmap_information(grid):
     return sum(1 for value in data if value < 90) / float(len(data))
 
 
+def _costmap_roll_span(frames):
+    """这组窗口的原点跨度：随车滚动的局部代价地图会明显 > 0，固定窗口是 0。"""
+    if not frames:
+        return 0.0
+    xs = [grid["origin"][0] for _stamp, grid in frames]
+    ys = [grid["origin"][1] for _stamp, grid in frames]
+    return max(max(xs) - min(xs), max(ys) - min(ys))
+
+
 def _pick_costmap_source(frames):
-    """从同一话题的多种窗口里挑出"有内容"的那一组（全致命的空窗口丢掉）。"""
+    """从同一话题的多种窗口里挑出最有信息量的一组。
+
+    实测同一话题里混着两种窗口：①**随车滚动**的局部代价地图（10 m@0.03）；
+    ②固定不动的 3 m@0.01 窗口（有时整帧致命、等于空窗口）。
+    排序：有内容 → 随车滚动 → 帧数 → 信息量。以前只看信息量+帧数，
+    遇到"固定 3 m 窗口信息量略高"的日志会选中固定窗口——代价地图就钉在
+    地图某个角落不跟车，看起来"位置不对"（zmqbag_12 就是这么错的）。
+    """
     if not frames:
         return []
     groups = {}
     for stamp, grid in frames:
         key = (round(grid["resolution"], 4), grid["width"], grid["height"])
         groups.setdefault(key, []).append((stamp, grid))
-    key = max(
-        groups,
-        key=lambda item: (
-            round(_costmap_information(groups[item][len(groups[item]) // 2][1]), 3),
-            len(groups[item]),
-        ),
-    )
+
+    def score(item):
+        items = groups[item]
+        info = _costmap_information(items[len(items) // 2][1])
+        return (
+            1 if info >= COSTMAP_MIN_INFORMATION else 0,
+            1 if _costmap_roll_span(items) >= COSTMAP_MIN_ROLL else 0,
+            len(items),
+            round(info, 4),
+        )
+
+    key = max(groups, key=score)
     return groups[key]
 
 
@@ -672,8 +797,14 @@ def _decode_pointcloud(blob):
 def read_obstacle_clouds(con, poses, start):
     """把障碍物点云换算到地图坐标（相机帧 → 车体 → 世界）。
 
-    只在地图坐标系位姿可用时才有意义（否则点云不知道往哪儿放），
-    返回 ``[(相对时间, [x1, y1, x2, y2, ...]), ...]``，已降采样。
+    只在地图坐标系位姿可用时才有意义（否则点云不知道往哪儿放）。
+    返回 ``[(相对时间, [x1, y1, ...], [vx1, vy1, ...]), ...]``：
+
+    * 第二项是这一帧真正测到的障碍点（相机帧 → 地图坐标）；
+    * 第三项是这一帧的**视锥落地面**（每帧都带 4 个 ``z = -2`` 的角点，
+      近端 0.45 m / 远端 1.35 m 的梯形），换算到地图坐标后是一个凸四边形——
+      "这一帧把哪块地面看清楚了"。看起来空无一物的帧也有它，回放时据此把
+      那一片旧点云清掉（同一处第二次探测没东西了，就应该刷新掉）。
     """
     if not poses or len(poses) < 2:
         return []
@@ -699,14 +830,15 @@ def read_obstacle_clouds(con, poses, start):
         yaw = pose[3]
         cos_yaw = math.cos(yaw)
         sin_yaw = math.sin(yaw)
-        point_stride = max(1, width // MAX_CLOUD_POINTS)
         points = []
-        for index in range(0, width, point_stride):
+        corners = []
+        for index in range(width):
             chunk = data[index * point_step : (index + 1) * point_step]
             if len(chunk) < 12:
                 continue
             local_x, local_y, local_z = struct.unpack("<fff", chunk[:12])
             if abs(local_z - CLOUD_FRUSTUM_Z) < 1e-3:
+                corners.append((local_x, local_y))
                 continue
             base_x = camera_x + local_x
             base_y = camera_y + local_y
@@ -714,10 +846,31 @@ def read_obstacle_clouds(con, poses, start):
             world_y = pose[2] + base_x * sin_yaw + base_y * cos_yaw
             points.append(round(world_x, 2))
             points.append(round(world_y, 2))
-        if points:
-            frames.append((round(stamp - start, 3), points))
-            if len(frames) >= MAX_CLOUD_FRAMES:
-                break
+
+        def to_map(local_x, local_y):
+            base_x = camera_x + local_x
+            base_y = camera_y + local_y
+            return (
+                round(pose[1] + base_x * cos_yaw - base_y * sin_yaw, 2),
+                round(pose[2] + base_x * sin_yaw + base_y * cos_yaw, 2),
+            )
+
+        # 视锥角点按极角排一圈，得到一个不自交的凸四边形（顺序不能指望发布端给对）
+        view = []
+        if len(corners) >= 3:
+            ring = [to_map(cx, cy) for cx, cy in corners]
+            mid_x = sum(point[0] for point in ring) / len(ring)
+            mid_y = sum(point[1] for point in ring) / len(ring)
+            ring.sort(key=lambda point: math.atan2(point[1] - mid_y, point[0] - mid_x))
+            for point in ring:
+                view.extend(point)
+        if not points and not view:
+            continue
+        frames.append((round(stamp - start, 3), points, view))
+        # 空帧也要留着（它们负责"刷新掉旧点云"），所以按消息条数截断，
+        # 条数超过上限时按等间隔抽稀（宁可少刷几次也不要丢掉整段）
+        if len(frames) >= MAX_CLOUD_FRAMES:
+            break
     return frames
 
 
@@ -798,10 +951,22 @@ def _tf_track(tracks):
 
     ``tf_dynamic`` 同一个话题里混着多个孩子帧（base_link1 / camera_link /
     wio_link_local / imu …）。机器人的那个有三个特征：真的在动、落在地图自由格上、
-    并且和局部代价地图窗口中心基本重合（窗口是随车滚动的）。判据不满足就返回
+    并且和局部代价地图窗口中心基本重合（窗口随车滚动时约等于 0）。判据不满足就返回
     ``None``，调用方继续用 base_pose / odom_data。
+
+    两个判据都是"有证据才用"：
+    * 日志里**没有能解析的地图**（`whole_map` 是空消息）时不做"自由格"检查——
+      以前这里直接按 free_ratio=0 判死，于是明明 tf 位姿是对的却被丢掉，
+      回放退回局部坐标（base_pose），机器人的朝向和地图差几十度，代价地图看着就"位置不对"
+      （逆时针建图那批日志就是这样）；
+    * 代价地图窗口**不是随车滚动**的（固定窗口）时，跳过"窗口中心重合"检查——
+      固定窗口和机器人本来就不重合，用它当判据会把正确的 tf 位姿否掉
+      （往草堆走那批日志就是这样，轨迹/弓字被摆错位置）。
     """
     best = None
+    grid = tracks.get("_map")
+    frames = tracks.get("_frames") or []
+    rolling = _costmap_roll_span(frames) >= COSTMAP_MIN_ROLL
     for name in TF_POSE_CHILDREN:
         points = tracks.get(name)
         if not points or len(points) < 10:
@@ -810,22 +975,48 @@ def _tf_track(tracks):
         ys = [point[2] for point in points]
         span = max(max(xs) - min(xs), max(ys) - min(ys))
         sample = points[:: max(1, len(points) // 200)]
-        free_ratio = _free_ratio_of(tracks.get("_map"), sample)
-        gap = _window_gap(tracks.get("_frames"), points)
-        score = (free_ratio >= TF_MIN_FREE_RATIO, span)
-        if span < TF_MIN_SPAN or free_ratio < TF_MIN_FREE_RATIO:
+        free_ratio = _free_ratio_of(grid, sample) if grid else None
+        if free_ratio is not None and free_ratio < TF_MIN_FREE_RATIO:
             continue
+        gap = _window_gap(frames, points) if rolling else None
         if gap is not None and gap > TF_MAX_WINDOW_GAP:
             continue
+        # 跨度只用来兜底：车没怎么动（被卡住/侧翻那几包）时 span≈0，但只要
+        # "落在地图自由区 + 和滚动窗口中心重合"两条都成立，它就是机器人位姿。
+        if span < TF_MIN_SPAN and free_ratio is None and gap is None:
+            continue
+        score = (1, free_ratio if free_ratio is not None else 1.0, span)
         candidate = (score, name, span, free_ratio, gap)
         if best is None or candidate[0] > best[0]:
             best = candidate
+    if best is None and grid is not None:
+        # 兜底：所有判据都不满足时，如果"落在地图自由区、真的在动"的孩子帧只有一个，
+        # 那它就是机器人（逆时针建图那批日志里代价地图窗口和车位有 ~2 m 的固定偏差，
+        # 窗口重合判据永远不满足，但位姿本身是对的）。
+        falls = []
+        for name in TF_POSE_CHILDREN:
+            points = tracks.get(name)
+            if not points or len(points) < 10:
+                continue
+            xs = [point[1] for point in points]
+            ys = [point[2] for point in points]
+            span = max(max(xs) - min(xs), max(ys) - min(ys))
+            if span < TF_MIN_SPAN:
+                continue
+            sample = points[:: max(1, len(points) // 200)]
+            free_ratio = _free_ratio_of(grid, sample)
+            if free_ratio < TF_MIN_FREE_RATIO:
+                continue
+            falls.append((name, span, free_ratio, _window_gap(frames, points)))
+        if len(falls) == 1:
+            name, span, free_ratio, gap = falls[0]
+            best = ((1, free_ratio, span), name, span, free_ratio, gap)
     if best is None:
         return None
     return {
         "name": best[1],
         "span": round(best[2], 2),
-        "free_ratio": round(best[3], 3),
+        "free_ratio": None if best[3] is None else round(best[3], 3),
         "window_gap": None if best[4] is None else round(best[4], 2),
     }
 
@@ -951,9 +1142,10 @@ def read_bag(path):
         # 代价地图看着"不跟车"，所以有可用的 tf 位姿就优先用它。
         tf_track = None
         tf_info = None
-        if maps.get("whole_map") and any(
-            item["name"] == TF_TOPIC for item in topics
-        ):
+        # 只要日志里有 tf_dynamic 就试着找"地图坐标系下的机器人位姿"：
+        # 没有 whole_map 的日志（地图消息是空的）也一样能用 tf 位姿回放，
+        # 以前这里要求先有地图，导致这些日志退回局部坐标、朝向和代价地图对不上。
+        if any(item["name"] == TF_TOPIC for item in topics):
             tf_tracks = {}
             for timestamp, blob in _topic_rows(con, TF_TOPIC):
                 decoded = _decode_tf(blob)
@@ -994,12 +1186,18 @@ def read_bag(path):
     if pose_frame == "map":
         clouds = read_obstacle_clouds(con, poses, start)
     battery = None
-    battery_topic = _pick_battery_topic([topic["name"] for topic in topics])
+    available = [topic["name"] for topic in topics]
+    battery_topic = _pick_battery_topic(available)
     if battery_topic:
         try:
             battery = _read_battery(con, battery_topic, start)
         except (sqlite3.Error, BagError):
             battery = None
+    # 充电桩位置：日志里没有明确发布就不给（回放时界面上不放桩）
+    dock_topic = _pick_dock_topic(available)
+    dock = read_dock(con, dock_topic) if dock_topic else None
+    if dock is None:
+        dock_topic = None
     con.close()
     timeline = [(round(t - start, 4), x, y, yaw) for t, x, y, yaw in poses]
     command_timeline = [
@@ -1061,6 +1259,9 @@ def read_bag(path):
         "images": images,
         "battery": battery,
         "battery_topic": battery_topic if battery else None,
+        # 日志里明确给的充电桩位置 (x, y)（日志坐标系）；没有就是 None
+        "dock": dock,
+        "dock_topic": dock_topic,
         "pose_topic": pose_topic,
         "pose_frame": pose_frame,
         "wall_start": None if wall_start is None else round(wall_start, 3),

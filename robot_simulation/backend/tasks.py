@@ -244,7 +244,7 @@ PHASE_LABELS = {
 MOW_PHASES = {"zone_edge", "zone_stripes", "detour", "ring", "corner_clean"}
 CHARGE_EXEMPT = {
     "charging", "charge_go", "charge_return", "align", "done", "idle", "to_dock",
-    "stopped",
+    "stopped", "replay",
 }
 
 
@@ -505,9 +505,14 @@ class TaskManager(object):
         return None
 
     # ----------------------------------------------------------- 对外指令
+    def release_battery_lock(self):
+        """普通任务 / 手动控制接管时解除"电量按日志钉住"。"""
+        self.robot.battery_lock = None
+
     def start_mapping(self):
         with self.lock:
             self._reset_state()
+            self.release_battery_lock()
             # 用户手动添加的障碍物/禁区要一直保留（只能由用户自己删除），
             # 重新建图只清传感器建出来的栅格。
             self.grid.reset_map()
@@ -547,6 +552,7 @@ class TaskManager(object):
 
     def start_mowing(self, zone_order, mode=None):
         with self.lock:
+            self.release_battery_lock()
             available = [zone["id"] for zone in self.grid.zones]
             if not available:
                 raise ValueError("请先完成自动建图，生成割草区域")
@@ -644,10 +650,11 @@ class TaskManager(object):
         with self.lock:
             state = self.replay.load(info, transform)
             self.robot.ghost = False
-            # 电量跟着日志走：日志里有电量话题就按它显示，否则锁在 100% 不变
+            # 电量跟着日志走：日志里有电量话题就按它的曲线显示，否则锁在 100% 不变。
+            # 两种情况下都把 battery_lock 钉上——回放期间电量不该被仿真"放电"消耗，
+            # 暂停/播完（日志还载着）时也一样，只有普通任务或手动接管才解锁。
             self.battery_series = list((info or {}).get("battery") or [])
             if self.battery_series:
-                self.robot.battery_lock = None
                 self._apply_replay_battery()
             else:
                 self.robot.battery_lock = 100.0
@@ -655,6 +662,11 @@ class TaskManager(object):
             return state
 
     def _apply_replay_battery(self):
+        """回放时刻的电量按日志取值，并钉住（`battery_lock`）。
+
+        以前只把值写进 `robot.battery`，随后 `robot.step()` 又按仿真放电扣一点，
+        暂停回放时更是完全走正常放电逻辑——界面上就会看到"播日志时电量在掉"。
+        """
         if not self.battery_series:
             return
         when = self.replay.time
@@ -663,7 +675,9 @@ class TaskManager(object):
             if stamp > when:
                 break
             best = (stamp, value)
-        self.robot.battery = max(0.0, min(100.0, float(best[1])))
+        value = max(0.0, min(100.0, float(best[1])))
+        self.robot.battery_lock = value
+        self.robot.battery = value
 
     def start_replay(self):
         with self.lock:
@@ -705,7 +719,8 @@ class TaskManager(object):
         with self.lock:
             state = self.replay.stop()
             self.robot.ghost = False
-            self.robot.battery_lock = None
+            # 电量锁不解：日志还载着，界面上的电量就停在日志最后一帧的值，
+            # 不会因为"回放结束、仿真空转"而慢慢掉下去。开始普通任务/手动接管时才解锁。
             self.task = None
             self.phase = "idle"
             self.last_phase = None
@@ -740,6 +755,8 @@ class TaskManager(object):
         state["battery_topic"] = info.get("battery_topic")
         state["battery_series"] = len(self.battery_series)
         state["battery_locked"] = self.robot.battery_lock is not None
+        # 日志里没有明确的桩位时回放不放桩（图上的充电桩就靠这个标志隐藏）
+        state["dock_visible"] = world.DOCK_VISIBLE
         if with_costmap:
             state["costmap"] = self.replay.costmap_at(self.replay.time)
         return state
@@ -748,6 +765,7 @@ class TaskManager(object):
         with self.lock:
             if self.phase in ("charge_go", "charge_return", "charging"):
                 return
+            self.release_battery_lock()
             self._save_breakpoint()
             self.charge_reason = "manual"
             self.resume_requested = False
@@ -758,11 +776,13 @@ class TaskManager(object):
     def request_resume(self):
         with self.lock:
             if self.phase in ("stopped", "paused") and self.breakpoint:
+                self.release_battery_lock()
                 self._log("event", "收到继续任务指令，从暂停断点恢复")
                 self._restore_breakpoint()
                 return
             if self.phase not in ("charging", "charge_go"):
                 return
+            self.release_battery_lock()
             self.resume_requested = True
             self._log("event", "收到继续任务指令")
 
@@ -774,12 +794,21 @@ class TaskManager(object):
     def tick(self, dt):
         with self.lock:
             self.tick_plan_left = TICK_PLAN_BUDGET
-            world.update_dynamic(dt)
-            if world.DYNAMIC:
-                self.grid.apply_dynamic(world.DYNAMIC)
-            readings = self.robot.scan()
+            # 日志播放只是"重放"，不做仿真感知、不响应障碍物：
+            # 不推进动态障碍、不用视觉刷地图障碍层、不算碰撞（robot.ghost 已挡掉），
+            # 界面上只呈现日志自己带的东西（位姿/代价地图/点云/图像）。
+            replaying = self.replay.active
+            if not replaying:
+                world.update_dynamic(dt)
+                if world.DYNAMIC:
+                    self.grid.apply_dynamic(world.DYNAMIC)
+            readings = self.robot.scan() if not replaying else []
+            if replaying:
+                # 回放不扫描：清掉上一次的视觉摘要，遥测里就不会出现"假障碍"
+                self.robot.vision = []
             pose = self._pose()
-            self.grid.update_from_scan(pose, readings, world.VISION_RANGE)
+            if not replaying:
+                self.grid.update_from_scan(pose, readings, world.VISION_RANGE)
 
             step = 0.0
             if self._prev_pose is not None:
@@ -810,7 +839,7 @@ class TaskManager(object):
                 ):
                     self.mow_track.append((round(pose[0], 3), round(pose[1], 3)))
 
-            if self.replay.active:
+            if replaying:
                 self.replay.tick(dt)
                 self._apply_replay_battery()
                 self.robot.step(dt)
@@ -5236,10 +5265,15 @@ class TaskManager(object):
                     for a, b in self.segments
                 ],
                 edge_route=[[round(p[0], 2), round(p[1], 2)] for p in self.edge_points],
-                ray_scan=[
-                    [round(math.degrees(relative), 1), round(distance, 3)]
-                    for relative, distance in self.robot.vision
-                ],
+                # 日志播放时不给"仿真视觉"（那是假的感知，只展示日志自己的数据）
+                ray_scan=(
+                    []
+                    if self.replay.active
+                    else [
+                        [round(math.degrees(relative), 1), round(distance, 3)]
+                        for relative, distance in self.robot.vision
+                    ]
+                ),
                 goal=(
                     [round(self.nav_goal[0], 2), round(self.nav_goal[1], 2)]
                     if self.nav_goal

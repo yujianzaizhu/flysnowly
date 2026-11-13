@@ -38,6 +38,14 @@ REPLAY_DESPIKE_RADIUS = 2
 REPLAY_SMOOTH_RADIUS = 2
 REPLAY_TRACK_MAX_V = 1.60
 REPLAY_TRACK_MAX_W = 4.50
+# 障碍点云按这个尺寸的方格去重 / 刷新（同一格最近一次观测说了算）
+CLOUD_CELL = 0.20
+# 一个格子要"连续被看清 N 帧且都没测到东西"才清掉：深度相机是稀疏采样，
+# 实测同一处障碍只有约 37% 的观测帧会报点，一帧没报就删会闪成一片。
+CLOUD_MISS_LIMIT = 3
+# 点云观测的留存窗口：最后一次被观测到超过这么久（1 分钟），就从记忆地图里**删掉**
+# （不是只隐藏），同一条日志往回拖才会重新生成。这段时间内粒子按年龄逐渐变淡。
+CLOUD_FADE_SECONDS = 60.0
 
 
 class ReplayError(ValueError):
@@ -190,6 +198,106 @@ def _smooth_track(track, radius=2):
     return smoothed
 
 
+def _point_in_polygon(x, y, points):
+    inside = False
+    count = len(points)
+    j = count - 1
+    for i in range(count):
+        xi, yi = points[i]
+        xj, yj = points[j]
+        if ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi
+        ):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _apply_cloud_frame(state, frame, scale, dx, dy, cell=CLOUD_CELL):
+    """把一帧点云并进"原始点缓冲"，同时记录"这一片看过了但什么都没测到"。
+
+    * ``frame`` = ``(相对时间, [x, y, ...], [vx, vy, ...])``，后两项都在日志地图坐标；
+    * ``state`` = ``{"points": [(x, y, 观测时间, 格键)], "miss": {...}, "dead": {...}}``；
+    * 点坐标**不做任何格网吸附**：以前按 0.2 m 格子去重、坐标取"亚格平滑值"，
+      画出来是一片稀疏散点、像给障碍描了个边；RViz 里那层是原始点的"喷雾"，
+      同一处多次观测会叠成一片。0.2 m 格子现在只用来数"没看到"了几次，不影响显示位置。
+    * 视锥落地面（凸四边形）里、但这一帧没测到点的格子记一次"空"，
+      连续 ``CLOUD_MISS_LIMIT`` 次就把该格**此前**观测到的点判定为过时（只删那之前的点，
+      之后再测到的照样保留）——这就是"同一个地方第二次探测没东西了"。
+    """
+    stamp, points, view = frame
+    buffer = state["points"]
+    hit = set()
+    for index in range(0, len(points) - 1, 2):
+        x = points[index] * scale + dx
+        y = points[index + 1] * scale + dy
+        key = (int(math.floor(x / cell)), int(math.floor(y / cell)))
+        buffer.append((round(x, 2), round(y, 2), stamp, key))
+        for dc in (-1, 0, 1):
+            for dr in (-1, 0, 1):
+                hit.add((key[0] + dc, key[1] + dr))
+    if len(view) < 6:
+        return
+    polygon = [
+        (view[index] * scale + dx, view[index + 1] * scale + dy)
+        for index in range(0, len(view) - 1, 2)
+    ]
+    cols = [point[0] for point in polygon]
+    rows = [point[1] for point in polygon]
+    col0 = int(math.floor(min(cols) / cell))
+    col1 = int(math.floor(max(cols) / cell))
+    row0 = int(math.floor(min(rows) / cell))
+    row1 = int(math.floor(max(rows) / cell))
+    miss = state["miss"]
+    dead = state["dead"]
+    for col in range(col0, col1 + 1):
+        for row in range(row0, row1 + 1):
+            key = (col, row)
+            if key in hit:
+                continue
+            if not _point_in_polygon((col + 0.5) * cell, (row + 0.5) * cell, polygon):
+                continue
+            count = miss.get(key, 0) + 1
+            if count >= CLOUD_MISS_LIMIT:
+                # 这一片被连续看清、什么都没测到：落在该格、且观测时间早于此刻的点都算过时
+                dead[key] = stamp
+                count = 0
+            miss[key] = count
+
+
+def _cloud_window_box(window):
+    """代价地图窗口在仿真坐标里的外接矩形 ``(x0, y0, x1, y1)``。"""
+    if not window:
+        return None
+    x0, y0, res, width, height, _data = window
+    if res <= 0:
+        return None
+    return (x0, y0, x0 + width * res, y0 + height * res)
+
+
+def _prune_cloud_points(state, now, window=None):
+    """裁剪原始点：超出留存窗口 / 已被判空 / 跑出代价地图范围的点都丢掉。
+
+    全都"只减不增"（时间只往前走、代价地图窗口跟着车走），所以增量缓存不会失效。
+    ``now = inf`` 是"整段归档"用的，此时只按判空裁剪，不按留存窗口裁剪。
+    """
+    cutoff = now - CLOUD_FADE_SECONDS if math.isfinite(now) else -float("inf")
+    dead = state["dead"]
+    box = _cloud_window_box(window)
+    kept = []
+    for point in state["points"]:
+        if point[2] < cutoff:
+            continue
+        if point[2] < dead.get(point[3], -1e18):
+            continue
+        if box is not None and not (
+            box[0] <= point[0] <= box[2] and box[1] <= point[1] <= box[3]
+        ):
+            continue
+        kept.append(point)
+    state["points"] = kept
+
+
 def _interp(track, time):
     """在时间轴上线性插值位姿。"""
     if not track:
@@ -328,6 +436,9 @@ class BagReplay(object):
         self.costmap_frames = maps.get(bag_reader.COSTMAP_TOPIC) or []
         self.costmap_index = -1
         self._costmap_cache = {}
+        # 障碍点云"记忆地图"：cells 是 {(col, row): [x, y, 未命中次数]}，按事件增量更新
+        self._cloud_state = None
+        self._cloud_event_cache = None
         self.image_info = info.get("images") or None
         self.image_frames = (self.image_info or {}).get("frames") or []
         self._image_cache = {}
@@ -546,44 +657,128 @@ class BagReplay(object):
         return result
 
     def cloud_at(self, time, max_points=3000):
-        """截至 ``time`` 的障碍物点云（已换算到仿真坐标，累计并降采样），供界面叠加。
+        """截至 ``time`` 的障碍物点云（已换算到仿真坐标），供界面叠加。
 
-        点云是拿**地图坐标系**的位姿算出来的（只有位姿在 map 帧里才有），所以和静态地图
-        同坐标系，用 ``map_offset`` 换算；没有日志地图时才退回轨迹的平移量。
+        和 RViz 里那层点云同一个语义——**近期的原始观测点**：
+
+        * 点是原始观测坐标（不做格网吸附/合并），同一处多次观测会叠成一片"喷雾"；
+        * 只留最近 ``CLOUD_FADE_SECONDS``（60 s）内的观测，超时直接丢弃（不是只隐藏）；
+        * 只保留在**当前局部代价地图窗口**内的点：地图上看到的就是"车周围这一块"，
+          和代价地图那层完全重合，不会有一堆孤零零的点飘在代价地图范围之外；
+        * 同一处"看过了但没有东西"（视锥落地面连续 ``CLOUD_MISS_LIMIT`` 帧没测到点）
+          会清掉那里的旧点——深度相机的判空只覆盖前方 1.35 m，所以这一条是补充手段，
+          主力仍然是上面的留存窗口。
+
+        点云是拿**地图坐标系**的位姿算出来的（只有位姿在 map 帧里才有），所以和静态地图、
+        代价地图同坐标系，用 ``map_offset`` 换算；没有日志地图时才退回轨迹的平移量。
+        状态按"已应用事件数"增量维护：时间往前走只补新的事件，往回拖才从头重建。
         """
-        frames = (self.info or {}).get("clouds") or []
-        if not frames:
+        events = self._cloud_events()
+        if not events:
             return None
         scale = self.scale if self.transform else 1.0
         if self.transform:
             dx, dy = self.map_offset
         else:
             dx, dy = self.offset
-        points = []
-        for stamp, chunk in frames:
+        upto = 0
+        for stamp, _kind, _payload in events:
             if stamp > time:
                 break
-            for index in range(0, len(chunk) - 1, 2):
-                points.append(round(chunk[index] * scale + dx, 2))
-                points.append(round(chunk[index + 1] * scale + dy, 2))
-        if not points:
+            upto += 1
+        cache = self._cloud_state
+        if (
+            cache is not None
+            and cache["transform"] == (round(scale, 6), dx, dy)
+            and cache["applied"] <= upto
+            # 状态已经按 cache["time"] 裁剪过（留存窗口 + 代价地图范围），只对"不早于它"的
+            # 查询有效：往回拖必须从头重建，否则会拿到已经被裁掉的空点集。
+            and time >= cache["time"]
+        ):
+            state = cache
+            start_index = cache["applied"]
+        else:
+            state = {
+                "points": [],
+                "miss": {},
+                "dead": {},
+                "window": None,
+                "frames": 0,
+                "pruned_at": -1e18,
+            }
+            start_index = 0
+        for stamp, kind, payload in events[start_index:upto]:
+            if kind == 0:
+                _apply_cloud_frame(state, payload, scale, dx, dy)
+                state["frames"] += 1
+                # 长日志一次跳很远时别让缓冲无限长：每 10 s 回放时间收一次
+                if stamp - state["pruned_at"] >= 10.0:
+                    state["pruned_at"] = stamp
+                    _prune_cloud_points(state, stamp, state["window"])
+            else:
+                state["window"] = payload
+        _prune_cloud_points(state, time, state["window"])
+        state["applied"] = upto
+        state["time"] = time
+        state["transform"] = (round(scale, 6), dx, dy)
+        self._cloud_state = state
+        buffer = state["points"]
+        total = len(buffer)
+        if not total:
             return None
-        total = len(points) // 2
         stride = 1
         if total > max_points:
             stride = int(math.ceil(total / float(max_points)))
-        if stride > 1:
-            picked = []
-            for index in range(0, total, stride):
-                picked.append(points[index * 2])
-                picked.append(points[index * 2 + 1])
-            points = picked
+        points = []
+        ages = []
+        for index in range(0, total, stride):
+            item = buffer[index]
+            points.append(item[0])
+            points.append(item[1])
+            # 距观测多久（按回放时间算，暂停时不变）：前端据此淡出
+            ages.append(round(min(max(0.0, time - item[2]), 1e6), 1))
         return {
             "points": points,
+            "ages": ages,
+            "fade": CLOUD_FADE_SECONDS,
             "count": len(points) // 2,
             "total": total,
-            "frames": sum(1 for stamp, _chunk in frames if stamp <= time),
+            "frames": state["frames"],
         }
+
+    def _cloud_events(self):
+        """点云帧与代价地图帧按时间合成一条事件流（增量回放用）。
+
+        ``kind = 0`` 是点云帧（写点 + 判空），``kind = 1`` 是代价地图帧（清空地）。
+        每包只构建一次。
+        """
+        cached = getattr(self, "_cloud_event_cache", None)
+        if cached is not None:
+            return cached
+        events = []
+        for frame in (self.info or {}).get("clouds") or []:
+            events.append((frame[0], 0, frame))
+        scale = self.scale if self.transform else 1.0
+        for stamp, grid in self.costmap_frames or []:
+            resolution = float(grid["resolution"]) * scale
+            if resolution <= 0:
+                continue
+            width = grid["width"]
+            height = grid["height"]
+            if self.transform:
+                x0 = grid["origin"][0] * scale + self.map_offset[0]
+                y0 = grid["origin"][1] * scale + self.map_offset[1]
+            else:
+                # 没有日志地图时代价地图窗口以车身为中心（与 costmap_at 一致）
+                ref = self._track_point_at(stamp)
+                if ref is None:
+                    continue
+                x0 = ref[0] - width * resolution / 2.0
+                y0 = ref[1] - height * resolution / 2.0
+            events.append((stamp, 1, (x0, y0, resolution, width, height, grid["data"])))
+        events.sort(key=lambda item: (item[0], item[1]))
+        self._cloud_event_cache = events
+        return events
 
     def _map_anchor(self):
         """回放轨迹的落点：优先充电桩附近，其次场地中心。"""
@@ -654,6 +849,8 @@ class BagReplay(object):
         self.costmap_frames = []
         self.costmap_index = -1
         self._costmap_cache = {}
+        self._cloud_state = None
+        self._cloud_event_cache = None
         self.image_info = None
         self.image_frames = []
         self._image_cache = {}

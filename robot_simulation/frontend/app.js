@@ -47,6 +47,13 @@
     simTime: document.getElementById("simTime"),
     leftWheel: document.getElementById("leftWheel"),
     rightWheel: document.getElementById("rightWheel"),
+    measureBtn: document.getElementById("measureBtn"),
+    measureHint: document.getElementById("measureHint"),
+    measureResult: document.getElementById("measureResult"),
+    measureA: document.getElementById("measureA"),
+    measureB: document.getElementById("measureB"),
+    measureDist: document.getElementById("measureDist"),
+    measureDelta: document.getElementById("measureDelta"),
 
     log: document.getElementById("log"),
     phaseChip: document.getElementById("phaseChip"),
@@ -285,6 +292,7 @@
   let logSignature = "";
 
   let lastMapId = null;
+  let lastMapEpoch = null;
   let mapOptionsSignature = "";
   let viewWorldKey = "";
   let viewZoom = 1;
@@ -318,13 +326,22 @@
     const response = await fetch(path, options);
     if (!response.ok) {
       let message = "HTTP " + response.status;
+      let code = null;
+      let number = null;
       try {
         const payload = await response.json();
         if (payload && payload.error) message = payload.error;
+        if (payload && payload.code) {
+          code = payload.code;
+          number = payload.number;
+        }
       } catch (error) {
         /* ignore */
       }
-      throw new Error(message);
+      const failure = new Error(message);
+      failure.code = code;
+      failure.number = number;
+      throw failure;
     }
     return response.json();
   }
@@ -366,6 +383,18 @@
     // 连续播放会自动换日志、重建场地、时间轴归零：这些都不能把上一段的路径抹掉，
     // 只有手动载入日志 / 复位才清除轨迹。
     const queueRunning = !!(bagQueue && bagQueue.active);
+    const mapEpoch = state.world && state.world.epoch != null ? state.world.epoch : 0;
+    if (lastMapEpoch !== null && mapEpoch !== lastMapEpoch) {
+      // 地图被清成空白（没地图的建图日志）：上一张地图上的轨迹/点云作废，重新起笔
+      trail = [];
+      strokeBreakPending = false;
+      lastTeleportsMark = -1;
+      mapVersion = -1;
+      zoneAutoValue = "";
+      zoneInputDirty = false;
+      els.zoneOrder.value = "";
+    }
+    lastMapEpoch = mapEpoch;
     if (lastMapId !== null && state.map_id !== lastMapId) {
       // 手动载入日志/换地图会整体换场地并挪车位，这不是回放里的"跳变"：
       // 直接重新起笔，否则会从上一张图的旧位置拉一条初始跳线过来。
@@ -563,6 +592,159 @@
   }
 
   let hoverWorld = null;
+
+  // ------------------------------------------------------------- 距离测量
+  // 遥测面板里点「开始测量」，然后在地图上点两个点，量两点间的直线距离。
+  // 只允许在待机 / 任务暂停 / 回放暂停时用：跑动中点出来的点没有意义，
+  // 还会和拖动平移抢手势。
+  const MEASURE_IDLE_PHASES = ["idle", "done", "stopped", "paused"];
+  const measure = { active: false, a: null, b: null };
+
+  function measureAllowed(state) {
+    const snapshot = state || current || {};
+    const task = snapshot.task || {};
+    const phase = task.phase || "idle";
+    if (snapshot.draft && snapshot.draft.active) return false;
+    if (task.type === "replay") return !(snapshot.bag || {}).playing;
+    if (!task.type) return true;
+    return MEASURE_IDLE_PHASES.includes(phase);
+  }
+
+  function measureText(point) {
+    return point ? point.x.toFixed(2) + ", " + point.y.toFixed(2) + " m" : "--";
+  }
+
+  function measureDistance(a, b) {
+    return Math.hypot(b.x - a.x, b.y - a.y);
+  }
+
+  function updateMeasureUI(state) {
+    if (!els.measureBtn) return;
+    const allowed = measureAllowed(state);
+    if (!allowed && measure.active) {
+      // 任务跑起来了：自动收起测量状态，免得留在画布上一根旧线
+      measure.active = false;
+      measure.a = null;
+      measure.b = null;
+    }
+    els.measureBtn.disabled = !allowed;
+    els.measureBtn.classList.toggle("is-active", measure.active);
+    els.measureBtn.textContent = measure.active
+      ? "取消测量"
+      : measure.a
+      ? "重新测量"
+      : "开始测量";
+    if (!allowed) {
+      const task = (state || current || {}).task || {};
+      els.measureBtn.title =
+        task.type === "replay" ? "日志回放中：先暂停回放再测量" : "任务运行中：先暂停或结束任务再测量";
+    } else {
+      els.measureBtn.title = "在地图上点两个点量直线距离";
+    }
+    if (els.measureHint) {
+      els.measureHint.textContent = !allowed
+        ? "距离测量只在待机、任务暂停或回放暂停时可用。"
+        : measure.active && !measure.a
+        ? "在地图上点第 1 个点。"
+        : measure.active
+        ? "再点第 2 个点，量出两点直线距离。"
+        : "暂停任务或待机时可在地图上点两个点量距离。";
+    }
+    if (els.measureResult) els.measureResult.hidden = !measure.a;
+    if (els.measureA) els.measureA.textContent = measureText(measure.a);
+    if (els.measureB) els.measureB.textContent = measureText(measure.b);
+    if (els.measureDist) {
+      els.measureDist.textContent =
+        measure.a && measure.b ? measureDistance(measure.a, measure.b).toFixed(2) + " m" : "--";
+    }
+    if (els.measureDelta) {
+      els.measureDelta.textContent =
+        measure.a && measure.b
+          ? Math.abs(measure.b.x - measure.a.x).toFixed(2) + " / " + Math.abs(measure.b.y - measure.a.y).toFixed(2) + " m"
+          : "--";
+    }
+    canvas.classList.toggle("is-measuring", measure.active);
+  }
+
+  function measureClick(worldPoint) {
+    if (!measure.a || measure.b) {
+      measure.a = { x: worldPoint.x, y: worldPoint.y };
+      measure.b = null;
+    } else {
+      measure.b = { x: worldPoint.x, y: worldPoint.y };
+      measure.active = false;
+    }
+    updateMeasureUI(current);
+  }
+
+  if (els.measureBtn) {
+    els.measureBtn.addEventListener("click", () => {
+      if (!measureAllowed(current)) return;
+      if (measure.active) {
+        measure.active = false;
+        measure.a = null;
+        measure.b = null;
+      } else {
+        measure.active = true;
+        measure.a = null;
+        measure.b = null;
+      }
+      updateMeasureUI(current);
+    });
+  }
+
+  function drawMeasure(geom) {
+    if (!measure.a) return;
+    const preview = measure.active && !measure.b ? hoverWorld : null;
+    const end = measure.b || preview;
+    const ax = geom.x(measure.a.x);
+    const ay = geom.y(measure.a.y);
+    ctx.save();
+    ctx.strokeStyle = "rgba(" + palette.route + ", 0.95)";
+    ctx.lineWidth = 1.6;
+    ctx.setLineDash([6, 5]);
+    ctx.beginPath();
+    if (end) {
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(geom.x(end.x), geom.y(end.y));
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+    const dots = [[measure.a, "A"]];
+    if (measure.b) dots.push([measure.b, "B"]);
+    ctx.font = "600 11px 'Segoe UI', sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    dots.forEach(([point, label]) => {
+      const px = geom.x(point.x);
+      const py = geom.y(point.y);
+      ctx.fillStyle = "rgba(" + palette.route + ", 0.95)";
+      ctx.beginPath();
+      ctx.arc(px, py, 3.6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "rgba(16, 20, 28, 0.85)";
+      ctx.beginPath();
+      ctx.arc(px, py, 1.4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "rgba(" + palette.route + ", 0.98)";
+      ctx.fillText(label, px, py - 10);
+    });
+    if (end) {
+      const text =
+        measureDistance(measure.a, end).toFixed(2) + (measure.b ? " m" : " m（预览）");
+      const mx = (ax + geom.x(end.x)) / 2;
+      const my = (ay + geom.y(end.y)) / 2;
+      const width = ctx.measureText(text).width + 12;
+      ctx.fillStyle = "rgba(16, 20, 28, 0.86)";
+      ctx.fillRect(mx - width / 2, my - 10, width, 18);
+      ctx.strokeStyle = "rgba(" + palette.route + ", 0.6)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(mx - width / 2, my - 10, width, 18);
+      ctx.fillStyle = "rgba(" + palette.route + ", 0.98)";
+      ctx.fillText(text, mx, my - 1);
+    }
+    ctx.restore();
+  }
 
   function updateDeleteButton() {
     const maps = (current && current.world && current.world.maps) || [];
@@ -1884,6 +2066,7 @@
   function updatePanels(state) {
     const task = state.task || {};
     const phase = task.phase || "idle";
+    updateMeasureUI(state);
     const charging = state.charging;
     const battery = clamp(state.battery, 0, 100);
 
@@ -1939,7 +2122,11 @@
     els.heading.textContent = heading.toFixed(0) + "°";
     els.distance.textContent = Math.round(state.distance);
     els.collisions.textContent = String(state.collisions);
-    if (state.dock_distance != null) {
+    if (state.dock_visible === false) {
+      // 日志回放且日志里没有桩位：没有桩就没有"距桩/回充预留"
+      els.dockDistance.textContent = "--";
+      els.dockReserve.textContent = "--";
+    } else if (state.dock_distance != null) {
       els.dockDistance.textContent = state.dock_distance.toFixed(1);
       els.dockReserve.textContent = (state.dock_distance * 0.65 + 3).toFixed(0);
     }
@@ -2103,6 +2290,25 @@
       viewWorldKey = worldKey;
       resetView(world);
     }
+    if (state && state.bag && state.bag.loaded && state.pose) {
+      // 回放时机器人可能跑到场地外（没地图的日志，轨迹不一定落在空白场地里）：
+      // 快出画布就跟着平移视口，别让机器人从画面上消失。
+      const scale = fitScale(world, width, height) * viewZoom;
+      if (scale > 0) {
+        const halfW = width / 2 / scale;
+        const halfH = height / 2 / scale;
+        const keepX = Math.max(0.6, halfW * 0.2);
+        const keepY = Math.max(0.6, halfH * 0.2);
+        const dx = state.pose.x - viewCenterX;
+        const dy = state.pose.y - viewCenterY;
+        if (Math.abs(dx) > halfW - keepX) {
+          viewCenterX += dx - Math.sign(dx) * (halfW - keepX);
+        }
+        if (Math.abs(dy) > halfH - keepY) {
+          viewCenterY += dy - Math.sign(dy) * (halfH - keepY);
+        }
+      }
+    }
     const geom = makeGeometry(world, width, height);
     lastGeometry = geom;
     drawBackground(geom);
@@ -2126,12 +2332,16 @@
       drawTrail(geom);
       // 编辑草稿自带充电桩，临时场地的占位桩不画，避免出现两个桩
       drawPassageLabels(geom, state.map || lastMapPayload, world);
-      if (!(state.draft && state.draft.active)) drawDock(geom, world.dock, state.charging);
+      // 日志回放时如果日志里没有明确的充电桩位置，后端会把 dock_visible 置 false：图上不放桩
+      if (!(state.draft && state.draft.active) && world.dock_visible !== false) {
+        drawDock(geom, world.dock, state.charging);
+      }
       const pose = poseAt(now);
       drawVision(geom, pose, state.ray_scan || [], state.vision || {});
       drawRobot(geom, pose, now);
     }
     drawScaleBar(geom);
+    drawMeasure(geom);
   }
 
   function drawBackground(geom) {
@@ -2943,6 +3153,13 @@
 
   document.addEventListener("keydown", (event) => {
     const key = keyName(event);
+    if (key === "Escape" && measure.active) {
+      measure.active = false;
+      measure.a = null;
+      measure.b = null;
+      updateMeasureUI(current);
+      return;
+    }
     if (key === " ") {
       event.preventDefault();
       send("/api/command", { command: "stop" });
@@ -3569,7 +3786,7 @@
     els.bagHint.textContent = text;
   }
 
-  // 日志编号：zmqbag_15_2026-09-15-... → 15，用于“从大到小”排序
+  // 日志编号：zmqbag_15_2026-09-15-... → 15，用于排序兜底
   function bagNumber(bag) {
     const name = (bag && bag.name) || "";
     const matched = name.match(/(\d+)/g);
@@ -3577,18 +3794,24 @@
     return parseInt(matched[0], 10);
   }
 
-  function sortBagsDesc(bags) {
+  // 按"录制时间"升序：同一批日志是分段录的，段与段的位姿首尾相接，只有按时间
+  // 顺序播，切换日志时机器人才不会跳到别处。取不到录制时间的排在本组最后。
+  function sortBagsChrono(bags) {
     return bags
       .slice()
       .sort((a, b) => {
-        const diff = bagNumber(b) - bagNumber(a);
+        const sa = Number(a.stamp) || 0;
+        const sb = Number(b.stamp) || 0;
+        if (Boolean(sa) !== Boolean(sb)) return sa ? -1 : 1;
+        if (sa !== sb) return sa - sb;
+        const diff = bagNumber(a) - bagNumber(b);
         if (diff !== 0) return diff;
-        return (b.mtime || 0) - (a.mtime || 0);
+        return (a.mtime || 0) - (b.mtime || 0);
       });
   }
 
   function selectAllVisible() {
-    const ordered = sortBagsDesc(bagVisible);
+    const ordered = sortBagsChrono(bagVisible);
     bagChecked = new Set(ordered.map((bag) => bag.key));
     bagOrder = ordered.map((bag) => bag.key);
     renderBagList();
@@ -3627,7 +3850,7 @@
   function renderBagList() {
     if (!els.bagList) return;
     const group = els.bagFolder ? els.bagFolder.value : "";
-    bagVisible = sortBagsDesc(bagEntries.filter((bag) => !group || bag.group === group));
+    bagVisible = sortBagsChrono(bagEntries.filter((bag) => !group || bag.group === group));
     els.bagList.textContent = "";
     if (!bagVisible.length) {
       const empty = document.createElement("p");
@@ -3729,7 +3952,7 @@
   const LAYER_LABELS = {
     pose: "仿真实际轨迹（跳变处画细线）",
     costmap: "日志局部代价地图（窗口随车滚动时机器人会落在窗口里；否则按日志自己的坐标摆放，和真实地图逐格对齐）",
-    cloud: "障碍物点云（深度相机 obstaclecloud，已换算到地图坐标，连续播放时跨日志累积）",
+    cloud: "障碍物点云（深度相机 obstaclecloud 原始观测点，只保留最近 60 s、且仅限代价地图范围内；连续播放时跨日志累积）",
     static_costmap: "静态代价地图（当前未叠加显示）",
     image: "日志图像窗口",
     map: "日志真实地图（已作为仿真场地，不能隐藏）",
@@ -3922,16 +4145,24 @@
   let costmapPollAt = 0;
   let costmapTime = -1;
 
-  let cloudPoints = null;        // 截至当前时刻的障碍物点云（地图坐标，扁平的 [x,y,...]）
+  let cloudPoints = null;        // 截至当前时刻的障碍物点云（原始观测点，扁平 [x,y,...]）
+  let cloudAges = null;          // 每个点"距最后一次观测"的秒数（服务端按回放时间算）
   let cloudPollAt = 0;
   let cloudTime = -1;
+  // 点云淡出：年龄 0 → 全亮，到服务端给的 fade 秒数（默认 45 s）完全消失；
+  // 分档绘制，避免每个点都改一次 fillStyle。
+  let cloudFade = 45;
+  const CLOUD_FADE_LEVELS = 4;
 
   async function refreshCloud(force) {
     const state = bagState;
     if (!state || !state.loaded) {
       // 连续播放换包的空档（新包还没载入）不要把点云清掉：历史点云要留着。
       // 只有手动载入 / 复位 / 「清理地图」才会清。
-      if (!(bagQueue && bagQueue.active)) cloudPoints = null;
+      if (!(bagQueue && bagQueue.active)) {
+        cloudPoints = null;
+        cloudAges = null;
+      }
       return;
     }
     const time = state.time || 0;
@@ -3943,6 +4174,8 @@
     try {
       const data = await request("/api/bag/cloud?t=" + time);
       cloudPoints = data.cloud && data.cloud.points ? data.cloud.points : null;
+      cloudAges = data.cloud && data.cloud.ages ? data.cloud.ages : null;
+      if (data.cloud && data.cloud.fade) cloudFade = Number(data.cloud.fade) || cloudFade;
     } catch (error) {
       /* 回放切换/结束期间的请求失败忽略 */
     }
@@ -3952,15 +4185,39 @@
     if (layerVisible.cloud === false) return;
     if (!cloudPoints || !cloudPoints.length) return;
     ctx.save();
-    ctx.fillStyle = "rgba(" + palette.cloud + ", 0.8)";
-    const size = Math.max(1.5, geom.scale * 0.02);
-    for (let index = 0; index < cloudPoints.length; index += 2) {
-      ctx.fillRect(
-        geom.x(cloudPoints[index]) - size / 2,
-        geom.y(cloudPoints[index + 1]) - size / 2,
-        size,
-        size
+    // 粒子按缩放给 1.8~3.6 px：现在画的是原始点（一帧几十个、叠成一片），
+    // 点太大会糊成一坨，太小在缩得很远时又看不见
+    const size = Math.max(1.8, Math.min(3.6, geom.scale * 0.06));
+    const half = size / 2;
+    // 越久没再观测到的粒子越淡（按回放时间算，暂停时不继续变淡）。
+    // 分 CLOUD_FADE_LEVELS 档画，避免每个点都改一次 fillStyle。
+    const buckets = [];
+    for (let level = 0; level < CLOUD_FADE_LEVELS; level += 1) buckets.push([]);
+    const points = cloudPoints.length / 2;
+    for (let index = 0; index < points; index += 1) {
+      const age = cloudAges && index < cloudAges.length ? cloudAges[index] : 0;
+      if (age >= cloudFade) continue;
+      const ratio = 1 - age / cloudFade;
+      const level = Math.min(
+        CLOUD_FADE_LEVELS - 1,
+        Math.max(0, Math.floor(ratio * CLOUD_FADE_LEVELS))
       );
+      buckets[level].push(index);
+    }
+    for (let level = 0; level < CLOUD_FADE_LEVELS; level += 1) {
+      const bucket = buckets[level];
+      if (!bucket.length) continue;
+      const alpha = (0.9 * (level + 1)) / CLOUD_FADE_LEVELS;
+      ctx.fillStyle = "rgba(" + palette.cloud + ", " + alpha.toFixed(2) + ")";
+      for (let i = 0; i < bucket.length; i += 1) {
+        const index = bucket[i] * 2;
+        ctx.fillRect(
+          geom.x(cloudPoints[index]) - half,
+          geom.y(cloudPoints[index + 1]) - half,
+          size,
+          size
+        );
+      }
     }
     ctx.restore();
   }
@@ -4148,6 +4405,7 @@
     lastTeleportsMark = 0;
     strokeBreakPending = false;
     cloudPoints = null;
+    cloudAges = null;
     cloudTime = -1;
     cloudPollAt = 0;
     costmapLayer = null;
@@ -4576,6 +4834,10 @@
   canvas.addEventListener("pointerdown", (event) => {
     if (event.button !== 0) return;
     const point = canvasPoint(event);
+    if (measure.active && lastGeometry) {
+      measureClick(lastGeometry.toWorld(point.x, point.y));
+      return;
+    }
     if (editorPointerMode() && lastGeometry) {
       editorPointerDown(lastGeometry.toWorld(point.x, point.y), event);
       return;
@@ -4634,8 +4896,12 @@
     finishPan(event);
   });
   canvas.addEventListener("pointerleave", (event) => {
-    if (!panState) els.mapCursor.style.display = "none";
-    else updateMapCursor(event);
+    if (!panState) {
+      els.mapCursor.style.display = "none";
+      hoverWorld = null;
+    } else {
+      updateMapCursor(event);
+    }
   });
 
   canvas.addEventListener(

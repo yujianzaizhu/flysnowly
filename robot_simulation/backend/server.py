@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import bag_player  # noqa: E402
 import bag_reader  # noqa: E402
 import config  # noqa: E402
 import map_editor  # noqa: E402
@@ -359,7 +360,7 @@ def add_bag_root(server, path):
 
 
 def list_bag_entries(server):
-    """汇总所有根目录下的日志（带分组），按分组 + 修改时间排序。"""
+    """汇总所有根目录下的日志（带分组），按分组 + 录制时间排序。"""
     entries = []
     seen = set()
     for index, root in enumerate(bag_roots(server)):
@@ -443,6 +444,50 @@ def apply_stable_dock(definition, log_map):
     return definition
 
 
+def _open_field_active():
+    """当前场地是不是"无地图"日志造出来的空白场地。"""
+    definition = world.MAPS.get(getattr(world, "MAP_ID", None)) or {}
+    return bool(definition.get("open_field"))
+
+
+def _remember_frame(queue, replay, use_log_map):
+    """连续播放时记住本包"日志坐标 → 仿真坐标"的换算，下一包沿用它。
+
+    同一批日志（同一次录制）是分段录的，段与段的位姿首尾相接；但没带 whole_map 的
+    日志只能把轨迹"居中摆到场地里"，每包各自居中就会在换包时跳到别处。所以把本包
+    实际用的换算记下来（统一成 origin=0 的等价形式），同处一段空白场地上的下一包
+    直接沿用。
+    """
+    if not queue or not queue.get("active") or not use_log_map or replay is None:
+        return
+    dx, dy = replay.offset
+    scale = float(getattr(replay, "scale", 1.0) or 1.0)
+    queue["frame_transform"] = {
+        "origin": [0.0, 0.0],
+        "scale": round(scale, 6),
+        "offset": [round(float(dx), 6), round(float(dy), 6)],
+    }
+
+
+# 相邻两包"日志坐标 → 仿真坐标"换算差多少算换了场地（m）。同一张地图的几段日志
+# 会有几毫米~几厘米的差别，不算换场地；清成空白地图 / 换一张地图才会明显不同。
+FRAME_CHANGED_TOLERANCE = 0.05
+
+
+def _frame_changed(before, after):
+    """两包的坐标换算是否变了：变了就等于"场地换了"，旧轨迹/旧点云都作废。"""
+    if not before or not after:
+        return True
+    if abs(float(before.get("scale", 1.0)) - float(after.get("scale", 1.0))) > 1e-3:
+        return True
+    old = before.get("offset") or [0.0, 0.0]
+    new = after.get("offset") or [0.0, 0.0]
+    return any(
+        abs(float(new[index]) - float(old[index])) > FRAME_CHANGED_TOLERANCE
+        for index in (0, 1)
+    )
+
+
 def load_bag(httpd, name, use_log_map=True):
     """解析日志并载入回放；日志自带地图时同时把它建成仿真场地。"""
     path = resolve_bag(httpd, name)
@@ -450,6 +495,10 @@ def load_bag(httpd, name, use_log_map=True):
     transform = None
     log_map = (info.get("maps") or {}).get("whole_map")
     manager = httpd.manager
+    queue = getattr(httpd, "bag_queue", None) or {}
+    # 没地图的日志 = 机器把地图删了正在重新建图/本来就无图：场地先清成空白，机器人
+    # 放到空白地图中心；已经在空白场地上（同一段建图的下一包）就继续用那块并沿用换算。
+    carrying = bool(queue.get("active")) and use_log_map and not log_map and _open_field_active()
     if use_log_map:
         label = os.path.splitext(os.path.basename(path))[0].split("_")[0] or "日志"
         definition = None
@@ -468,22 +517,40 @@ def load_bag(httpd, name, use_log_map=True):
                 print("日志地图构造失败：{}".format(exc))
                 definition = None
         if definition is None:
-            # 日志里没有地图：给一块没有边界、没有障碍的开阔场地，不限制机器人活动
-            bounds = (info.get("summary") or {}).get("bounds") or {}
-            span_x = max(0.0, float(bounds.get("x1", 0.0)) - float(bounds.get("x0", 0.0)))
-            span_y = max(0.0, float(bounds.get("y1", 0.0)) - float(bounds.get("y0", 0.0)))
-            definition = map_import.build_open_field(
-                span_x, span_y, name="{}·无地图".format(label)
-            )
-        try:
-            transform = definition.get("replay_transform")
-            manager = rebuild_system(httpd, definition)
-        except Exception as exc:  # 场地构造失败时退回当前地图
-            print("日志场地构造失败：{}".format(exc))
-            transform = None
-            manager = httpd.manager
+            carried = queue.get("frame_transform") if carrying else None
+            if carried:
+                # 同一段建图的下一包（机器人还没建出图）：沿用上一包的换算，留在
+                # 同一块空白场地上，换包时机器人的绝对位置不会跳。
+                transform = dict(carried)
+                manager = httpd.manager
+            else:
+                # 日志里没有地图：给一块没有边界、没有障碍的空白场地（机器人摆到
+                # 场地中心），不限制它活动；前一张地图连同其历史点云一起作废。
+                bounds = (info.get("summary") or {}).get("bounds") or {}
+                span_x = max(0.0, float(bounds.get("x1", 0.0)) - float(bounds.get("x0", 0.0)))
+                span_y = max(0.0, float(bounds.get("y1", 0.0)) - float(bounds.get("y0", 0.0)))
+                definition = map_import.build_open_field(
+                    span_x, span_y, name="{}·无地图".format(label)
+                )
+        if definition is not None:
+            try:
+                transform = definition.get("replay_transform")
+                manager = rebuild_system(httpd, definition)
+            except Exception as exc:  # 场地构造失败时退回当前地图
+                print("日志场地构造失败：{}".format(exc))
+                transform = None
+                manager = httpd.manager
     manager.load_replay(info, transform)
     replay = manager.replay
+    if getattr(httpd, "bag_queue", None) is queue:
+        # 载入期间可能已经起了新队列：不是同一个队列就不写，免得污染新队列
+        before = queue.get("frame_transform")
+        _remember_frame(queue, replay, use_log_map)
+        if _frame_changed(before, queue.get("frame_transform")):
+            # 场地换了（清成空白地图 / 换了一张日志地图）：上一张图上的轨迹与历史
+            # 点云都作废——`world.epoch` 变了，前端据此重新起笔
+            world.bump_map_epoch()
+            clear_cloud_history(httpd)
     if replay is not None and replay.track:
         # 起点/车体跟着日志第一帧走；**充电桩不要跟着动** —— 之前这里把桩直接搬到
         # 回放起点，连续播放时每换一个包桩就跳一次，"充电桩老是换地方"就是这么来的。
@@ -491,13 +558,48 @@ def load_bag(httpd, name, use_log_map=True):
         pose = (round(first[1], 4), round(first[2], 4), round(first[3], 4))
         world.START.update({"x": pose[0], "y": pose[1], "theta": pose[2]})
         manager.robot.pose = [pose[0], pose[1], pose[2]]
+    apply_log_dock(info, manager, use_log_map)
     return manager, info, path
+
+
+def apply_log_dock(info, manager, use_log_map=True):
+    """充电桩摆放：**日志里明确给了桩位才画**，否则回放期间图上不放桩。
+
+    * 日志里有桩位话题（`bag_reader.DOCK_HINTS`）→ 按日志坐标换算到仿真坐标摆放；
+    * 没有 → `world.DOCK_VISIBLE = False`（内部 DOCK 仍保留一个锚点给任务用）；
+    * 回放跑在仿真自己的场地上（`use_log_map=False`）时，桩是真实的，照常显示。
+    """
+    replay = getattr(manager, "replay", None)
+    dock = (info or {}).get("dock")
+    if not use_log_map:
+        world.DOCK_VISIBLE = True
+        return False
+    if not dock:
+        world.DOCK_VISIBLE = False
+        return False
+    scale = replay.scale if replay is not None and replay.transform else 1.0
+    if replay is not None and replay.transform:
+        dx, dy = replay.map_offset
+    elif replay is not None:
+        dx, dy = replay.offset
+    else:
+        dx = dy = 0.0
+    world.DOCK.update(
+        {
+            "x": round(float(dock[0]) * scale + dx, 3),
+            "y": round(float(dock[1]) * scale + dy, 3),
+            "r": world.DOCK_RADIUS,
+        }
+    )
+    world.DOCK_VISIBLE = True
+    return True
 
 
 # 连续播放时历史感知点云一直留着：换包只换"当前这一段"，前面的点云不清。
 # 界面上的「清理地图」才会真正清掉（顺便清掉轨迹）。
 CLOUD_HISTORY_POINTS = 24000
 CLOUD_MAX_POINTS = 6000
+# 历史点云（连续播放时前面几段日志）统一按"半程年龄"淡出：看得见但压不当前段的新点
 
 
 def cloud_history(server):
@@ -508,6 +610,26 @@ def cloud_history(server):
     return history
 
 
+def history_points(chunk):
+    """历史条目的点（兼容旧的"裸点列表"写法）。"""
+    if isinstance(chunk, dict):
+        return chunk.get("points") or []
+    return chunk or []
+
+
+def history_base_wall(chunk):
+    """这条历史的"基准墙钟"：``base - ages[i]`` 就是第 i 个点的观测时刻。"""
+    if isinstance(chunk, dict):
+        return chunk.get("base")
+    return None
+
+
+def history_ages(chunk):
+    if isinstance(chunk, dict):
+        return chunk.get("ages") or []
+    return []
+
+
 def archive_replay_cloud(server):
     """换包前把当前这段日志的点云整段存进历史。"""
     manager = getattr(server, "manager", None)
@@ -515,17 +637,30 @@ def archive_replay_cloud(server):
     if replay is None:
         return 0
     try:
-        cloud = replay.cloud_at(float("inf"), max_points=6000)
+        # 只归档"当前留存窗口内"的点（以前用 inf，会把整包 150 s 的点都存进来，
+        # 存的时候又统一盖成"换包那一刻"的年龄，于是这些点到了下一包永远不会过期）
+        cloud = replay.cloud_at(float(replay.time), max_points=6000)
     except Exception:
         return 0
     points = (cloud or {}).get("points") or []
+    ages = list((cloud or {}).get("ages") or [])
     if not points:
         return 0
+    # 每个点的观测墙钟 = base - ages[i]；跨包老化按真实时间算
+    wall_start = getattr(replay, "wall_start", None)
+    base = round(float(wall_start) + float(replay.time), 3) if wall_start else None
     history = cloud_history(server)
-    history.append([float(value) for value in points])
-    total = sum(len(chunk) // 2 for chunk in history)
+    history.append(
+        {
+            "points": [float(value) for value in points],
+            "ages": [float(value) for value in ages],
+            "base": base,
+            "name": replay.name,
+        }
+    )
+    total = sum(len(history_points(chunk)) // 2 for chunk in history)
     while len(history) > 1 and total > CLOUD_HISTORY_POINTS:
-        total -= len(history.pop(0)) // 2
+        total -= len(history_points(history.pop(0))) // 2
     return len(points) // 2
 
 
@@ -533,45 +668,90 @@ def clear_cloud_history(server):
     server.bag_cloud_history = []
 
 
-def _downsample_cloud(points, max_points):
+def _downsample_cloud(points, max_points, ages=None):
     total = len(points) // 2
     if total <= max_points or max_points <= 0:
-        return points, total
+        return points, total, ages if ages is not None else []
     stride = int(math.ceil(total / float(max_points)))
     picked = []
+    picked_ages = [] if ages is not None else None
     for index in range(0, total, stride):
         picked.append(points[index * 2])
         picked.append(points[index * 2 + 1])
-    return picked, total
+        if picked_ages is not None:
+            picked_ages.append(ages[index] if index < len(ages) else 0.0)
+    return picked, total, picked_ages if picked_ages is not None else []
 
 
 def combined_cloud(server, time_value):
-    """历史点云（前面几段日志）+ 当前日志截至 ``time_value`` 的点云。"""
+    """历史点云（前面几段日志）+ 当前日志截至 ``time_value`` 的点云。
+
+    历史点云同样受 `CLOUD_FADE_SECONDS` 约束：按**墙钟**算年龄（每段日志录制时刻
+    在日志头里），超过留存窗口的直接不返回——以前给它一个固定的"半程年龄"，
+    换成下一包以后这些点就永远不会消失了。
+    """
     manager = getattr(server, "manager", None)
     replay = getattr(manager, "replay", None) if manager is not None else None
     history = list(cloud_history(server))
     current = None
+    wall_now = None
     if replay is not None:
         try:
             current = replay.cloud_at(time_value)
         except Exception:
             current = None
+        # 用查询时刻的墙钟（和 cloud_at 的 time_value 对齐），日志没有墙钟就算不出来
+        wall_start = getattr(replay, "wall_start", None)
+        if wall_start:
+            wall_now = float(wall_start) + float(time_value)
     current_points = list((current or {}).get("points") or [])
-    if not history and not current_points:
-        return None
+    current_ages = list((current or {}).get("ages") or [])
+    fade = bag_player.CLOUD_FADE_SECONDS
     points = []
+    ages = []
+    bags = 0
     for chunk in history:
-        points.extend(chunk)
-    history_points = len(points) // 2
+        chunk_points = list(history_points(chunk))
+        if not chunk_points:
+            continue
+        base = history_base_wall(chunk)
+        if base is None or wall_now is None:
+            # 没有墙钟（老格式/测试里手工塞的裸点）→ 无法判断年龄，按已过期处理
+            continue
+        chunk_ages = list(history_ages(chunk))
+        kept = 0
+        for index in range(len(chunk_points) // 2):
+            seen_age = chunk_ages[index] if index < len(chunk_ages) else 0.0
+            # 这个点是 base - seen_age 时刻观测的，到"现在"多老了
+            age = max(0.0, float(wall_now) - (float(base) - float(seen_age)))
+            if age >= fade:
+                continue
+            points.append(chunk_points[index * 2])
+            points.append(chunk_points[index * 2 + 1])
+            ages.append(round(age, 1))
+            kept += 1
+        if kept:
+            bags += 1
+    history_total = len(points) // 2
+    if not points and not current_points:
+        return None
     points.extend(current_points)
-    picked, total = _downsample_cloud(points, CLOUD_MAX_POINTS)
+    ages.extend(current_ages[: len(current_points) // 2])
+    picked, total, picked_ages = _downsample_cloud(points, CLOUD_MAX_POINTS, ages)
+    stride = 1
+    if total > CLOUD_MAX_POINTS > 0:
+        stride = int(math.ceil(total / float(CLOUD_MAX_POINTS)))
+    # 历史点排在最前面，按同样的步长抽稀后还剩多少个
+    history_kept = int(math.ceil(history_total / float(stride))) if history_total else 0
     return {
         "points": picked,
+        "ages": picked_ages,
+        "fade": fade,
         "count": len(picked) // 2,
         "total": total,
         "frames": int((current or {}).get("frames") or 0),
-        "history": history_points,
-        "bags": len(history),
+        "history": history_kept,
+        "bags": bags,
     }
 
 
@@ -853,6 +1033,8 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/command":
                 if manager.task is not None:
                     manager.stop_task("手动接管，当前任务已取消", resumable=False)
+                # 手动接管后电量按仿真正常放电（回放时钉在日志值上的锁要解开）
+                manager.release_battery_lock()
                 self.server.robot.handle_command(
                     payload.get("command"),
                     payload.get("linear"),
@@ -861,6 +1043,8 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
             elif path == "/api/task":
                 if getattr(self.server, "editor", None) is not None:
                     raise ValueError("地图编辑中：请先保存地图或取消编辑，再开始任务")
+                # 开始任务是仿真自己的作业，桩照常显示（回放里"日志没给桩位"的状态到此结束）
+                world.DOCK_VISIBLE = True
                 task_type = payload.get("task")
                 if task_type == "map":
                     manager.start_mapping()
@@ -877,6 +1061,7 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
             elif path == "/api/reset":
                 self.server.bag_queue = None
                 clear_cloud_history(self.server)
+                world.DOCK_VISIBLE = True
                 manager.clear_replay()
                 self.server.robot.reset()
                 self.server.grid.reset_map()
@@ -1258,7 +1443,12 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "接口不存在"}, status=404)
                 return
         except ValueError as exc:
-            self._send_json({"error": str(exc)}, status=400)
+            # 地图编辑的错误带错误码（E01…），单独回给前端方便显示/排查
+            payload = {"error": str(exc)}
+            if getattr(exc, "code", None):
+                payload["code"] = exc.code
+                payload["number"] = getattr(exc, "number", None)
+            self._send_json(payload, status=400)
             return
         except Exception as exc:  # pragma: no cover - 兜底：内部异常也要给出可读反馈
             # 以前这里会把异常抛给 socketserver，浏览器只看到连接被重置/500 空响应，
@@ -1281,6 +1471,8 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
         state["speed"] = self.server.simulator.speed
         state["map_id"] = world.MAP_ID
         state["map_name"] = world.MAP_NAME
+        # 回放时日志里没有明确桩位 → 界面上不放桩，遥测里的"距桩/回充预留"也留空
+        state["dock_visible"] = world.DOCK_VISIBLE
         state["config"] = dict(config.settings.__dict__)
         state["bag"] = self.server.manager.replay_state()
         # 连续播放的状态也放进主状态里：界面的轨迹逻辑要按它判断"是不是在连续播"，

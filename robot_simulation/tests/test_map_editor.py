@@ -127,8 +127,8 @@ class DraftDeleteTest(unittest.TestCase):
     def test_hit_test_prefers_surface_elements(self):
         self.draft.add_region(square(6.0, 6.0, 3.0))
         self.draft.add_dock(6.0, 6.0, 0.45)
-        zone = self.draft.add_no_go(4.0, 4.0, 8.0, 8.0)
-        hit = self.draft.hit_test(6.0, 6.0)
+        zone = self.draft.add_no_go(8.2, 8.2, 9.0, 9.0)
+        hit = self.draft.hit_test(8.6, 8.6)
         self.assertEqual(hit["kind"], "no_go")
         self.assertEqual(hit["id"], zone["id"])
 
@@ -202,8 +202,9 @@ class DraftSaveTest(unittest.TestCase):
     def test_definition_carries_dock_obstacles_and_flag(self):
         self.draft.add_region(square(6.0, 6.0, 3.0))
         self.draft.add_dock(6.0, 6.0, 0.45)
-        self.draft.add_no_go(3.6, 3.6, 4.4, 4.4)
-        self.draft.add_static([(8.0, 8.0)], 0.30)
+        # 禁区 / 障碍物必须离充电桩 3 m 以上
+        self.draft.add_no_go(8.8, 3.4, 9.6, 4.2)
+        self.draft.add_static([(8.8, 8.8)], 0.30)
         self.draft.add_dynamic(9.0, 10.0, 0.3, 1.6, 0.5)
         self.assertTrue(self.draft.can_save())
         definition = self.draft.to_definition()
@@ -367,7 +368,7 @@ class DynamicDraftTest(unittest.TestCase):
     def test_dynamic_keeps_custom_path_and_speed(self):
         draft = map_editor.Draft()
         draft.add_region(square(6.0, 6.0, 4.0))
-        draft.add_dock(6.0, 6.0, 0.45)
+        draft.add_dock(9.0, 3.0, 0.45)
         item = draft.add_dynamic(6.0, 6.0, 0.30, 1.0, 0.0)
         self.assertAlmostEqual(item["speed"], world.DYNAMIC_SPEED, places=3)
         updated = draft.update_dynamic(
@@ -393,8 +394,9 @@ class RoundTripTest(unittest.TestCase):
         draft.add_region(square(20.0, 6.0, 4.0))
         draft.add_dock(6.0, 6.0, 0.45)
         draft.add_passage([(9.6, 6.0), (16.4, 6.0)])
-        draft.add_static([(8.0, 8.0)], 0.40)
-        draft.add_no_go(5.0, 8.5, 7.0, 9.5)
+        # 离桩 3 m 以外（桩在 (6, 6)）
+        draft.add_static([(9.2, 9.2)], 0.40)
+        draft.add_no_go(8.4, 8.0, 9.6, 9.0)
         draft.add_dynamic(19.0, 8.0, 0.30, 2.0, 0.0, 18.0, 8.0, 20.0, 8.0, speed=0.30)
         self.definition = draft.to_definition("往返")
 
@@ -497,6 +499,98 @@ class PassageOverlapTest(unittest.TestCase):
         self.assertEqual(self.grid.zone_id_map[self.grid.index(*self.grid.cell_of(wx, wy))], 0)
 
 
+class EditorErrorCodeTest(unittest.TestCase):
+    """错误码（沿用上级系统协议）+ 充电桩 3 m 净空。"""
+
+    def setUp(self):
+        self.draft = map_editor.Draft("错误码")
+        self.draft.add_region(square(14.0, 14.0, 6.0))   # 8..20
+        self.draft.add_region(square(29.0, 14.0, 5.0))   # 24..34
+        self.draft.add_dock(14.0, 14.0, 0.45)
+
+    def expect(self, code, fn):
+        with self.assertRaises(map_editor.EditorError) as ctx:
+            fn()
+        self.assertEqual(ctx.exception.code, code)
+        self.assertTrue(str(ctx.exception).startswith("E%02d" % ctx.exception.number))
+        return str(ctx.exception)
+
+    def test_passage_needs_a_region_first(self):
+        draft = map_editor.Draft("空")
+        text = self.expect("NO_ENOUGH_WORKAREA_BEFORE_CREATE_TIE",
+                           lambda: draft.add_passage([(10, 10), (12, 10)]))
+        self.assertIn("创建通道前请先画至少一个区域", text)
+
+    def test_no_go_needs_a_region_first(self):
+        draft = map_editor.Draft("空")
+        self.expect("NO_MAP_AND_CREATE_NOT_WORKAREA",
+                    lambda: draft.add_no_go(10, 10, 12, 12))
+
+    def test_no_go_too_close_to_dock(self):
+        text = self.expect("FORBIDDEN_NEAR_STATION",
+                           lambda: self.draft.add_no_go(15.0, 14.6, 16.0, 15.6))
+        self.assertIn("3 m", text)
+        self.assertEqual(self.draft.no_gos, [])
+
+    def test_no_go_far_from_dock_is_allowed(self):
+        item = self.draft.add_no_go(18.0, 18.0, 19.0, 19.0)
+        self.assertEqual(item["kind"], "no_go")
+
+    def test_brush_obstacle_too_close_to_dock(self):
+        self.expect("FORBIDDEN_NEAR_STATION",
+                    lambda: self.draft.add_static([(14.5, 14.5), (15.0, 15.0)], 0.3))
+        self.assertEqual(self.draft.static, [])
+
+    def test_polygon_obstacle_too_close_to_dock(self):
+        self.expect("FORBIDDEN_NEAR_STATION",
+                    lambda: self.draft.add_obstacle_polygon(
+                        [(13.0, 13.0), (14.0, 13.0), (14.0, 14.0)]))
+        self.assertEqual(self.draft.poly_obstacles, [])
+
+    def test_dynamic_obstacle_too_close_to_dock(self):
+        self.expect("FORBIDDEN_NEAR_STATION",
+                    lambda: self.draft.add_dynamic(13.0, 13.0, 0.3, 2.0, 0.0))
+        self.assertEqual(self.draft.dynamic, [])
+
+    def test_dock_cannot_be_placed_next_to_obstacle(self):
+        draft = map_editor.Draft("桩")
+        draft.add_region(square(14.0, 14.0, 8.0))
+        draft.add_static([(15.0, 15.0), (16.0, 15.5)], 0.4)
+        self.expect("CREATE_CHARGE_STATION_FAIL",
+                    lambda: draft.add_dock(15.5, 17.6, 0.45))
+        draft.add_dock(20.0, 20.0, 0.45)
+        self.assertEqual(len(draft.docks), 1)
+
+    def test_passage_crossing_no_go_is_rejected(self):
+        # 禁区放在离桩 (14, 14) 3 m 以外的通道上
+        self.draft.add_no_go(16.0, 9.0, 18.0, 11.0)
+        self.expect("PATH_CROSSING_FORBIDDEN",
+                    lambda: self.draft.add_passage([(10.0, 10.0), (28.0, 10.0)]))
+
+    def test_no_go_crossing_passage_is_rejected(self):
+        self.draft.add_passage([(10.0, 10.0), (28.0, 10.0)])
+        self.expect("FORBIDDEN_CROSSING_PATH",
+                    lambda: self.draft.add_no_go(15.0, 9.0, 17.0, 11.0))
+
+    def test_passage_endpoints_must_be_in_two_regions(self):
+        self.expect("START_AND_END_POINT_OF_TUNNEL_NOT_IN_DIFFERENT_AREAS",
+                    lambda: self.draft.add_passage([(5.0, 5.0), (28.0, 14.0)]))
+        self.expect("START_AND_END_POINT_OF_TUNNEL_NOT_IN_DIFFERENT_AREAS",
+                    lambda: self.draft.add_passage([(10.0, 10.0), (11.0, 11.0)]))
+        corridor = self.draft.add_passage([(10.0, 14.0), (28.0, 14.0)])
+        self.assertEqual(corridor["kind"], "passage")
+
+    def test_passage_point_out_of_canvas(self):
+        self.expect("START_POINT_OF_TIE_IS_OUT_OF_MAP",
+                    lambda: self.draft.add_passage([(120.0, 14.0), (28.0, 14.0)]))
+        self.expect("END_POINT_OF_TIE_IS_OUT_OF_MAP",
+                    lambda: self.draft.add_passage([(10.0, 14.0), (28.0, 140.0)]))
+
+    def test_delete_missing_element_has_code(self):
+        self.expect("CANT_FIND_SPECIFIC_ID",
+                    lambda: self.draft.delete("dock", 999))
+
+
 class RegionPartitionTest(unittest.TestCase):
     """地图编辑器保存的地图：用户画了几个区域，割草就分几个区域。"""
 
@@ -577,7 +671,7 @@ class UndoTest(unittest.TestCase):
     def setUp(self):
         self.draft = map_editor.Draft("撤销")
         self.draft.add_region(square(6.0, 6.0, 4.0))
-        self.draft.add_dock(6.0, 6.0, 0.45)
+        self.draft.add_dock(9.0, 3.0, 0.45)
 
     def test_undo_restores_deleted_element(self):
         brush = self.draft.add_static([(4.5, 4.5), (5.0, 4.5)], 0.3)
@@ -600,9 +694,9 @@ class UndoTest(unittest.TestCase):
         self.assertEqual(len(self.draft.passages), 1)
 
     def test_failed_action_does_not_consume_undo(self):
-        self.draft.add_no_go(4.0, 4.0, 8.0, 8.0)
+        self.draft.add_no_go(2.5, 2.5, 3.5, 3.5)
         with self.assertRaises(ValueError):
-            self.draft.add_no_go(4.0, 4.0, 4.1, 4.1)
+            self.draft.add_no_go(2.5, 2.5, 2.6, 2.6)
         self.draft.undo()
         self.assertEqual(len(self.draft.no_gos), 0)
         # 失败的操作没有占掉一层历史：再撤一步能退回到"没有充电桩"的状态
@@ -629,7 +723,7 @@ class BrushGeometryTest(unittest.TestCase):
         draft = map_editor.Draft("笔迹")
         draft.add_region(square(6.0, 6.0, 4.0))
         draft.add_dock(6.0, 6.0, 0.45)
-        draft.add_static([(5.0, 5.0), (6.0, 5.0), (7.0, 5.5)], 0.35)
+        draft.add_static([(8.6, 8.6), (9.4, 8.6), (10.0, 9.2)], 0.35)
         definition = draft.to_definition("笔迹")
         painted = [item for item in definition["obstacles"] if item["area"] > 0.5]
         self.assertEqual(len(painted), 1)

@@ -1,5 +1,6 @@
 """日志读取与回放测试：用临时 sqlite bag 覆盖解析、映射与吻合度统计。"""
 
+import datetime
 import math
 import os
 import sqlite3
@@ -65,6 +66,51 @@ def _pose_message(timestamp, x, y, yaw, wall_ns=None):
         stamp_field = _field_bytes(2, _varint(1 << 3) + _varint(int(timestamp * 1000)))
     header = _field_bytes(1, seq) + stamp_field
     return _field_bytes(1, header) + _field_bytes(3, body)
+
+
+def _pose_stamped_message(timestamp, x, y, yaw=0.0):
+    """PoseStamped：field1=header、field2=pose{1:position, 2:orientation}。"""
+    header = (
+        _field_bytes(1, _varint(1 << 3) + _varint(1))
+        + _field_bytes(2, _varint(1 << 3) + _varint(int(timestamp * 1000)))
+        + _field_bytes(3, b"world")
+    )
+    half = yaw / 2.0
+    position = _field_double(1, x) + _field_double(2, y) + _field_double(3, 0.0)
+    orientation = (
+        _field_double(1, 0.0)
+        + _field_double(2, 0.0)
+        + _field_double(3, math.sin(half))
+        + _field_double(4, math.cos(half))
+    )
+    body = _field_bytes(1, position) + _field_bytes(2, orientation)
+    return _field_bytes(1, header) + _field_bytes(2, body)
+
+
+def build_dock_bag(path, dock=(3.0, 2.0), dock_topic=b"dock_pose"):
+    """一条带"充电桩位置"话题的日志（桩位是日志里明确发布的）。"""
+    con = sqlite3.connect(path)
+    con.execute("create table Zmqmsg (TOPIC BLOB NOT NULL, TI REAL NOT NULL, DA BLOB NOT NULL)")
+    start = 1000.0
+    for index in range(30):
+        stamp = start + index * 0.1
+        x = 0.1 * index
+        con.execute(
+            "insert into Zmqmsg values (?, ?, ?)",
+            (b"base_pose", stamp,
+             _pose_message(stamp, x, 0.0, 0.0, wall_ns=WALL_NS + index * 100000000)),
+        )
+        con.execute(
+            "insert into Zmqmsg values (?, ?, ?)",
+            (b"tf_dynamic", stamp, _tf_message(stamp, x, 2.0, 0.0)),
+        )
+    con.execute(
+        "insert into Zmqmsg values (?, ?, ?)",
+        (dock_topic, start, _pose_stamped_message(start, dock[0], dock[1])),
+    )
+    con.commit()
+    con.close()
+    return path
 
 
 def _map_message(timestamp, resolution, width, height, origin, cells):
@@ -172,7 +218,7 @@ def _add_images(con, start, topic="perception_debug_image", frames=((0.0, JPEG_A
         )
 
 
-def build_bag(path, samples=120, dt=0.1, with_images=False):
+def build_bag(path, samples=120, dt=0.1, with_images=False, origin=(0.0, 0.0)):
     con = sqlite3.connect(path)
     con.execute("create table Zmqmsg (TOPIC BLOB NOT NULL, TI REAL NOT NULL, DA BLOB NOT NULL)")
     start = 1000.0
@@ -184,6 +230,8 @@ def build_bag(path, samples=120, dt=0.1, with_images=False):
         else:
             x, y = 0.03 * (samples // 2), 0.0
             yaw = math.radians(6.0 * (index - samples // 2))
+        x += float(origin[0])
+        y += float(origin[1])
         con.execute(
             "insert into Zmqmsg values (?, ?, ?)",
             (b"base_pose", start + t, _pose_message(start + t, x, y, yaw)),
@@ -287,7 +335,16 @@ def _tf_message(timestamp, x, y, yaw, child="base_link1"):
 WALL_NS = 1789000000 * 1000000000  # 测试用的墙钟起点（Unix 纪元，纳秒）
 
 
-def _cloud_message(timestamp, points, frustum=((3.0, -3.0, -2.0), (3.0, 3.0, -2.0))):
+# 真实的深度相机视锥角点（相机帧，z = -2 是角点占位）：近端 0.45 m、远端 1.35 m 的梯形
+CLOUD_FRUSTUM = (
+    (0.45, -0.13, -2.0),
+    (0.45, 0.13, -2.0),
+    (1.35, -0.80, -2.0),
+    (1.35, 0.80, -2.0),
+)
+
+
+def _cloud_message(timestamp, points, frustum=CLOUD_FRUSTUM):
     """PointCloud2 风格障碍物点云：field3=width、6=point_step、8=data。"""
     header = (
         _field_bytes(1, _varint(1 << 3) + _varint(1))
@@ -307,7 +364,11 @@ def _cloud_message(timestamp, points, frustum=((3.0, -3.0, -2.0), (3.0, 3.0, -2.
     )
 
 
-def build_map_frame_bag(path, samples=120, dt=0.1, clouds=False, wall_offset_ns=0):
+COSTMAP_SIDE = 120   # 代价地图窗口 120 格 × 0.05 m = 6 m
+
+
+def build_map_frame_bag(path, samples=120, dt=0.1, clouds=False, wall_offset_ns=0,
+                        fixed_costmap=False, include_map=True):
     """位姿在"局部坐标系"里、但 tf 里有地图坐标系真实位姿、代价地图窗口随车滚动的日志。"""
     con = sqlite3.connect(path)
     con.execute("create table Zmqmsg (TOPIC BLOB NOT NULL, TI REAL NOT NULL, DA BLOB NOT NULL)")
@@ -317,13 +378,16 @@ def build_map_frame_bag(path, samples=120, dt=0.1, clouds=False, wall_offset_ns=
     for row in range(20, 60):
         for col in range(20, 100):
             whole[row * side + col] = 0
-    con.execute(
-        "insert into Zmqmsg values (?, ?, ?)",
-        (b"whole_map", start, _map_message(start, 0.05, side, side, (0.0, 0.0), bytes(whole))),
-    )
-    cells = bytearray([0] * (40 * 40))
-    for row in range(0, 40):
-        cells[row * 40] = 100
+    if include_map:
+        con.execute(
+            "insert into Zmqmsg values (?, ?, ?)",
+            (b"whole_map", start, _map_message(start, 0.05, side, side, (0.0, 0.0), bytes(whole))),
+        )
+    # 窗口 6 m × 6 m（0.05 m 一格）：要能把相机前方 2 m 内的点云套进来，
+    # 否则"点云只保留在代价地图范围内"会把测试点全裁掉
+    cells = bytearray([0] * (COSTMAP_SIDE * COSTMAP_SIDE))
+    for row in range(0, COSTMAP_SIDE):
+        cells[row * COSTMAP_SIDE] = 100
     for index in range(samples):
         stamp = start + index * dt
         # 局部坐标系位姿（带 90° 旋转，和地图坐标系不同）
@@ -346,7 +410,14 @@ def build_map_frame_bag(path, samples=120, dt=0.1, clouds=False, wall_offset_ns=
             con.execute(
                 "insert into Zmqmsg values (?, ?, ?)",
                 (b"grid_costmap", stamp,
-                 _map_message(stamp, 0.05, 40, 40, (world_x - 1.0, 1.0), bytes(cells))),
+                 _map_message(
+                     stamp, 0.05, COSTMAP_SIDE, COSTMAP_SIDE,
+                     (
+                         1.5 - COSTMAP_SIDE * 0.05 / 2.0 if fixed_costmap else world_x - COSTMAP_SIDE * 0.05 / 2.0,
+                         2.0 - COSTMAP_SIDE * 0.05 / 2.0,
+                     ),
+                     bytes(cells),
+                 )),
             )
         if clouds:
             con.execute(
@@ -354,6 +425,74 @@ def build_map_frame_bag(path, samples=120, dt=0.1, clouds=False, wall_offset_ns=
                 (b"obstaclecloud", stamp,
                  _cloud_message(stamp, ((1.0, 0.5, 0.10), (1.5, -0.5, 0.20), (2.0, 0.0, 0.05)))),
             )
+    con.commit()
+    con.close()
+    return path
+
+
+def build_cloud_refresh_bag(path, hits=3, misses=6, dt=0.15, obstacle=None,
+                            costmap_value=None):
+    """同一位置先测到障碍、再连续几帧什么都没测到（模拟"同一个地方第二次探测"）。
+
+    ``obstacle`` 可以换成自定义的相机帧点（测亚格精度用）；
+    ``costmap_value`` 给定时同时发布 4 m × 4 m 的局部代价地图（全填这个值），
+    用来验证"代价地图说这里是空地就把旧点云刷掉"。
+    """
+    con = sqlite3.connect(path)
+    con.execute("create table Zmqmsg (TOPIC BLOB NOT NULL, TI REAL NOT NULL, DA BLOB NOT NULL)")
+    start = 1000.0
+    side = 120
+    whole = bytearray([100] * (side * side))
+    for row in range(20, 60):
+        for col in range(20, 100):
+            whole[row * side + col] = 0
+    con.execute(
+        "insert into Zmqmsg values (?, ?, ?)",
+        (b"whole_map", start, _map_message(start, 0.05, side, side, (0.0, 0.0), bytes(whole))),
+    )
+    # 相机正前方 1.2 m 处的一个障碍（相机帧坐标，落在视锥落地面里）
+    if obstacle is None:
+        obstacle = ((1.20, 0.00, 0.06), (1.22, 0.05, 0.06))
+    total = hits + misses
+    if costmap_value is not None:
+        cost_cells = bytes([costmap_value] * (40 * 40))
+        for index in range(total + 2):
+            stamp = start + index * dt
+            con.execute(
+                "insert into Zmqmsg values (?, ?, ?)",
+                (b"grid_costmap", stamp,
+                 _map_message(stamp, 0.1, 40, 40, (0.0, 0.0), cost_cells)),
+            )
+    for index in range(total):
+        stamp = start + index * dt
+        con.execute(
+            "insert into Zmqmsg values (?, ?, ?)",
+            (b"base_pose", stamp,
+             _pose_message(stamp, 0.0, 0.0, 0.0, wall_ns=WALL_NS + index * int(dt * 1e9))),
+        )
+        con.execute(
+            "insert into Zmqmsg values (?, ?, ?)",
+            (b"tf_dynamic", stamp, _tf_message(stamp, 2.0, 2.0, 0.0)),
+        )
+        points = obstacle if index < hits else ()
+        con.execute(
+            "insert into Zmqmsg values (?, ?, ?)",
+            (b"obstaclecloud", stamp, _cloud_message(stamp, points)),
+        )
+    # 位姿源要"真的在动"才会被采用（跨度 ≥2 m）：后面补一段纯位移（不带点云），
+    # 这样上面那几帧点云仍然按 (2.0, 2.0) 的位姿换算。
+    for index in range(1, 25):
+        stamp = start + (total - 1 + index) * dt
+        pose_x = 2.0 + 0.12 * index
+        con.execute(
+            "insert into Zmqmsg values (?, ?, ?)",
+            (b"base_pose", stamp,
+             _pose_message(stamp, pose_x, 0.0, 0.0, wall_ns=WALL_NS + int(stamp * 1e9))),
+        )
+        con.execute(
+            "insert into Zmqmsg values (?, ?, ?)",
+            (b"tf_dynamic", stamp, _tf_message(stamp, pose_x, 2.0, 0.0)),
+        )
     con.commit()
     con.close()
     return path
@@ -491,6 +630,38 @@ class BagReaderTest(unittest.TestCase):
             self.assertAlmostEqual(layer["origin"][0], expect_x, places=2)
             self.assertAlmostEqual(layer["origin"][1], expect_y, places=2)
 
+    def test_list_bags_sorted_by_recorded_time(self):
+        """日志按"录制时间"排序：文件修改时间是拷贝顺序，经常和录制顺序相反。"""
+        nested = os.path.join(self.tmpdir, "逆时针建图")
+        os.makedirs(nested)
+        for name in (
+            "zmqbag_1_2026-08-29-06-34-42.bag",
+            "zmqbag_2_2026-08-29-06-31-33.bag",
+            "zmqbag_3_2026-08-29-06-29-34.bag",
+        ):
+            build_bag(os.path.join(nested, name), samples=4)
+        names = [
+            item["name"]
+            for item in bag_reader.list_bags(self.tmpdir)
+            if item["group"] == "逆时针建图"
+        ]
+        self.assertEqual(
+            names,
+            [
+                "zmqbag_3_2026-08-29-06-29-34.bag",
+                "zmqbag_2_2026-08-29-06-31-33.bag",
+                "zmqbag_1_2026-08-29-06-34-42.bag",
+            ],
+        )
+
+    def test_record_stamp_ignores_epoch_name(self):
+        self.assertIsNone(bag_reader.record_stamp("zmqbag_1_1970-01-01-00-00-08.bag"))
+        self.assertIsNone(bag_reader.record_stamp("clip.bag"))
+        stamp = bag_reader.record_stamp("zmqbag_2_2026-08-29-06-31-33.bag")
+        self.assertAlmostEqual(
+            stamp, datetime.datetime(2026, 8, 29, 6, 31, 33).timestamp(), places=0
+        )
+
     def test_list_bags_groups_subfolders(self):
         nested = os.path.join(self.tmpdir, "掉下台阶侧翻")
         os.makedirs(nested)
@@ -558,6 +729,21 @@ class BagReaderTest(unittest.TestCase):
         levels = [round(value, 1) for _t, value in info["battery"]]
         self.assertEqual(levels, [90.0, 80.0, 70.0])
 
+    def test_dock_topic_is_parsed_when_present(self):
+        """日志里明确发布了桩位话题 → 解出坐标；没有该话题 → None（回放不放桩）。"""
+        path = os.path.join(self.tmpdir, "dock.bag")
+        build_dock_bag(path, dock=(3.25, 2.5))
+        info = bag_reader.read_bag(path)
+        self.assertEqual(info["dock_topic"], "dock_pose")
+        self.assertIsNotNone(info["dock"])
+        self.assertAlmostEqual(info["dock"][0], 3.25, places=3)
+        self.assertAlmostEqual(info["dock"][1], 2.5, places=3)
+
+    def test_bag_without_dock_topic_has_no_dock(self):
+        info = bag_reader.read_bag(self.path)
+        self.assertIsNone(info["dock_topic"])
+        self.assertIsNone(info["dock"])
+
     def test_replay_pins_battery_when_topic_missing(self):
         info = bag_reader.read_bag(self.path)
         world.select_map(1)
@@ -570,7 +756,10 @@ class BagReaderTest(unittest.TestCase):
         for _ in range(200):
             manager.tick(DT)
         self.assertAlmostEqual(robot.battery, 100.0, places=3)
+        # 停止回放后日志仍载着：电量继续钉住，不会因为仿真空转慢慢掉
         manager.stop_replay()
+        self.assertEqual(robot.battery_lock, 100.0)
+        manager.clear_replay()
         self.assertIsNone(robot.battery_lock)
 
     def test_replay_follows_battery_topic(self):
@@ -581,7 +770,9 @@ class BagReaderTest(unittest.TestCase):
         robot = RobotCar()
         manager = TaskManager(robot, GridMap())
         manager.load_replay(info)
-        self.assertIsNone(robot.battery_lock)
+        # 日志有电量话题：回放期间电量直接钉在日志值上（仿真不放电），
+        # 所以暂停回放、甚至回放结束后都不会掉电。
+        self.assertEqual(robot.battery_lock, 90.0)
         manager.start_replay()
         readings = []
         for _ in range(240):
@@ -591,7 +782,17 @@ class BagReaderTest(unittest.TestCase):
             readings.append(robot.battery)
         self.assertLess(max(readings), 91.0)
         self.assertGreater(min(readings), 69.0)
+        # 每一帧都必须精确等于日志里的某个值（以前会额外被仿真放电扣掉一点）
+        levels = {round(value, 1) for _stamp, value in info["battery"]}
+        for reading in readings:
+            self.assertIn(round(reading, 1), levels)
+        manager.pause_replay()
+        for _ in range(200):
+            manager.tick(DT)
+        self.assertGreater(robot.battery, 69.0)
         manager.stop_replay()
+        manager.clear_replay()
+        self.assertIsNone(robot.battery_lock)
 
     def test_reject_missing_bag(self):
         with self.assertRaises(bag_reader.BagError):
@@ -778,6 +979,49 @@ class BagReaderTest(unittest.TestCase):
             replay.state()["wall_time"], info["wall_start"] + target, places=1
         )
 
+    def test_tf_pose_accepted_when_costmap_window_is_fixed(self):
+        """代价地图窗口固定不跟车时，"窗口中心与车位重合"这条判据要跳过。
+
+        往草堆走那批日志就是这个情况：窗口固定 → 用重合判据会把正确的 tf 位姿否掉，
+        回放退回局部坐标，轨迹（弓字）就被摆错位置。
+        """
+        path = os.path.join(self.tmpdir, "fixedcm.bag")
+        build_map_frame_bag(path, fixed_costmap=True)
+        info = bag_reader.read_bag(path)
+        self.assertEqual(info["pose_frame"], "map")
+        self.assertEqual(info["tf_pose"]["name"], "base_link1")
+        # 窗口固定 → 不做窗口重合检查
+        self.assertIsNone(info["tf_pose"]["window_gap"])
+
+    def test_tf_pose_accepted_without_log_map(self):
+        """日志里没有可解析的地图（whole_map 是空消息）时，仍要用 tf 的地图位姿。
+
+        逆时针建图那批日志就是这样：以前必须先有地图才去试 tf 位姿，结果退回
+        base_pose（局部坐标、朝向差几十度），代价地图看着就"位置不对"。
+        """
+        path = os.path.join(self.tmpdir, "nomap.bag")
+        build_map_frame_bag(path, include_map=False)
+        info = bag_reader.read_bag(path)
+        self.assertIsNone((info.get("maps") or {}).get("whole_map"))
+        self.assertEqual(info["pose_frame"], "map")
+        self.assertEqual(info["tf_pose"]["name"], "base_link1")
+        self.assertIsNone(info["tf_pose"]["free_ratio"])
+
+    def test_replay_does_not_react_to_obstacles(self):
+        """日志播放只重放：不扫视觉、不刷障碍层、不显示仿真视觉。"""
+        path = os.path.join(self.tmpdir, "mapframe.bag")
+        build_map_frame_bag(path)
+        info = bag_reader.read_bag(path)
+        world.select_map(1)
+        robot = RobotCar()
+        manager = TaskManager(robot, GridMap())
+        manager.load_replay(info)
+        manager.start_replay()
+        manager.tick(DT)
+        self.assertEqual(robot.vision, [])
+        self.assertEqual(manager.get_state()["ray_scan"], [])
+        self.assertEqual(robot.collisions, 0)
+
     def test_obstacle_cloud_is_mapped_into_map_frame(self):
         """深度相机点云按位姿 + 相机偏移换算到地图坐标，视锥角点跳过。"""
         path = os.path.join(self.tmpdir, "cloud.bag")
@@ -786,10 +1030,11 @@ class BagReaderTest(unittest.TestCase):
         self.assertEqual(info["pose_frame"], "map")
         frames = info["clouds"]
         self.assertEqual(len(frames), 120)
-        stamp, points = frames[0]
+        stamp, points, view = frames[0]
         self.assertAlmostEqual(stamp, 0.0, places=2)
-        # 每帧 3 个真实点（2 个 z=-2 的视锥角点被丢掉）
+        # 每帧 3 个真实点（4 个 z=-2 的视锥角点单独换算成"看过的地面"四边形）
         self.assertEqual(len(points), 6)
+        self.assertEqual(len(view), 8)
         pose_x, pose_y = info["poses"][0][1], info["poses"][0][2]
         cam_x, cam_y = bag_reader.CLOUD_CAMERA_OFFSET
         self.assertAlmostEqual(points[0], round(pose_x + cam_x + 1.0, 2), places=2)
@@ -799,6 +1044,7 @@ class BagReaderTest(unittest.TestCase):
         manager.load_replay(info)
         layer = manager.replay.cloud_at(0.0)
         self.assertEqual(layer["frames"], 1)
+        # 3 个点落在 3 个格子里
         self.assertEqual(layer["count"], 3)
 
     def test_cloud_points_are_shifted_into_simulation_frame(self):
@@ -819,15 +1065,153 @@ class BagReaderTest(unittest.TestCase):
         pose = replay.track[10]
         self.assertAlmostEqual(replay.scale, 1.0, places=3)
         # 累计点云的第一点来自第一帧
-        self.assertAlmostEqual(
-            layer["points"][0], round(info["clouds"][0][1][0] + replay.map_offset[0], 2), places=2
-        )
-        self.assertAlmostEqual(
-            layer["points"][1], round(info["clouds"][0][1][1] + replay.map_offset[1], 2), places=2
-        )
+        expected = [
+            round(info["clouds"][0][1][index] + replay.map_offset[index % 2], 2)
+            for index in range(2)
+        ]
+        got = layer["points"][:2]
+        self.assertLess(math.hypot(got[0] - expected[0], got[1] - expected[1]), 0.3)
         # 离车身不超过 3 m（点云是相机看到的前方障碍）
         self.assertLess(abs(layer["points"][0] - pose[1]), 3.0)
         self.assertLess(abs(layer["points"][1] - pose[2]), 3.0)
+
+    def test_cloud_is_refreshed_when_area_looks_empty_again(self):
+        """同一处第二次探测没东西了：旧点云要被刷掉，而不是一直累积。"""
+        path = os.path.join(self.tmpdir, "refresh.bag")
+        build_cloud_refresh_bag(path, hits=3, misses=bag_player.CLOUD_MISS_LIMIT + 2, dt=0.15)
+        info = bag_reader.read_bag(path)
+        world.select_map(1)
+        manager = TaskManager(RobotCar(), GridMap())
+        manager.load_replay(info)
+        replay = manager.replay
+        # 第 3 帧（最后一次测到障碍）时还有点云：3 帧 × 2 个原始点（不按格子合并）
+        seen = replay.cloud_at(2 * 0.15)
+        self.assertIsNotNone(seen)
+        self.assertEqual(seen["count"], 6)
+        # 中间几帧"看到了但没东西"：不到阈值仍保留（深度相机是稀疏采样，不能一帧就删）
+        almost = replay.cloud_at((3 + bag_player.CLOUD_MISS_LIMIT - 2) * 0.15)
+        self.assertIsNotNone(almost)
+        self.assertEqual(almost["count"], 6)
+        # 连续 CLOUD_MISS_LIMIT 帧都空 → 刷新掉
+        gone = replay.cloud_at((3 + bag_player.CLOUD_MISS_LIMIT) * 0.15)
+        self.assertIsNone(gone)
+
+    def test_cloud_keeps_raw_observation_coordinates(self):
+        """点云保留**原始观测坐标**：不按 0.2 m 格子合并、不吸到格心。
+
+        以前一格只留一个点、坐标还取"亚格平滑值"，画出来是稀疏的描边；RViz 里那层是
+        原始点的"喷雾"，同一处多次观测叠成一片。这里三个点都在同一格，必须原样保留三条。
+        """
+        path = os.path.join(self.tmpdir, "subcell.bag")
+        hits = ((1.20, 0.00, 0.06), (1.24, 0.03, 0.06), (1.22, 0.05, 0.06))
+        build_cloud_refresh_bag(path, hits=3, misses=0, dt=0.15, obstacle=hits)
+        info = bag_reader.read_bag(path)
+        world.select_map(1)
+        manager = TaskManager(RobotCar(), GridMap())
+        manager.load_replay(info)
+        layer = manager.replay.cloud_at(info["duration"])
+        self.assertEqual(layer["count"], 9)   # 3 帧 × 3 点
+        offset = manager.replay.offset
+        raw = info["clouds"][0][1]
+        expected = sorted(
+            (round(raw[index] + offset[0], 2), round(raw[index + 1] + offset[1], 2))
+            for index in range(0, 6, 2)
+        )
+        # 位置原样保留（每帧都测到同样三个点，所以三条会重复出现三次）
+        got = sorted(set(zip(layer["points"][0::2], layer["points"][1::2])))
+        self.assertEqual(got, expected)
+
+    def test_cloud_is_clipped_to_costmap_window(self):
+        """点云只保留在局部代价地图范围内：窗口外的点直接丢掉（和代价地图那层对齐）。
+
+        深度相机最远看 1.35 m，正常情况下都在窗口里；车开远以后留在原地的旧点会跑出
+        10 m 窗口，那时就不再显示——RViz 里那层点云也是"局部"的。
+        """
+        # 一个点在窗口内（相机前方 1.2 m），一个点在窗口外（前方 3 m，超出 2 m 窗口）
+        obstacle = ((1.20, 0.00, 0.06), (3.00, 0.00, 0.06))
+        inside_path = os.path.join(self.tmpdir, "cloudclip.bag")
+        build_cloud_refresh_bag(
+            inside_path, hits=3, misses=0, dt=0.15, obstacle=obstacle, costmap_value=100
+        )
+        info = bag_reader.read_bag(inside_path)
+        world.select_map(1)
+        manager = TaskManager(RobotCar(), GridMap())
+        manager.load_replay(info)
+        layer = manager.replay.cloud_at(info["duration"])
+        self.assertIsNotNone(layer)
+        self.assertEqual(layer["count"], 3)      # 3 帧 × 只有窗口内那 1 个点
+        cam_x, cam_y = bag_reader.CLOUD_CAMERA_OFFSET
+        pose = manager.replay.track[0]
+        expected_x = round(pose[1] + cam_x + obstacle[0][0], 2)
+        self.assertTrue(all(value == expected_x for value in layer["points"][0::2]))
+
+        # 没有代价地图窗口时不裁剪：两个点都在
+        free_path = os.path.join(self.tmpdir, "cloudnoclip.bag")
+        build_cloud_refresh_bag(free_path, hits=3, misses=0, dt=0.15, obstacle=obstacle)
+        info = bag_reader.read_bag(free_path)
+        manager = TaskManager(RobotCar(), GridMap())
+        manager.load_replay(info)
+        layer = manager.replay.cloud_at(info["duration"])
+        self.assertEqual(layer["count"], 6)
+
+    def test_cloud_reports_point_ages_for_fading(self):
+        """每个点要带"距最后一次观测多久"，前端按它淡出；同时下发淡出窗口。"""
+        path = os.path.join(self.tmpdir, "cloudage.bag")
+        build_cloud_refresh_bag(path, hits=3, misses=0, dt=0.15)
+        info = bag_reader.read_bag(path)
+        world.select_map(1)
+        manager = TaskManager(RobotCar(), GridMap())
+        manager.load_replay(info)
+        first = manager.replay.cloud_at(0.0)
+        self.assertEqual(first["count"], len(first["ages"]))
+        self.assertEqual(first["ages"][0], 0.0)
+        self.assertAlmostEqual(first["fade"], bag_player.CLOUD_FADE_SECONDS, places=3)
+        # 之后没有新的观测：年龄跟着回放时间长大（暂停时不会长大，因为按回放时间算）
+        later = manager.replay.cloud_at(10.0)
+        self.assertEqual(later["count"], 6)
+        self.assertGreaterEqual(min(later["ages"]), 9.0)
+        # 超过留存窗口（CLOUD_FADE_SECONDS）就从记忆地图里删掉，而不是只藏起来
+        gone = manager.replay.cloud_at(bag_player.CLOUD_FADE_SECONDS + 0.5)
+        self.assertIsNone(gone)
+        # 一开始就跳到超过窗口的时刻，结果一致（增量老化和从头重建要等价）
+        fresh = TaskManager(RobotCar(), GridMap())
+        fresh.load_replay(info)
+        self.assertIsNone(fresh.replay.cloud_at(bag_player.CLOUD_FADE_SECONDS + 0.5))
+        # 往回拖会重新生成（重建分支不受老化影响）
+        again = manager.replay.cloud_at(0.3)
+        self.assertEqual(again["count"], 6)
+        self.assertLess(max(again["ages"]), 0.35)
+
+    def test_starting_a_task_releases_replay_battery_pin(self):
+        """回放把电量钉在日志值上；开始普通任务后要解下来，否则任务永远不掉电。"""
+        path = os.path.join(self.tmpdir, "batt2.bag")
+        build_battery_bag(path)
+        info = bag_reader.read_bag(path)
+        world.select_map(1)
+        robot = RobotCar()
+        manager = TaskManager(robot, GridMap())
+        manager.load_replay(info)
+        self.assertEqual(robot.battery_lock, 90.0)
+        manager.start_mapping()
+        self.assertIsNone(robot.battery_lock)
+
+    def test_cloud_incremental_state_matches_full_rebuild(self):
+        """按帧增量维护的结果要和"从 0 重建"完全一致（拖进度条来回拖不会错位）。"""
+        path = os.path.join(self.tmpdir, "cloud.bag")
+        build_map_frame_bag(path, clouds=True)
+        info = bag_reader.read_bag(path)
+        world.select_map(1)
+        stepped = TaskManager(RobotCar(), GridMap())
+        stepped.load_replay(info)
+        for step in range(0, 12):
+            layer = stepped.replay.cloud_at(step * 0.9)
+        fresh = TaskManager(RobotCar(), GridMap())
+        fresh.load_replay(info)
+        target = fresh.replay.cloud_at(11 * 0.9)
+        self.assertIsNotNone(layer)
+        self.assertIsNotNone(target)
+        self.assertEqual(layer["total"], target["total"])
+        self.assertEqual(sorted(layer["points"]), sorted(target["points"]))
 
     def test_cloud_accumulates_until_time(self):
         path = os.path.join(self.tmpdir, "cloud.bag")

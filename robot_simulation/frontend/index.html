@@ -139,6 +139,20 @@
           </div>
         </div>
 
+        <div class="measure">
+          <div class="measure-head">
+            <span>📏 距离测量</span>
+            <button id="measureBtn" class="task-btn task-btn--ghost measure-btn" type="button" disabled>开始测量</button>
+          </div>
+          <p class="hint measure-hint" id="measureHint">暂停任务或待机时可在地图上点两个点量距离。</p>
+          <div class="measure-result" id="measureResult" hidden>
+            <div><span>起点</span><strong id="measureA">--</strong></div>
+            <div><span>终点</span><strong id="measureB">--</strong></div>
+            <div><span>距离</span><strong id="measureDist">--</strong></div>
+            <div><span>ΔX / ΔY</span><strong id="measureDelta">--</strong></div>
+          </div>
+        </div>
+
       </section>
 
       <section class="panel" data-module="params" data-drag-panel="params" aria-label="参数设置">
@@ -227,6 +241,7 @@
             <button id="editorPassageCancelBtn" class="task-btn task-btn--ghost" type="button">取消通道</button>
           </div>
           <p class="editor-tip">通道只用来通行：压在区域上的部分照常割草，只有纯通道段不割也不分区。</p>
+          <p class="editor-tip">禁区不能压到通道；通道不能穿过禁区；禁区与障碍物（含动态障碍）必须离充电桩 3 m 以上。</p>
 
           <div class="editor-sub">元素</div>
           <div class="editor-grid editor-grid--4">
