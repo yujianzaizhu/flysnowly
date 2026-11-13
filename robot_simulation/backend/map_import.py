@@ -511,15 +511,16 @@ def build_map_from_grid(
     return definition
 
 
-OPEN_FIELD_MIN = 26.0
+# 空白场地边长（m）：建图/无图日志没有地图，给足 100 × 100 m，机器人怎么绕都够用
+OPEN_FIELD_MIN = 100.0
 OPEN_FIELD_MARGIN = 14.0
 
 
 def build_open_field(span_x=0.0, span_y=0.0, name="日志·无地图"):
     """给没有地图数据的日志造一块开阔场地：没有边界墙、没有障碍物。
 
-    场地尺寸按日志轨迹的跨度自动放大（最小 26 m），充电桩/起点放在正中间，
-    回放轨迹会被摆到场地中心，所以机器人可以在整块场地里自由行驶。
+    场地固定 100 × 100 m（轨迹跨度超过这个尺寸才继续放大），充电桩/起点放在
+    正中间，回放轨迹会被摆到场地中心，所以机器人可以在整块场地里自由行驶。
     """
     width = max(OPEN_FIELD_MIN, float(span_x) + OPEN_FIELD_MARGIN)
     height = max(OPEN_FIELD_MIN, float(span_y) + OPEN_FIELD_MARGIN)

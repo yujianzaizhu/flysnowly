@@ -490,6 +490,7 @@
 
     if (state.map) {
       lastMapPayload = state.map;
+      lastMapKey = state.map.key || null;
       updateMapImage(state.map);
     }
     updatePanels(state);
@@ -506,6 +507,8 @@
 
   let mapPollTick = 0;
   let lastMapPayload = null;
+  // 手上这张位图的指纹（地图号-纪元-栅格版本）：轮询时带上，服务端版本没变就不重发
+  let lastMapKey = null;
 
   let shuttingDown = false;
 
@@ -517,8 +520,13 @@
     mapPollTick += 1;
     const mapEvery = speed >= 8 ? 8 : 4;
     const withMap = speed < 4 || mapPollTick % mapEvery === 0;
+    const params = [];
+    if (!withMap) params.push("map=0");
+    else if (lastMapKey) params.push("map_key=" + encodeURIComponent(lastMapKey));
     try {
-      const state = await request("/api/state" + (withMap ? "" : "?map=0"));
+      const state = await request(
+        "/api/state" + (params.length ? "?" + params.join("&") : "")
+      );
       ingest(state);
       setConnected(true);
     } catch (error) {
@@ -2020,8 +2028,10 @@
 
   // ------------------------------------------------------------- 地图位图
   function updateMapImage(map) {
-    if (!map || map.version === mapVersion) return;
-    mapVersion = map.version;
+    // 指纹里含地图号与纪元：换图后即使栅格版本号又回到 0，也要重画
+    const stamp = map && (map.key || map.version);
+    if (!map || stamp === mapVersion) return;
+    mapVersion = stamp;
     mapCanvas.width = map.cols;
     mapCanvas.height = map.rows;
     const image = mapCtx.createImageData(map.cols, map.rows);

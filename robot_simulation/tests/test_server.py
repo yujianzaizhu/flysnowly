@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -113,6 +114,20 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(state["mowing_mode"], "A")
         for key in ("overall_coverage", "distance", "duration"):
             self.assertIn(key, state["task"])
+
+    def test_state_skips_unchanged_map_bitmap(self):
+        """带上位图指纹再取状态：版本没变就不重发栅格字符画（100 万格的图太大）。"""
+        _status, body = self.get("/api/state")
+        state = json.loads(body)
+        self.assertIn("map", state)
+        key = state["map"]["key"]
+        self.assertTrue(key)
+        _status, body = self.get("/api/state?map_key=" + urllib.parse.quote(key))
+        state = json.loads(body)
+        self.assertIsNone(state.get("map"))
+        # 指纹不对（换了地图/纪元/版本）就照常给位图
+        _status, body = self.get("/api/state?map_key=1-0-9999")
+        self.assertIsNotNone(json.loads(body).get("map"))
 
     def test_map_scan_imports_all_maps_under_directory(self):
         """自动导入：扫描指定目录下所有含 .pgm 的地图并注册，编号复用不重复占号。"""

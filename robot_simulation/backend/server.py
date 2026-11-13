@@ -942,7 +942,9 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/state":
             query = parse_qs(urlsplit(self.path).query)
             with_map = (query.get("map") or ["1"])[0] not in ("0", "false", "")
-            self._send_json(self._state(include_map=with_map))
+            # 前端带上自己手上那张位图的指纹：没变就不重发栅格字符画
+            known = (query.get("map_key") or [None])[0] or None
+            self._send_json(self._state(include_map=with_map, map_key=known))
         elif path == "/api/world":
             self._send_json(world.world_dict())
         elif path == "/api/bag":
@@ -1462,12 +1464,14 @@ class RobotRequestHandler(BaseHTTPRequestHandler):
         self._send_json(self._state())
 
     # --------------------------------------------------------------- 工具
-    def _state(self, include_map=True):
+    def _state(self, include_map=True, map_key=None):
         # 编辑草稿是一块 100 × 100 m 的空场地（100 万格），栅格字符画没有意义，
         # 也不该每几十毫秒往浏览器传一次，编辑期间直接不取栅格。
         if getattr(self.server, "editor", None) is not None:
             include_map = False
-        state = self.server.manager.get_state(include_map=include_map)
+        state = self.server.manager.get_state(
+            include_map=include_map, map_key=map_key
+        )
         state["speed"] = self.server.simulator.speed
         state["map_id"] = world.MAP_ID
         state["map_name"] = world.MAP_NAME

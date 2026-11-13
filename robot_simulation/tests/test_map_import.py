@@ -86,9 +86,15 @@ class OpenFieldTest(unittest.TestCase):
     def test_open_field_covers_small_and_large_tracks(self):
         small = map_import.build_open_field(0.2, 0.3)
         large = map_import.build_open_field(28.0, 4.0)
+        huge = map_import.build_open_field(180.0, 4.0)
+        # 空白场地固定 100 × 100 m 起：小轨迹也给这么大
+        self.assertGreaterEqual(small["width"], 100.0)
+        self.assertGreaterEqual(small["height"], 100.0)
         self.assertAlmostEqual(small["width"], small["height"], places=3)
-        self.assertGreater(large["width"], small["width"])
-        self.assertGreaterEqual(large["width"], 28.0)
+        self.assertAlmostEqual(large["width"], small["width"], places=3)
+        # 轨迹比场地还长时继续放大
+        self.assertGreater(huge["width"], small["width"])
+        self.assertGreaterEqual(huge["width"], 180.0)
 
 
 if __name__ == "__main__":

@@ -4929,14 +4929,26 @@ class TaskManager(object):
         self.phase = "ring"
 
     # ----------------------------------------------------------- 充电与断点
-    def _map_payload(self):
-        """栅格位图按 version 缓存：同一版本重复取状态时不再重新编码。"""
-        version = self.grid.version
+    def _map_key(self):
+        """位图内容指纹：地图号 + 地图纪元 + 栅格版本。换了场地/改过格子都会变。"""
+        return "{}-{}-{}".format(world.MAP_ID, world.MAP_EPOCH, self.grid.version)
+
+    def _map_payload(self, known_key=None):
+        """栅格位图按指纹缓存：同一版本重复取状态时不再重新编码。
+
+        ``known_key`` 是前端手上那张位图的指纹：一致就直接不发（返回 ``None``），
+        前端继续用它缓存的那张图。100 × 100 m 的空白场地有 100 万格，每 100 ms
+        重发一次位图会把界面拖慢。
+        """
+        key = self._map_key()
+        if known_key is not None and known_key == key:
+            return None
         cached = self._map_cache
-        if cached is not None and cached[0] == version:
+        if cached is not None and cached[0] == key:
             return cached[1]
         payload = self.grid.encode()
-        self._map_cache = (version, payload)
+        payload["key"] = key
+        self._map_cache = (key, payload)
         return payload
 
     def _log_task_summary(self):
@@ -5172,7 +5184,7 @@ class TaskManager(object):
             self.phase = "idle"
 
     # ----------------------------------------------------------- 状态输出
-    def get_state(self, include_map=True):
+    def get_state(self, include_map=True, map_key=None):
         with self.lock:
             state = self.robot.get_state()
             zone_list = []
@@ -5257,7 +5269,7 @@ class TaskManager(object):
                 task=task,
                 zones=zone_list,
                 obstacles=self.grid.obstacle_circles(None),
-                map=self._map_payload() if include_map else None,
+                map=self._map_payload(map_key) if include_map else None,
                 world=world.world_dict(),
                 route=[[round(p[0], 2), round(p[1], 2)] for p in self.route],
                 segments=[

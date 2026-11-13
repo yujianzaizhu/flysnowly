@@ -693,6 +693,112 @@ class PlannerTest(unittest.TestCase):
                 math.hypot(x - 5.0, y - 4.5), 0.35 + world.ROBOT_RADIUS - 0.02
             )
 
+class FreeComponentTest(unittest.TestCase):
+    """扫描线找连通自由区：结果必须和逐格 BFS 的参考实现完全一致。"""
+
+    @staticmethod
+    def _reference(grid):
+        """逐格 4/8 邻接 BFS 参考实现（通道不参与、也不连通）。"""
+        cols = grid.cols
+        rows = grid.rows
+        seen = set()
+        parts = []
+        for start in range(cols * rows):
+            if not grid.free_mask[start] or start in seen or grid.no_mow[start]:
+                continue
+            seen.add(start)
+            stack = [start]
+            cells = set()
+            while stack:
+                index = stack.pop()
+                cells.add(index)
+                row, col = divmod(index, cols)
+                for dc in (-1, 0, 1):
+                    for dr in (-1, 0, 1):
+                        if dc == 0 and dr == 0:
+                            continue
+                        nc, nr = col + dc, row + dr
+                        if not (0 <= nc < cols and 0 <= nr < rows):
+                            continue
+                        nindex = nr * cols + nc
+                        if grid.no_mow[nindex]:
+                            continue
+                        if grid.free_mask[nindex] and nindex not in seen:
+                            seen.add(nindex)
+                            stack.append(nindex)
+            parts.append(cells)
+        return sorted(len(part) for part in parts)
+
+    def test_scanline_matches_reference(self):
+        import random
+
+        grid = GridMap()
+        cols = rows = 40
+        grid.cols = cols
+        grid.rows = rows
+        grid.cell = 0.1
+        for seed in range(5):
+            rng = random.Random(seed)
+            free = bytearray(cols * rows)
+            no_mow = bytearray(cols * rows)
+            for index in range(cols * rows):
+                if rng.random() < 0.62:
+                    free[index] = 1
+                if rng.random() < 0.08:
+                    no_mow[index] = 1
+            grid.free_mask = free
+            grid.no_mow = no_mow
+            grid._no_mow_count = no_mow.count(1)
+            got = sorted(len(part) for part in grid._free_components())
+            self.assertEqual(got, self._reference(grid), "seed {}".format(seed))
+
+
+class EncodePayloadTest(unittest.TestCase):
+    """位图发往前端时的抽样：超大空白场地不能每帧发 100 万格的字符画。"""
+
+    def setUp(self):
+        world.select_map(1)
+
+    def test_small_map_is_sent_cell_by_cell(self):
+        grid = GridMap()
+        payload = grid.encode()
+        self.assertEqual(payload["stride"], 1)
+        self.assertEqual(payload["cell"], grid.cell)
+        self.assertEqual(payload["cols"], grid.cols)
+        self.assertEqual(len(payload["occupancy"]), grid.cols * grid.rows)
+
+    def test_huge_map_is_downsampled_but_keeps_marks(self):
+        grid = GridMap()
+        # 造一块 100 × 100 m 的空白场地（100 万格）
+        grid.cols = grid.rows = 1004
+        grid.data = bytearray(grid.cols * grid.rows)
+        grid.mowed = bytearray(grid.cols * grid.rows)
+        grid.no_mow = bytearray(grid.cols * grid.rows)
+        grid._no_mow_count = 0
+        stride = grid._payload_stride()
+        self.assertGreater(stride, 1)
+        # 抽样后总格数必须在限额内
+        self.assertLessEqual((grid.cols // stride) * (grid.rows // stride), 1000000)
+        # 同一块里"自由 + 占据"要保留占据；已割也要保留
+        grid.data[0] = 1
+        grid.data[1] = 2
+        grid.mowed[grid.cols * 2] = 1   # 第 2 行第 0 列 → 抽样块 (row 1, col 0)
+        payload = grid.encode()
+        self.assertEqual(payload["stride"], stride)
+        self.assertEqual(payload["cell"], round(grid.cell * stride, 6))
+        self.assertEqual(payload["cols"], grid.cols // stride)
+        self.assertEqual(len(payload["occupancy"]), payload["cols"] * payload["rows"])
+        self.assertEqual(payload["occupancy"][0], "2")
+        self.assertEqual(payload["mowed"][payload["cols"]], "1")
+
+    def test_passage_layer_only_when_present(self):
+        grid = GridMap()
+        self.assertNotIn("passage", grid.encode())
+        grid.no_mow[0] = 1
+        grid._no_mow_count = 1
+        self.assertIn("passage", grid.encode())
+
+
 class CoverageTotalsTest(unittest.TestCase):
     """覆盖率分母 = 当前真正能割的格子（禁区 / 场内障碍 / 刀盘层都要扣掉）。"""
 

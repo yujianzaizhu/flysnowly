@@ -29,6 +29,8 @@ LARGE_OBSTACLE_EXTENT = 0.85
 LARGE_OBSTACLE_AREA = 5.0
 # 栅格超过这么多格（编辑用的 100 × 100 m 空白场地是 100 万格）时，障碍估计只扫车周围
 OBSTACLE_SCAN_CELL_LIMIT = 250000
+# 发往前端的位图最多这么多格（超了就按最大池化抽样，见 encode）
+PAYLOAD_CELL_LIMIT = 400000
 OBSTACLE_SCAN_RANGE = 6.0      # m
 
 MAX_OBSTACLE_CELLS = 1200
@@ -87,6 +89,8 @@ class GridMap(object):
         # 通道：只通行、不割草。这一层既不进 free_mask（不参与分区与覆盖率），
         # 也不进 blocked（规划照常可以穿过去）
         self.no_mow = bytearray(self.cols * self.rows)
+        # 纯通道格数量：encode 靠它判断要不要发通道层（不能每帧扫一百万格）
+        self._no_mow_count = 0
         self.dyn_blocked = bytearray(self.cols * self.rows)
         self.verified_free = bytearray(self.cols * self.rows)
         self.free_mask = bytearray(self.cols * self.rows)
@@ -150,6 +154,7 @@ class GridMap(object):
                 index = self.index(col, row)
                 if not self.no_mow[index]:
                     self.no_mow[index] = 1
+                    self._no_mow_count = getattr(self, "_no_mow_count", 0) + 1
                     marked += 1
         return marked
 
@@ -184,6 +189,7 @@ class GridMap(object):
         self.mow_blocked = bytearray(baseline[2])
         if len(baseline) > 3:
             self.no_mow = bytearray(baseline[3])
+            self._no_mow_count = sum(1 for value in self.no_mow if value)
         self._wall_pending = None
         self.data_version += 1
         self.version += 1
@@ -1006,38 +1012,64 @@ class GridMap(object):
         return groups
 
     def _free_components(self):
-        visited = set()
-        components = []
+        """按连通自由区分块（4/8 邻接通），通道（no_mow）不参与分区也不连通。
+
+        用"按行连续段"的扫描线填充：100 × 100 m 的空白场地有 100 万格，逐格
+        8 邻接 DFS 要 4 s，扫描线只处理行段，约 0.1 s。
+        """
+        cols = self.cols
+        rows = self.rows
+        total = cols * rows
+        free = self.free_mask
         no_mow = self.no_mow
-        for start in range(self.cols * self.rows):
-            if not self.free_mask[start] or start in visited:
+        visited = bytearray(total)
+        components = []
+        for start in range(total):
+            if not free[start] or visited[start] or no_mow[start]:
                 continue
-            if no_mow[start]:
-                # 通道只通行不割草：不参与分区，否则两个区域会被通道粘成一块
-                continue
-            visited.add(start)
+            visited[start] = 1
             stack = [start]
             cells = []
             while stack:
                 index = stack.pop()
-                cells.append(index)
-                col = index % self.cols
-                row = index // self.cols
-                for dc in (-1, 0, 1):
-                    for dr in (-1, 0, 1):
-                        if dc == 0 and dr == 0:
-                            continue
-                        nc, nr = col + dc, row + dr
-                        if not self.in_bounds(nc, nr):
-                            continue
-                        nindex = self.index(nc, nr)
-                        if no_mow[nindex]:
-                            # 通道既不参与分区，也不作为区域的连接边
-                            visited.add(nindex)
-                            continue
-                        if self.free_mask[nindex] and nindex not in visited:
-                            visited.add(nindex)
-                            stack.append(nindex)
+                row, col = divmod(index, cols)
+                base = row * cols
+                # 先把本行里连着的一段吃掉
+                left = col
+                while left > 0 and free[base + left - 1] and not no_mow[base + left - 1] and not visited[base + left - 1]:
+                    left -= 1
+                right = col
+                while (
+                    right + 1 < cols
+                    and free[base + right + 1]
+                    and not no_mow[base + right + 1]
+                    and not visited[base + right + 1]
+                ):
+                    right += 1
+                for position in range(left, right + 1):
+                    visited[base + position] = 1
+                    cells.append(base + position)
+                # 上下两行里与这一段相邻的每一段，压一个代表格进栈
+                for next_row in (row - 1, row + 1):
+                    if next_row < 0 or next_row >= rows:
+                        continue
+                    next_base = next_row * cols
+                    # 8 邻接：上下两行要连到 left-1 … right+1（斜着也算连通）
+                    run_start = None
+                    for position in range(max(0, left - 1), min(cols, right + 2)):
+                        ok = (
+                            free[next_base + position]
+                            and not no_mow[next_base + position]
+                            and not visited[next_base + position]
+                        )
+                        if ok and run_start is None:
+                            run_start = position
+                        elif not ok and run_start is not None:
+                            stack.append(next_base + run_start)
+                            run_start = None
+                    if run_start is not None:
+                        # 段一直连到扫描窗口末尾：这里补一次压栈
+                        stack.append(next_base + run_start)
             components.append(set(cells))
         return components
 
@@ -1923,24 +1955,77 @@ class GridMap(object):
         return True
 
     # ----------------------------------------------------------- 编码
+    def _payload_stride(self):
+        """位图发往前端时的抽样步长：超大场地（100 × 100 m 空白场地 = 100 万格）
+        逐格发一次要 1.9 MB，`/api/state` 是 10 Hz 轮询，前端会直接被拖慢。
+
+        按 ``PAYLOAD_CELL_LIMIT`` 做最大池化抽样后，「有障碍/已割」这些信息都在
+        （障碍格与已割格优先保留），只是分辨率降到 ``cell * stride``；前端本来就是
+        把这张位图拉伸铺满整块场地，所以看起来没有区别。
+        """
+        stride = 1
+        while stride < 512:
+            cols = self.cols // stride
+            rows = self.rows // stride
+            if cols <= 0 or rows <= 0:
+                break
+            if cols * rows <= PAYLOAD_CELL_LIMIT:
+                break
+            stride += 1
+        return stride
+
+    @staticmethod
+    def _pool(src, cols, rows, stride):
+        """stride × stride 取最大值（占据 > 自由 > 未知；已割 > 未割）。
+
+        100 万格逐格循环是 0.5 s（每帧都做会把仿真拖住），所以按行把整行当成
+        大整数做按位或：占据 2 | 自由 1 = 3，最后用查表把 3 折回 2。
+        """
+        if stride <= 1:
+            return src
+        out_cols = cols // stride
+        out_rows = rows // stride
+        span = out_cols * stride
+        out = bytearray(out_cols * out_rows)
+        for row in range(out_rows):
+            merged = 0
+            for dy in range(stride):
+                base = (row * stride + dy) * cols
+                merged |= int.from_bytes(src[base:base + span], "little")
+            acc = merged
+            for k in range(1, stride):
+                # 小端：右移 8 位把后一个字节挪到当前字节位置，块内按"起点对齐"合并
+                acc |= merged >> (8 * k)
+            packed = acc.to_bytes(span, "little").translate(_POOL_MERGE)
+            out[row * out_cols:(row + 1) * out_cols] = packed[0::stride]
+        return out
+
     def encode(self):
-        occupancy = bytes(self.data).translate(_ASCII_TABLE).decode("ascii")
-        mowed = bytes(self.mowed).translate(_ASCII_TABLE).decode("ascii")
+        stride = self._payload_stride()
+        data = self._pool(self.data, self.cols, self.rows, stride)
+        mowed = self._pool(self.mowed, self.cols, self.rows, stride)
+        cols = self.cols // stride
+        rows = self.rows // stride
         payload = {
-            "cell": self.cell,
-            "cols": self.cols,
-            "rows": self.rows,
-            "occupancy": occupancy,
-            "mowed": mowed,
+            "cell": round(self.cell * stride, 6),
+            "cols": cols,
+            "rows": rows,
+            "occupancy": bytes(data).translate(_ASCII_TABLE).decode("ascii"),
+            "mowed": bytes(mowed).translate(_ASCII_TABLE).decode("ascii"),
             "version": self.version,
+            # 位图相对栅格的分辨率倍数：前端从位图取格时用 cell * stride
+            "stride": stride,
         }
         # 纯通道层只在真的有纯通道格时才发（大多数地图没有通道 → 零开销）
-        if any(self.no_mow):
-            payload["passage"] = bytes(self.no_mow).translate(_ASCII_TABLE).decode("ascii")
+        if getattr(self, "_no_mow_count", 0):
+            passage = self._pool(self.no_mow, self.cols, self.rows, stride)
+            payload["passage"] = bytes(passage).translate(_ASCII_TABLE).decode("ascii")
         return payload
 
 
 _ASCII_TABLE = bytes.maketrans(b"\x00\x01\x02", b"012")
+# 抽样时按位或会把"占据 2"与"自由 1"叠成 3，查表折回占据
+_POOL_MERGE = bytes([0, 1, 2, 2]) + bytes(range(4, 256))
 
 
 def _polygon_area(points):
