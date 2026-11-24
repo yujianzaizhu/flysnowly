@@ -521,27 +521,53 @@ def build_open_field(span_x=0.0, span_y=0.0, name="日志·无地图"):
 
     场地固定 100 × 100 m（轨迹跨度超过这个尺寸才继续放大），充电桩/起点放在
     正中间，回放轨迹会被摆到场地中心，所以机器人可以在整块场地里自由行驶。
+
+    矩形场地直接按几何构造，**不走栅格 → 提边界 → 简化**那套通用流程：100 万格
+    的空白栅格跑一遍要 4 s，连续播包切到"没地图"的包时界面就卡在这一次上。
     """
     width = max(OPEN_FIELD_MIN, float(span_x) + OPEN_FIELD_MARGIN)
     height = max(OPEN_FIELD_MIN, float(span_y) + OPEN_FIELD_MARGIN)
     cols = max(8, int(round(width / world.CELL)))
     rows = max(8, int(round(height / world.CELL)))
-    raw = bytearray([254]) * (cols * rows)
+    natural_width = cols * world.CELL
+    natural_height = rows * world.CELL
+    width_m = round(natural_width + PADDING * 2.0, 3)
+    height_m = round(natural_height + PADDING * 2.0, 3)
     tag = "{}x{}".format(round(width, 1), round(height, 1))
-    definition = _definition(
-        cols,
-        rows,
-        raw,
-        world.CELL,
-        name,
-        source_path="bag:open:{}".format(tag),
-        map_file="open:{}".format(tag),
-        max_extent=max(width, height) + 1.0,
-    )
-    definition["name"] = name
-    definition["open_field"] = True
-    center_x = round(definition["width"] / 2.0, 3)
-    center_y = round(definition["height"] / 2.0, 3)
+    map_file = "open:{}".format(tag)
+    right = round(natural_width + PADDING, 4)
+    top = round(natural_height + PADDING, 4)
+    definition = {
+        "id": None,
+        "name": name,
+        "native": True,
+        "imported": True,
+        "source_path": "bag:open:{}".format(tag),
+        "map_file": map_file,
+        "width": width_m,
+        "height": height_m,
+        "polygon": [
+            (PADDING, PADDING),
+            (right, PADDING),
+            (right, top),
+            (PADDING, top),
+        ],
+        "obstacles": [],
+        "import_meta": {
+            "resolution": world.CELL,
+            "source_width": cols,
+            "source_height": rows,
+            "sim_width": width_m,
+            "sim_height": height_m,
+            "scale": 1.0,
+            "free_area_m2": round(cols * rows * world.CELL * world.CELL, 2),
+            "obstacle_count": 0,
+            "map_file": os.path.basename(map_file),
+        },
+        "open_field": True,
+    }
+    center_x = round(width_m / 2.0, 3)
+    center_y = round(height_m / 2.0, 3)
     definition["dock"] = {"x": center_x, "y": center_y, "r": 0.45}
     definition["start"] = {"x": center_x, "y": center_y, "theta": 0.0}
     return definition

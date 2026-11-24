@@ -341,14 +341,19 @@ class GridMap(object):
         )
         if self._wall_pending:
             self._note_known(drow * self.cols + dcol, spread=2)
+        # 导航/刀盘膨胀层（blocked / mow_blocked）不参与位图，也不该动 data_version：
+        # 它喂着障碍聚类、边界进度、可达区这几个按 data_version 失效的缓存，
+        # 混进来会让它们每帧重算（实测障碍聚类多算 10 倍）。
         self._fill_rows(self.blocked, col, row, 1 + INFLATE_CELLS)
         self._fill_rows(self.mow_blocked, col, row, 1 + MOW_INFLATE_CELLS)
         if self._restore_verified(dcol, drow, 1):
             changed = True
         if self._restore_verified(col, row, 1 + INFLATE_CELLS):
             changed = True
-        self.version += 1
+        # version 是"位图内容指纹"：没改动就不加，否则静止时每帧都变，
+        # `/api/state` 的 map_key 永远命中不了、位图每 100 ms 重发一次
         if changed:
+            self.version += 1
             self.data_version += 1
 
     def _verify_footprint(self, x, y):
@@ -619,7 +624,7 @@ class GridMap(object):
                 changed_data = changed_data or self.data_version != before
         if changed_data:
             self.data_version += 1
-        self.version += 1
+            self.version += 1
 
     def unknown_wall_cells(self):
         """还没探明的墙格。
@@ -698,6 +703,58 @@ class GridMap(object):
                 if r2 < 0 or r2 >= rows:
                     continue
                 pending.discard(r2 * cols + c2)
+
+    def seal_wall_holes(self, max_run=0.35, max_cells=12):
+        """把墙体带上的小豁口补平（建图收尾用）。
+
+        传感器斜着扫墙时，占据带会整体外移半格，墙上就留下 1~2 格从没被写入过的
+        格子：功能上不影响（未知格照常可通行），但界面上墙体带会破一个洞，看着
+        像"建图漏了一点"。这里把**跨度不超过 ``max_run``** 的未探明墙格簇按墙面
+        补上（只补小簇：真正没扫到的长墙仍然留着，建图如实报告）。
+
+        返回补上的格子数。
+        """
+        if not self.wall_cells:
+            return 0
+        # 注意不能用 `unknown_wall_cells()`：它只返回"连占据邻居都没有"的格子，
+        # 而这里的豁口恰恰是"隔壁已经喷上墙、自己那一格还是 UNKNOWN"——
+        # 探明率算作已探明（100%），界面上却是一个洞。所以按"栅格数据仍是 UNKNOWN"
+        # 来找。
+        cols = self.cols
+        data = self.data
+        unknown = set()
+        for col, row in self.wall_cells:
+            if data[row * cols + col] == UNKNOWN:
+                unknown.add((col, row))
+        if not unknown:
+            return 0
+        limit = max(1, int(round(float(max_run) / self.cell)))
+        sealed = 0
+        remaining = set(unknown)
+        while remaining:
+            seed = remaining.pop()
+            stack = [seed]
+            cluster = [seed]
+            while stack:
+                col, row = stack.pop()
+                for dc in (-1, 0, 1):
+                    for dr in (-1, 0, 1):
+                        if dc == 0 and dr == 0:
+                            continue
+                        neighbour = (col + dc, row + dr)
+                        if neighbour in remaining:
+                            remaining.remove(neighbour)
+                            stack.append(neighbour)
+                            cluster.append(neighbour)
+            cols_in = [col for col, _row in cluster]
+            rows_in = [row for _col, row in cluster]
+            span = max(max(cols_in) - min(cols_in), max(rows_in) - min(rows_in)) + 1
+            if span > limit or len(cluster) > max_cells:
+                continue
+            for col, row in cluster:
+                self.mark_occupied(col, row)
+                sealed += 1
+        return sealed
 
     def boundary_discovery(self):
         if not self.wall_cells:

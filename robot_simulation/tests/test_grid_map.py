@@ -603,6 +603,47 @@ class PlannerTest(unittest.TestCase):
             self.assertGreater(gap["run_m"], 0.0)
             self.assertGreater(gap["cells"], 0)
 
+    def test_seal_wall_holes_closes_small_gaps_only(self):
+        """收工补墙只补 1~3 格的小豁口；真正没扫到的长墙必须留着。"""
+        world.select_map(1)
+        grid = GridMap()
+        cell = grid.cell
+
+        def poke(x0, x1, y0, y1):
+            holes = 0
+            for col, row in grid.wall_cells:
+                x, y = col * cell, row * cell
+                if x0 <= x <= x1 and y0 <= y <= y1:
+                    index = row * grid.cols + col
+                    if grid.data[index] == OCCUPIED:
+                        grid.data[index] = UNKNOWN
+                        holes += 1
+            grid._wall_pending = None
+            grid.data_version += 1
+            grid.version += 1
+            return holes
+
+        # 先把整圈墙都喷上（模拟建图跑完），再人为挖两处：一处 2 格小豁口、一处长墙
+        for col, row in grid.wall_cells:
+            grid.data[row * grid.cols + col] = OCCUPIED
+        grid._wall_pending = None
+        grid.data_version += 1
+        grid.version += 1
+        small = poke(2.0, 2.1, 0.0, 0.1)
+        self.assertGreater(small, 0)
+        sealed = grid.seal_wall_holes(0.35)
+        self.assertEqual(sealed, small)
+        # 小豁口的格子已经被写上了（界面上的洞补平）
+        for col, row in grid.wall_cells:
+            if 2.0 <= col * cell <= 2.1 and 0.0 <= row * cell <= 0.1:
+                self.assertNotEqual(grid.data[row * grid.cols + col], UNKNOWN)
+
+        long_holes = poke(6.0, 7.5, 0.0, 0.1)
+        self.assertGreater(long_holes, 3)
+        self.assertEqual(grid.seal_wall_holes(0.35), 0)
+        gaps = [gap for gap in grid.boundary_gaps() if gap["run_m"] >= 0.3]
+        self.assertTrue(gaps, "长缺口不该被补掉")
+
     def test_verified_footprint_never_turns_into_obstacle(self):
         """车体压过的格子是"一定能走"的硬证据，后续盖章不能再写成障碍。"""
         world.select_map(1)

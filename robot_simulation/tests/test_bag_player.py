@@ -497,6 +497,60 @@ def build_cloud_refresh_bag(path, hits=3, misses=6, dt=0.15, obstacle=None,
     con.close()
     return path
 
+def build_edge_hugging_bag(path, samples=120, dt=0.1):
+    """位姿在地图坐标系（tf）、但轨迹贴着墙走：自由格比例很低。
+
+    "沿边被困" 那批日志就是这样：代价地图窗口**以车为中心**发布（窗口中心与位姿
+    只差 0.01 m，是硬证据），可整条轨迹压在墙体带上，落在"自由格"里的比例只有
+    0.57（有些日志甚至 0.09）。以前的判据"自由格比例 ≥ 0.9"会把这种正确的 tf 位姿
+    否掉，回放退回局部坐标 base_pose，轨迹和地图就完全对不上了。
+    """
+    con = sqlite3.connect(path)
+    con.execute("create table Zmqmsg (TOPIC BLOB NOT NULL, TI REAL NOT NULL, DA BLOB NOT NULL)")
+    start = 1000.0
+    side = 120
+    # 整张图只有一小块自由区（在左上角），机器人却在右侧贴墙走
+    whole = bytearray([100] * (side * side))
+    for row in range(90, 110):
+        for col in range(10, 40):
+            whole[row * side + col] = 0
+    con.execute(
+        "insert into Zmqmsg values (?, ?, ?)",
+        (b"whole_map", start, _map_message(start, 0.05, side, side, (0.0, 0.0), bytes(whole))),
+    )
+    cells = bytearray([0] * (COSTMAP_SIDE * COSTMAP_SIDE))
+    for index in range(samples):
+        stamp = start + index * dt
+        # 局部坐标位姿（带 90° 旋转）：一旦被选中，轨迹会明显跑偏
+        con.execute(
+            "insert into Zmqmsg values (?, ?, ?)",
+            (b"base_pose", stamp, _pose_message(stamp, 0.02 * index, 0.0, math.pi / 2.0)),
+        )
+        world_x = 1.5 + 0.02 * index
+        world_y = 4.0
+        con.execute(
+            "insert into Zmqmsg values (?, ?, ?)",
+            (b"tf_dynamic", stamp, _tf_message(stamp, world_x, world_y, 0.0)),
+        )
+        if index % 10 == 0:
+            # 窗口以车为中心滚动发布 → 窗口中心与 tf 位姿只差几厘米
+            con.execute(
+                "insert into Zmqmsg values (?, ?, ?)",
+                (b"grid_costmap", stamp,
+                 _map_message(
+                     stamp, 0.05, COSTMAP_SIDE, COSTMAP_SIDE,
+                     (
+                         world_x - COSTMAP_SIDE * 0.05 / 2.0,
+                         world_y - COSTMAP_SIDE * 0.05 / 2.0,
+                     ),
+                     bytes(cells),
+                 )),
+            )
+    con.commit()
+    con.close()
+    return path
+
+
 
 class BagReaderTest(unittest.TestCase):
     def setUp(self):
@@ -573,6 +627,88 @@ class BagReaderTest(unittest.TestCase):
         self.assertEqual(transform["scale"], 1.0)
         self.assertGreater(transform["offset"][0], 0.0)
         self.assertGreater(len(definition["polygon"]), 2)
+
+    def test_whole_map_prefers_repeated_snapshot_over_outlier(self):
+        """一个偶发的高占据快照不能覆盖日志里反复发布的稳定地图。"""
+        side = 40
+        stable = bytearray(side * side)
+        stable[:80] = bytes([100] * 80)
+        outlier = bytes([100] * (side * side))
+        con = sqlite3.connect(self.path)
+        for stamp in (1000.0, 1001.0, 1002.0):
+            cells = bytes(stable) if stamp < 1002.0 else outlier
+            con.execute(
+                "insert into Zmqmsg values (?, ?, ?)",
+                (
+                    b"whole_map",
+                    stamp,
+                    _map_message(stamp, 0.05, side, side, (-1.0, -1.0), cells),
+                ),
+            )
+        con.commit()
+        con.close()
+
+        info = bag_reader.read_bag(self.path)
+        self.assertEqual(info["maps"]["whole_map"]["data"], bytes(stable))
+
+    def test_whole_map_snapshot_matches_map_frame_track(self):
+        """多次发布的快照里，取轨迹落在自由格的那一帧（发布次数多的不一定是它对）。"""
+        side = 100
+        aligned = bytearray([100] * (side * side))
+        for row in range(18, 23):
+            for col in range(18, 86):
+                aligned[row * side + col] = 0
+        blocked = bytearray(side * side)
+        for row in (19, 20):
+            for col in range(20, 86):
+                blocked[row * side + col] = 100
+        con = sqlite3.connect(self.path)
+        stamps = [1100.0 + index for index in range(8)]
+        for stamp in stamps:
+            # 挡路的快照发 6 次、贴合的快照只发 2 次：按发布次数选会选错
+            cells = bytes(blocked) if stamp < 1106.0 else bytes(aligned)
+            con.execute(
+                "insert into Zmqmsg values (?, ?, ?)",
+                (
+                    b"whole_map",
+                    stamp,
+                    _map_message(stamp, 0.05, side, side, (-1.0, -1.0), cells),
+                ),
+            )
+        con.commit()
+        con.close()
+
+        info = bag_reader.read_bag(self.path)
+        self.assertEqual(info["maps"]["whole_map"]["data"], bytes(blocked))
+
+        # 位姿在地图坐标系（tf）时才能判断哪一帧和轨迹吻合
+        con = sqlite3.connect(self.path)
+        cost_cells = bytes(bytearray([0] * (40 * 40)))
+        for index in range(100):
+            stamp = 1200.0 + index * 0.1
+            pose_x = 0.03 * index
+            con.execute(
+                "insert into Zmqmsg values (?, ?, ?)",
+                (b"tf_dynamic", stamp, _tf_message(stamp, pose_x, 0.0, 0.0)),
+            )
+            if index % 10 == 0:
+                # 窗口以车为中心滚动发布：窗口中心与位姿重合，是认下这个 tf 位姿的硬证据
+                con.execute(
+                    "insert into Zmqmsg values (?, ?, ?)",
+                    (
+                        b"grid_costmap",
+                        stamp,
+                        _map_message(
+                            stamp, 0.05, 40, 40, (pose_x - 1.0, -1.0), cost_cells
+                        ),
+                    ),
+                )
+        con.commit()
+        con.close()
+
+        info = bag_reader.read_bag(self.path)
+        self.assertEqual(info["pose_frame"], "map")
+        self.assertEqual(info["maps"]["whole_map"]["data"], bytes(aligned))
 
     def test_replay_anchor_track_inside_log_map(self):
         path = os.path.join(self.tmpdir, "map.bag")
@@ -978,6 +1114,51 @@ class BagReaderTest(unittest.TestCase):
         self.assertAlmostEqual(
             replay.state()["wall_time"], info["wall_start"] + target, places=1
         )
+
+    def test_tf_pose_accepted_when_window_follows_robot_but_track_hugs_wall(self):
+        """窗口中心与位姿重合就是硬证据：轨迹落在墙带上也要认这个位姿。
+
+        "沿边被困" 那批日志：gap ≈ 0.01 m（窗口就是围着车发布），但整条轨迹贴墙走，
+        自由格比例只有 0.57（个别包 0.09）。以前按"自由格 ≥ 0.9"判，会把正确的地图
+        坐标系位姿否掉 → 退回 base_pose 局部坐标 → 轨迹和地图对不上。
+        """
+        path = os.path.join(self.tmpdir, "edge.bag")
+        build_edge_hugging_bag(path)
+        info = bag_reader.read_bag(path)
+        self.assertEqual(info["pose_frame"], "map")
+        self.assertEqual(info["pose_topic"], "base_link1")
+        tf = info["tf_pose"]
+        self.assertLessEqual(tf["window_gap"], bag_reader.TF_TIGHT_WINDOW_GAP)
+        # 自由格比例确实很低，说明这条判据确实是"因为窗口重合才被认下"的
+        self.assertLess(tf["free_ratio"], bag_reader.TF_MIN_FREE_RATIO)
+
+    def test_replay_resyncs_instead_of_drifting_far(self):
+        """跟不上的段落要把车摆回日志位姿：画面上的轨迹必须是日志轨迹。
+
+        沿边被困那批日志里有急转/卡死段，四轮后驱车跟不住，偏差会一路涨到
+        3.9 m（画出来就是"轨迹和地图对不上"）。现在误差超过
+        REPLAY_RESYNC_GAP 持续 REPLAY_RESYNC_HOLD 就把车摆回去。
+        """
+        path = os.path.join(self.tmpdir, "jumpy.bag")
+        build_jumpy_bag(path)
+        info = bag_reader.read_bag(path)
+        replay = bag_player.BagReplay(RobotCar())
+        replay.load(info, None)
+        replay.start()
+        worst = 0.0
+        for _ in range(int(replay.duration / 0.02) + 20):
+            replay.tick(0.02)
+            if not replay.playing:
+                break
+            reference = replay._reference(replay.time)
+            worst = max(
+                worst,
+                math.hypot(
+                    replay.robot.pose[0] - reference[0],
+                    replay.robot.pose[1] - reference[1],
+                ),
+            )
+        self.assertLess(worst, 3 * bag_player.REPLAY_RESYNC_GAP + 0.2)
 
     def test_tf_pose_accepted_when_costmap_window_is_fixed(self):
         """代价地图窗口固定不跟车时，"窗口中心与车位重合"这条判据要跳过。

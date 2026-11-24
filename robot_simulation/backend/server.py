@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import copy
 import hashlib
 import json
 import gzip
@@ -488,10 +489,61 @@ def _frame_changed(before, after):
     )
 
 
-def load_bag(httpd, name, use_log_map=True):
-    """解析日志并载入回放；日志自带地图时同时把它建成仿真场地。"""
+# 日志自带地图（whole_map）→ 仿真场地定义：连续几段日志常常是同一张图（同一 origin、
+# 同一栅格内容），每换一包重算一次要 0.4~0.5 s（重采样 + 提边界 + 简化）。按"地图指纹"
+# 缓存最近几份，换包时直接复用。
+BAG_MAP_CACHE = {}
+BAG_MAP_CACHE_LIMIT = 4
+
+
+def _log_map_key(log_map, label):
+    crc = 0
+    try:
+        import zlib
+
+        crc = zlib.crc32(bytes(log_map["data"]))
+    except Exception:  # 数据异常就不缓存（键里带 None 会每次都算）
+        return None
+    return _log_map_signature(log_map) + (crc, label)
+
+
+def _log_map_label(name):
+    """日志地图的场地名：取文件名前缀（`zmqbag_5_2026-…bag` → `zmqbag`）。"""
+    base = os.path.splitext(os.path.basename(str(name or "")))[0]
+    return base.split("_")[0] or "日志"
+
+
+def _log_definition(log_map, label):
+    """取日志地图对应的场地定义：命中缓存就复用，否则现场构造并缓存。"""
+    key = _log_map_key(log_map, label)
+    if key is not None:
+        cached = BAG_MAP_CACHE.get(key)
+        if cached is not None:
+            return copy.deepcopy(cached)
+    definition = map_import.build_map_from_grid(
+        log_map["resolution"],
+        log_map["width"],
+        log_map["height"],
+        log_map["data"],
+        grid_origin=log_map["origin"],
+        name="{}·日志".format(label),
+    )
+    if key is not None:
+        if len(BAG_MAP_CACHE) >= BAG_MAP_CACHE_LIMIT:
+            BAG_MAP_CACHE.clear()
+        BAG_MAP_CACHE[key] = copy.deepcopy(definition)
+    return definition
+
+
+def load_bag(httpd, name, use_log_map=True, info=None):
+    """解析日志并载入回放；日志自带地图时同时把它建成仿真场地。
+
+    ``info`` 是已经解析好的日志信息（连续播放时预解析的那一份）：解析 100 MB 的
+    包要 1~2 s，挪到播放过程中提前做掉，切包时就不卡了。
+    """
     path = resolve_bag(httpd, name)
-    info = bag_reader.read_bag(path)
+    if info is None:
+        info = bag_reader.read_bag(path)
     transform = None
     log_map = (info.get("maps") or {}).get("whole_map")
     manager = httpd.manager
@@ -500,18 +552,11 @@ def load_bag(httpd, name, use_log_map=True):
     # 放到空白地图中心；已经在空白场地上（同一段建图的下一包）就继续用那块并沿用换算。
     carrying = bool(queue.get("active")) and use_log_map and not log_map and _open_field_active()
     if use_log_map:
-        label = os.path.splitext(os.path.basename(path))[0].split("_")[0] or "日志"
+        label = _log_map_label(path)
         definition = None
         if log_map:
             try:
-                definition = map_import.build_map_from_grid(
-                    log_map["resolution"],
-                    log_map["width"],
-                    log_map["height"],
-                    log_map["data"],
-                    grid_origin=log_map["origin"],
-                    name="{}·日志".format(label),
-                )
+                definition = _log_definition(log_map, label)
                 definition = apply_stable_dock(definition, log_map)
             except Exception as exc:  # 日志地图坏了就退回开阔场地
                 print("日志地图构造失败：{}".format(exc))
@@ -559,7 +604,34 @@ def load_bag(httpd, name, use_log_map=True):
         world.START.update({"x": pose[0], "y": pose[1], "theta": pose[2]})
         manager.robot.pose = [pose[0], pose[1], pose[2]]
     apply_log_dock(info, manager, use_log_map)
+    _explain_map_mismatch(manager, info)
     return manager, info, path
+
+
+def _explain_map_mismatch(manager, info):
+    """只有轨迹超出地图栅格的实际边界时，才提示地图记录范围不足。"""
+    info = info or {}
+    grid = (info.get("maps") or {}).get("whole_map")
+    poses = info.get("poses") or []
+    if info.get("pose_frame") != "map" or not grid or not poses:
+        return
+    resolution = float(grid["resolution"])
+    origin_x, origin_y = grid["origin"]
+    max_x = origin_x + grid["width"] * resolution
+    max_y = origin_y + grid["height"] * resolution
+    inside = sum(
+        origin_x <= pose[1] <= max_x and origin_y <= pose[2] <= max_y
+        for pose in poses
+    )
+    ratio = inside / float(len(poses))
+    if ratio >= 0.90:
+        return
+    manager._log(
+        "info",
+        "该日志地图栅格边界覆盖轨迹的 {:.0f}%；其余位姿超出地图记录范围".format(
+            max(0.0, min(1.0, ratio)) * 100.0
+        ),
+    )
 
 
 def apply_log_dock(info, manager, use_log_map=True):
@@ -773,6 +845,66 @@ def bag_queue_snapshot(server):
     }
 
 
+# 切包时只剩"换场地 + 载入回放"（约 0.3 s）；日志解析（100 MB 的包 1~2 s）提前到
+# 上一包播放期间的后台线程里做掉。预解析结果只留一份，换包后立刻释放。
+def _take_prefetched(server, queue, index):
+    """取这一包的预解析结果；没有或不匹配就返回 None（退回现场解析）。"""
+    if not isinstance(queue, dict):
+        return None
+    prefetched = queue.get("prefetch")
+    if not prefetched:
+        return None
+    queue["prefetch"] = None
+    names = queue.get("names") or []
+    if prefetched.get("index") != index:
+        # 已经过期（队列被改过/跳过了几个包）：丢掉，别挡住下一轮的预解析
+        return None
+    if index >= len(names) or prefetched.get("name") != names[index]:
+        return None
+    return prefetched.get("info")
+
+
+def _start_prefetch(server, queue, index):
+    """后台解析队列里第 ``index`` 个日志，结果挂回 ``queue["prefetch"]``。"""
+    if not isinstance(queue, dict) or not queue.get("active"):
+        return
+    names = queue.get("names") or []
+    if index >= len(names) or index < 0:
+        return
+    stale = queue.get("prefetch")
+    if stale and stale.get("index") != index:
+        queue["prefetch"] = None
+    if queue.get("prefetch") or queue.get("prefetching"):
+        return
+    queue["prefetching"] = True
+    name = names[index]
+
+    def run():
+        try:
+            path = resolve_bag(server, name)
+            info = bag_reader.read_bag(path)
+            if queue.get("use_log_map", True):
+                # 顺路把这张日志地图对应的场地也算好（0.4~0.5 s 的重采样/提边界）：
+                # 算进 `_log_definition` 的缓存里，换包时直接命中
+                log_map = (info.get("maps") or {}).get("whole_map")
+                if log_map:
+                    _log_definition(log_map, _log_map_label(path))
+        except Exception as exc:  # 坏包留给换包时的正常流程去报错/跳过
+            print("预解析日志失败（{}）：{}".format(name, exc))
+            info = None
+        finally:
+            if getattr(server, "bag_queue", None) is queue:
+                queue["prefetching"] = False
+        if info is None or getattr(server, "bag_queue", None) is not queue:
+            return
+        if not queue.get("active") or int(queue.get("index") or 0) != index - 1:
+            # 播完前队列已经换了（或者用户拖到了下一个/停止了）：这份结果没用
+            return
+        queue["prefetch"] = {"index": index, "name": name, "info": info}
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def _queue_worker(server, owner=None):
     """后台线程：载入队列里的下一条日志并自动播放。
 
@@ -798,9 +930,14 @@ def _queue_worker(server, owner=None):
                     # 换包前把上一段日志的感知点云存进历史：连续播放不清历史点云
                     archive_replay_cloud(server)
                 manager, _info, _path = load_bag(
-                    server, names[index], queue.get("use_log_map", True)
+                    server,
+                    names[index],
+                    queue.get("use_log_map", True),
+                    info=_take_prefetched(server, queue, index),
                 )
                 manager.start_replay()
+                # 下一包的解析提前到这一包播放时做掉（切包时只剩换场地那一点开销）
+                _start_prefetch(server, queue, index + 1)
                 return
             except Exception as exc:
                 print("连续播放失败（{}）：{}".format(names[index], exc))

@@ -120,8 +120,20 @@ class ServerTest(unittest.TestCase):
         _status, body = self.get("/api/state")
         state = json.loads(body)
         self.assertIn("map", state)
-        key = state["map"]["key"]
-        self.assertTrue(key)
+        self.assertTrue(state["map"]["key"])
+        # 仿真还在跑（视觉盖章会改栅格版本），等版本稳定下来再比对指纹
+        key = None
+        previous = None
+        for _ in range(40):
+            _status, body = self.get("/api/state")
+            state = json.loads(body)
+            current = state["map"]["key"] if state.get("map") else previous
+            if current is not None and current == previous:
+                key = current
+                break
+            previous = current
+            time.sleep(0.05)
+        self.assertIsNotNone(key, "栅格版本一直没稳定下来")
         _status, body = self.get("/api/state?map_key=" + urllib.parse.quote(key))
         state = json.loads(body)
         self.assertIsNone(state.get("map"))
@@ -612,6 +624,112 @@ class ServerTest(unittest.TestCase):
             self.post("/api/map", {"map": 1})
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_prefetched_info_skips_reparsing(self):
+        """连续播放的下一包在播放期间预解析好：换包时不再读一遍日志。"""
+        tmp = tempfile.mkdtemp(prefix="robot-bagprefetch-")
+        first = os.path.join(tmp, "zmqbag_1_2026-08-29-06-20-18.bag")
+        second = os.path.join(tmp, "zmqbag_2_2026-08-29-06-27-04.bag")
+        bag_fixtures.build_bag(first, samples=20)
+        bag_fixtures.build_bag(second, samples=20, origin=(3.0, 1.0))
+        queue = {
+            "names": [first, second],
+            "index": 0,
+            "active": True,
+            "use_log_map": True,
+            "loading": False,
+            "failed": [],
+        }
+        self.httpd.bag_queue = queue
+        originals = server.bag_reader.read_bag
+        calls = []
+
+        def counting(path):
+            calls.append(path)
+            return originals(path)
+
+        server.bag_reader.read_bag = counting
+        try:
+            server._start_prefetch(self.httpd, queue, 1)
+            for _ in range(200):
+                if queue.get("prefetch"):
+                    break
+                time.sleep(0.05)
+            self.assertTrue(queue.get("prefetch"), "预解析没完成")
+            self.assertEqual(calls, [second])
+            info = server._take_prefetched(self.httpd, queue, 1)
+            self.assertIsNotNone(info)
+            self.assertIsNone(queue.get("prefetch"))
+            manager, _info, _path = server.load_bag(self.httpd, second, True, info=info)
+            # 用预解析结果时不该再读一遍日志
+            self.assertEqual(calls, [second])
+            self.assertTrue(manager.replay.track)
+        finally:
+            server.bag_reader.read_bag = originals
+            self.httpd.bag_queue = None
+            self.post("/api/bag/control", {"command": "stop"})
+            self.post("/api/map", {"map": 1})
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_prefetched_result_dropped_when_index_moved(self):
+        """预解析的是 N+1 包，但队列已经走到 N+2：这份结果不能拿来用。"""
+        tmp = tempfile.mkdtemp(prefix="robot-bagprefetch2-")
+        names = [os.path.join(tmp, "zmqbag_{}_2026-08-29-06-2{}-00.bag".format(i, i)) for i in range(3)]
+        for name in names:
+            bag_fixtures.build_bag(name, samples=10)
+        queue = {
+            "names": names,
+            "index": 0,
+            "active": True,
+            "use_log_map": True,
+            "loading": False,
+            "failed": [],
+            "prefetch": {"index": 1, "name": names[1], "info": {"poses": []}},
+        }
+        self.httpd.bag_queue = queue
+        try:
+            self.assertIsNone(server._take_prefetched(self.httpd, queue, 2))
+            self.assertIsNone(queue.get("prefetch"))
+        finally:
+            self.httpd.bag_queue = None
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_log_definition_is_cached(self):
+        """同一张日志地图连续几包复用场地定义：不重复跑重采样/提边界。"""
+        tmp = tempfile.mkdtemp(prefix="robot-mapcache-")
+        first = os.path.join(tmp, "zmqbag_1_2026-09-15-07-04-14.bag")
+        second = os.path.join(tmp, "zmqbag_2_2026-09-15-07-05-14.bag")
+        bag_fixtures.build_map_frame_bag(first, samples=20)
+        bag_fixtures.build_map_frame_bag(second, samples=20, wall_offset_ns=10 ** 9)
+        info_a = server.bag_reader.read_bag(first)
+        info_b = server.bag_reader.read_bag(second)
+        log_map = info_a["maps"]["whole_map"]
+        self.assertEqual(
+            server._log_map_key(log_map, "zmqbag"),
+            server._log_map_key(info_b["maps"]["whole_map"], "zmqbag"),
+        )
+        server.BAG_MAP_CACHE.clear()
+        original = server.map_import.build_map_from_grid
+        calls = []
+
+        def counting(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        server.map_import.build_map_from_grid = counting
+        try:
+            def_a = server._log_definition(log_map, "zmqbag")
+            def_b = server._log_definition(info_b["maps"]["whole_map"], "zmqbag")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(def_a["width"], def_b["width"])
+            self.assertEqual(def_a["polygon"], def_b["polygon"])
+            # 缓存给的是副本：改一份不能影响另一个包
+            def_b["dock"]["x"] += 5.0
+            self.assertNotEqual(def_a["dock"]["x"], def_b["dock"]["x"])
+        finally:
+            server.map_import.build_map_from_grid = original
+            server.BAG_MAP_CACHE.clear()
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_continuous_play_keeps_position_across_bags(self):
         """同一批"无地图"日志连续播放：换包时机器人不该跳到别处。
 
@@ -815,6 +933,34 @@ class ServerTest(unittest.TestCase):
             self.post("/api/bag/control", {"command": "stop"})
             self.post("/api/map", {"map": 1})
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_map_range_warning_uses_grid_bounds_not_free_ratio(self):
+        messages = []
+
+        class LogCollector:
+            def _log(self, level, message):
+                messages.append((level, message))
+
+        info = {
+            "pose_frame": "map",
+            "tf_pose": {"free_ratio": 0.0},
+            "poses": [(0.0, 0.5, 0.5, 0.0), (1.0, 1.5, 1.5, 0.0)],
+            "maps": {
+                "whole_map": {
+                    "origin": (0.0, 0.0),
+                    "resolution": 1.0,
+                    "width": 2,
+                    "height": 2,
+                }
+            },
+        }
+        server._explain_map_mismatch(LogCollector(), info)
+        self.assertEqual(messages, [])
+
+        info["poses"][1] = (1.0, 3.0, 1.5, 0.0)
+        server._explain_map_mismatch(LogCollector(), info)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("栅格边界覆盖轨迹的 50%", messages[0][1])
 
     def test_bag_playlist_requires_names(self):
         with self.assertRaises(urllib.error.HTTPError) as ctx:

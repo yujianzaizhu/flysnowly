@@ -85,8 +85,16 @@ MOW_STALL_LIMIT = 180.0
 MOW_STALL_PHASES = frozenset(
     ("to_zone", "to_segment", "zone_stripes", "zone_edge", "zone_plan")
 )
+# 墙前避让的最小角速度：避让方向与期望角速度可能刚好互相抵消（-1.4 + 1.4），
+# 车就原地不动了。低于这个量就强制按避让方向转。
+WALL_GUARD_MIN_TURN = 0.8
 # 原地打转超过这个角度（约两圈）还没挪窝，就按卡滞处理
 MAX_SPIN_WITHOUT_MOVE = 12.6
+# 同一处最多允许原地转两圈：转完两圈还是出不去，就把这一带记为"转不出去"，
+# 强制后退并换个目标，不再原地接着转。
+MAX_SPIN_EPISODES = 2
+# "同一处"的判定半径（m）：两次打转的位置相差在这个范围内就算同一个地方
+SPIN_SITE_RADIUS = 1.2
 # 位置 2.6 s 不动（或转了两圈还没挪窝）就判定卡滞
 STUCK_TRIGGER_SECONDS = 2.0
 # 顶着墙/障碍物还在踩油门（碰撞）超过这么久、而车没怎么动，就立刻倒车脱困，
@@ -124,9 +132,11 @@ PROGRESS_GUARD_DISTANCE = 1.0
 # 回桩路线不通时，隔多久再试一次（期间继续手上的建图/割草）；连续失败会翻倍退避
 CHARGE_RETRY_SECONDS = 30.0
 CHARGE_RETRY_MAX = 240.0
-# 未探明的墙面超过这个长度就算"明显缺口"，必须去补扫，不能直接结束建图
-# （0.3 m 大约是 3 格墙：再短的缺口肉眼几乎看不出来，可以放过）
-MAP_GAP_MAX_RUN = 0.3
+# 未探明的墙面超过这个长度就算"缺口"，必须去补扫，不能直接结束建图。
+# 以前给 0.3 m（3 格）并配"残留 <0.25 m 就收工"，于是收工时墙体带上总留着
+# 1~2 格没写过的"小豁口"：功能上不影响（未知格照常可通行），但界面上墙线破了
+# 一个洞，看着像"建图漏了一点"。现在按 1 格算，1~2 格的缝也会补上。
+MAP_GAP_MAX_RUN = 0.1
 # 同一轮建图最多补扫几次，避免在不可达缺口上无限绕
 MAP_GAP_ATTEMPTS = 4
 # 边界还没探明就想收工时，最多"再找一轮"几次（每次放开周边膨胀重新探索）
@@ -145,6 +155,8 @@ MAP_FILL_SPOT_RADIUS = 1.0
 # 命令前进却原地不动超过这个时间/位移，就判定这条扫描线开不过去
 MAP_FILL_STALL_SECONDS = 1.0
 MAP_FILL_STALL_DISTANCE = 0.10
+# 一轮补看里最多跳过多少条扫描线，超了就收手（说明这片区域开不进去）
+MAP_FILL_SKIP_LIMIT = 12
 # 连续几次补扫都没有新增边界，就认为剩下的缺口补不上，收尾结束建图
 MAP_GAP_WASTE_LIMIT = 3
 # 补扫白跑一次后，这处缺口周边多大范围内不再重复跑
@@ -161,8 +173,12 @@ MAP_GAP_PLAN_BUDGET = 0.40
 MAP_GAP_VIEW_OFFSET = 0.55
 MAP_DONE_DISCOVERY = 0.85
 # 收工时允许残留的未探明墙面总长（m）：低于它就算"边界找齐了"，高于它就再绕一圈。
-# 之前给 0.6 m，收工时地图边上总会留一小段没涂抹，看着像"建图漏了一点"。
-MAP_DONE_RESIDUAL = 0.25
+# 这里要求"一格都不留"（配合 MAP_GAP_MAX_RUN = 0.1 m）：实测 5 张内置场地都能在
+# 多绕几格墙内补齐（补扫 0 次、仿真时间只多 0~1 s），比事后糊墙干净。
+MAP_DONE_RESIDUAL = 0.0
+# 实在补不上（缺口开不过去/补扫几次都白跑/超时）时，收工前把"跨度不超过这么多"
+# 的小豁口直接补平（只补 1~3 格的小簇，真正没扫到的长墙仍如实留着）。
+MAP_SEAL_MAX_RUN = 0.35
 # 最多绕几圈把最后一点墙刷上；超过就收工（不再无限找缺口）
 MAP_CLOSE_MAX_LAPS = 2
 # 绕障过程中允许擦碰 / 卡滞多少次还继续绕（绕障半径贴着障碍物时蹭到是常态，
@@ -282,6 +298,8 @@ class TaskManager(object):
     def _reset_state(self):
         self.task = None
         self.phase = "idle"
+        self.spin_sites = []
+        self.spin_blocked = []
         self.dock_retries = 0
         self.charge_wait = 0.0
         self.message = "等待任务"
@@ -406,6 +424,10 @@ class TaskManager(object):
         self.stuck_ref = None
         self.stuck_heading = 0.0
         self.stuck_spin = 0.0
+        # 原地打转记账：同一处转两圈还出不去就拉黑这一带（见 _note_spin_site）
+        self.spin_sites = []
+        self.spin_blocked = []
+        self.map_bump_spots = []
         self.progress_ref = None
         self.progress_ref_time = 0.0
         self.stall_ref = None
@@ -453,6 +475,7 @@ class TaskManager(object):
         self.map_fill_last_area = None
         self.map_fill_progress = None
         self.map_fill_cmd_v = 0.0
+        self.map_fill_skipped = 0
         self.map_fill_visited = []
         self.map_loop_count = 0
         self.map_seek_stuck = 0
@@ -540,9 +563,12 @@ class TaskManager(object):
             self.map_fill_last_area = None
             self.map_fill_progress = None
             self.map_fill_cmd_v = 0.0
+            self.map_fill_skipped = 0
             self.map_fill_visited = []
             self.map_loop_count = 0
             self.map_seek_stuck = 0
+            self.spin_sites = []
+            self.spin_blocked = []
             self.map_best_discovery = 0.0
             self.map_best_time = self.robot.sim_time
             self.map_active_time = 0.0
@@ -891,7 +917,18 @@ class TaskManager(object):
     # 弓字（zone_stripes）的线段本身就按禁区膨胀切过了，再叠一层会在禁区拐角
     # 反复停车→转向→重规划，机器就在禁区边上左右来回跑；这里把它去掉。
     # 这些阶段允许"顶着障碍物不动 → 立刻倒车脱困"
-    BUMP_ESCAPE_PHASES = ("zone_stripes", "zone_edge", "to_segment", "detour", "ring")
+    # 建图阶段同样要"一撞就退"：以前 map_seek 撞在墙角上会每 0.6 s 撞一次、
+    # 连着撞十几次，看着就是"卡在墙角"。map_fill 的扫描线也常正对墙面。
+    BUMP_ESCAPE_PHASES = (
+        "zone_stripes",
+        "zone_edge",
+        "to_segment",
+        "detour",
+        "ring",
+        "map_seek",
+        "map_follow",
+        "map_fill",
+    )
 
     NO_GO_GUARD_PHASES = (
         "map_seek",
@@ -940,6 +977,66 @@ class TaskManager(object):
             return -0.15, -turn * 1.0
         return 0.0, turn * 1.2
 
+    def _note_spin_site(self, pose):
+        """记一次"原地打转"；同一处转满 MAX_SPIN_EPISODES 次就拉黑这一带。
+
+        建图时偶尔会在墙角/障碍物拐角原地转圈：转两圈触发脱困 → 退一点 → 又转回来，
+        于是看起来"在一个地方转圈圈很久"。现在按位置记账，第二次就退出这一带
+        （加入 `spin_blocked`，找边界/补扫都不会再把目标指到这里），并立刻要求脱困。
+
+        返回 True 表示这一带已被拉黑。
+        """
+        x, y = float(pose[0]), float(pose[1])
+        site = None
+        for item in self.spin_sites:
+            if math.hypot(x - item["x"], y - item["y"]) <= SPIN_SITE_RADIUS:
+                site = item
+                break
+        if site is None:
+            site = {"x": x, "y": y, "count": 0}
+            self.spin_sites.append(site)
+        site["x"], site["y"] = x, y
+        site["count"] += 1
+        if len(self.spin_sites) > 16:
+            self.spin_sites.pop(0)
+        if site["count"] < MAX_SPIN_EPISODES:
+            return False
+        if site["count"] > MAX_SPIN_EPISODES:
+            # 已经拉黑过这一带又转回同一处：不再重复计数。
+            # 注意**不要**在这里强行掉头/加倍倒退——巡边本来就得经过同一个拐角，
+            # 每次都强行改道反而会打断贴墙巡边（实测会让建图只探到六七成）。
+            # 真正把车救出来的还是常规的卡滞脱困（_recover_stuck / _on_bump）。
+            site["count"] = MAX_SPIN_EPISODES
+            return True
+        for item in self.spin_blocked:
+            if math.hypot(x - item["x"], y - item["y"]) <= SPIN_SITE_RADIUS:
+                item["x"], item["y"] = x, y
+                break
+        else:
+            self.spin_blocked.append({"x": round(x, 2), "y": round(y, 2), "r": SPIN_SITE_RADIUS})
+            if len(self.spin_blocked) > 12:
+                self.spin_blocked.pop(0)
+        # 这一带别再来了：丢掉指向这里的寻边/补扫目标与补看线段
+        if self.map_seek_goal is not None and self._near_spin_site(*self.map_seek_goal):
+            self.map_seek_goal = None
+        if self.map_gap_goal is not None and self._near_spin_site(*self.map_gap_goal):
+            self.map_gap_goal = None
+        if self.map_fill_target is not None and self._near_spin_site(*self.map_fill_target):
+            self._drop_map_fill_segment()
+        self._log(
+            "warn",
+            "已在同一处原地打转 {} 次，标记这一带不再进入并后退改道".format(site["count"]),
+        )
+        return True
+
+    def _near_spin_site(self, x, y, radius=None):
+        """这个位置是不是"转过两圈还出不去"的地方（找边界/补扫时避开它）。"""
+        limit = SPIN_SITE_RADIUS if radius is None else radius
+        for item in self.spin_blocked:
+            if math.hypot(x - item["x"], y - item["y"]) <= item["r"] + limit * 0.5:
+                return True
+        return False
+
     def _update_progress(self, dt):
         if self.phase != self.last_phase:
             self.last_phase = self.phase
@@ -969,6 +1066,8 @@ class TaskManager(object):
             self.stuck_time = 0.0
             if self.stuck_spin > MAX_SPIN_WITHOUT_MOVE:
                 # 转了两整圈还没走出一米：这不是掉头，是绕不出来
+                self._note_spin_site(pose)
+                self.stuck_spin = 0.0
                 self.stuck_time = STUCK_TRIGGER_SECONDS + 0.5
         else:
             self.stuck_time += dt
@@ -1241,6 +1340,22 @@ class TaskManager(object):
             if self.segment is not None:
                 self.failed_segments.add(_segment_key(self.segment_plan or self.segment))
             self.phase = "zone_plan"
+        elif phase == "map_fill":
+            # 补扫线段走不通：换下一条；换得太多说明这一轮补看没戏，换个策略
+            self.map_fill_skipped += 1
+            self._drop_map_fill_segment()
+            if self.map_fill_skipped > MAP_FILL_SKIP_LIMIT:
+                # 一片区域连着十几条扫描线都开不进去：别再生成新的一轮，
+                # 直接带着现有边界收尾（继续磨只会耗电）
+                self.map_fill_skipped = 0
+                self._log(
+                    "warn",
+                    "补看连续 {} 条扫描线都开不过去，结束建图并返回充电桩".format(
+                        MAP_FILL_SKIP_LIMIT
+                    ),
+                )
+                self._finish_mapping()
+                return
         elif phase == "to_zone":
             self._plan_to_zone_corner()
         self.stuck_time = 0.0
@@ -1248,7 +1363,8 @@ class TaskManager(object):
         self.stuck_heading = 0.0
         self.last_phase = None
 
-    def _begin_escape(self, resume_phase):
+    def _begin_escape(self, resume_phase, distance=None):
+        limit = ESCAPE_DISTANCE if distance is None else float(distance)
         x, y, _ = self._pose()
         path = []
         length = 0.0
@@ -1263,7 +1379,7 @@ class TaskManager(object):
             path.append((point[0], point[1]))
             length += distance
             last = point
-            if length >= ESCAPE_DISTANCE:
+            if length >= limit:
                 break
         if not path or length < 0.20:
             return False
@@ -1285,7 +1401,9 @@ class TaskManager(object):
             if math.hypot(target[0] - x, target[1] - y) >= 0.12:
                 break
             self.escape_index += 1
-        if self.escape_index >= len(self.escape_path) or self.escape_time > ESCAPE_TIME_LIMIT:
+        if self.escape_index >= len(self.escape_path) or self.escape_time > ESCAPE_TIME_LIMIT * max(
+            1.0, len(self.escape_path) / 8.0
+        ):
             self._resume_after_escape()
             return 0.0, 0.0
         target = self.escape_path[self.escape_index]
@@ -1698,7 +1816,9 @@ class TaskManager(object):
             return goal
         goal = self.grid.explore_goal(self._pose()[:2])
         if goal is not None and (
-            self._near_known_island(goal[0], goal[1]) or self._seek_goal_blocked(goal)
+            self._near_known_island(goal[0], goal[1])
+            or self._seek_goal_blocked(goal)
+            or self._near_spin_site(goal[0], goal[1])
         ):
             goal = None
         self.map_seek_goal = goal
@@ -1769,6 +1889,9 @@ class TaskManager(object):
             if nearby and near_distance <= MAP_GAP_REACH:
                 viewpoint = nearby[-1]
                 break
+        if viewpoint is not None and self._near_spin_site(viewpoint[0], viewpoint[1]):
+            # 这个观察点上一轮转了两圈都出不去：别再去那里转
+            viewpoint = None
         self.map_gap_reach[key] = (self.robot.sim_time, viewpoint)
         return viewpoint
 
@@ -1812,7 +1935,53 @@ class TaskManager(object):
         """观察点必须落在场地内、且不贴墙，否则车开不过去。"""
         if not world.point_in_polygon(x, y):
             return False
+        if world.in_no_go(x, y, NO_GO_MARGIN):
+            return False
         return world.boundary_distance(x, y) >= 0.25
+
+    def _gap_blocked_by_no_go(self, gap, viewpoint=None):
+        """这段墙到底还能不能被看到：禁区挡住视线时永远补不上，别白跑一趟。
+
+        机器人不许进禁区（`NO_GO_GUARD_PHASES` 里建图阶段也在列），所以：
+        * 缺口就在禁区里（含安全边距）→ 看不到；
+        * 给了观察点时，观察点到缺口的连线穿过禁区 → 看不到；
+        * 没给观察点时按"传感器环"判：以缺口为圆心、从 0.4 m 到视场量程一圈采样，
+          只要有一个位置既在场地内、又不在禁区里，就说明还能开过去看（返回 False），
+          整圈都被禁区占满就永远看不到（返回 True）。
+
+        以前不判这个：禁区贴着墙时那段墙永远 0%，却在它上面反复补扫（实测一次
+        建图被 4.3 m 的缺口拖掉 200 s，最后仍停在 96%）。
+        """
+        if not world.NO_GO:
+            return False
+        gx, gy = float(gap.get("x", 0.0)), float(gap.get("y", 0.0))
+        if world.in_no_go(gx, gy, NO_GO_MARGIN + 0.15):
+            return True
+        if viewpoint is not None:
+            x0, y0 = viewpoint[0], viewpoint[1]
+            length = math.hypot(gx - x0, gy - y0)
+            if length >= 1e-6:
+                steps = max(2, int(length / 0.15))
+                for index in range(1, steps):
+                    t = index / float(steps)
+                    if world.in_no_go(
+                        x0 + (gx - x0) * t, y0 + (gy - y0) * t, NO_GO_MARGIN * 0.5
+                    ):
+                        return True
+        # 传感器环：能不能找个站得住、又看得见这段墙的位置
+        for radius in (0.45, 0.70, 0.90):
+            for step in range(12):
+                angle = step * math.pi / 6.0
+                px = gx + radius * math.cos(angle)
+                py = gy + radius * math.sin(angle)
+                if not world.point_in_polygon(px, py):
+                    continue
+                if world.in_no_go(px, py, NO_GO_MARGIN):
+                    continue
+                if world.boundary_distance(px, py) < 0.25:
+                    continue
+                return False
+        return True
 
     def _gap_abandoned(self, gap):
         """这处缺口白跑过一次就先放过，先把别的缺口补完再回头。"""
@@ -1887,8 +2056,19 @@ class TaskManager(object):
             if gap["run_m"] < MAP_GAP_MAX_RUN or self._gap_abandoned(gap):
                 continue
             viewpoint = self._gap_viewpoint(gap)
-            if viewpoint is not None:
-                pending.append((gap, viewpoint))
+            if viewpoint is None:
+                continue
+            if self._gap_blocked_by_no_go(gap, viewpoint):
+                # 禁区挡着视线：这段墙永远扫不到，记下来别再反复往那边跑
+                point = (gap.get("x", 0.0), gap.get("y", 0.0))
+                if point not in self.map_gap_abandoned:
+                    self.map_gap_abandoned.append(point)
+                    self._log(
+                        "info",
+                        "缺口 ({:.1f}, {:.1f}) 被禁区挡住视线，跳过这处补扫".format(*point),
+                    )
+                continue
+            pending.append((gap, viewpoint))
         if not pending:
             if discovery >= MAP_DONE_DISCOVERY:
                 return True
@@ -1929,8 +2109,13 @@ class TaskManager(object):
             return cache[1]
         total = 0.0
         for gap in self.grid.boundary_gaps(max_gaps=12):
-            if gap["run_m"] >= MAP_GAP_MAX_RUN:
-                total += gap["run_m"]
+            if gap["run_m"] < MAP_GAP_MAX_RUN:
+                continue
+            if self._gap_blocked_by_no_go(gap):
+                # 禁区挡死的墙永远扫不到：不该算成"还差多少没建完"，
+                # 否则建图会一直判定"没建完"、反复去补扫这一段
+                continue
+            total += gap["run_m"]
         self._map_residual_cache = (version, total)
         return total
 
@@ -1940,10 +2125,17 @@ class TaskManager(object):
         只看百分比会在"最后差半米墙"时提前回桩（地图边上留一道没喷涂的口子），
         所以要求残留缺口也很小；绕满 `MAP_CLOSE_MAX_LAPS` 圈还是差就认了。
         """
-        if self.grid.boundary_discovery() < MAP_DONE_DISCOVERY_NOW:
+        discovery = self.grid.boundary_discovery()
+        if discovery < MAP_DONE_DISCOVERY:
             return False
         if self._map_residual_length() <= MAP_DONE_RESIDUAL:
-            return True
+            if discovery >= MAP_DONE_DISCOVERY_NOW:
+                return True
+            # 剩下补不上的缺口全是被禁区挡死、1 m 视场永远看不到的墙：
+            # 这种墙不算"还没建完"，不然会一直判定没完成、反复往那边跑
+            gaps = self.grid.boundary_gaps()
+            if gaps and all(self._gap_blocked_by_no_go(gap) for gap in gaps):
+                return True
         return self.map_loop_count >= MAP_CLOSE_MAX_LAPS
 
     def _mapping_stalled(self):
@@ -2166,6 +2358,14 @@ class TaskManager(object):
             # 边界还没探全（实景大图的内部隔墙也算边界）：开进去补看一轮再收工
             return
         self.mapping_done = True
+        # 收工前把墙体带上的小豁口补平：斜着扫墙时占据带会整体外移半格，墙上
+        # 常留 1~2 格没写入的缝，界面上看着就是一个洞。长缺口不补（如实报告）。
+        sealed = self.grid.seal_wall_holes(MAP_SEAL_MAX_RUN)
+        if sealed:
+            self._log(
+                "info",
+                "建图收尾：补平墙体带上 {} 格小豁口（边界带闭合）".format(sealed),
+            )
         # 建图结束后不再保留巡边进度，避免之后回充/恢复任务时又回到巡边阶段。
         self.map_path = []
         self._map_hash = {}
@@ -2173,9 +2373,17 @@ class TaskManager(object):
         self.map_islands = []
         if self.breakpoint and str(self.breakpoint.get("phase", "")).startswith("map"):
             self.breakpoint = None
-        self.map_gap_remaining = max(
-            [gap["run_m"] for gap in self.grid.boundary_gaps()] or [0.0]
-        )
+        gaps = self.grid.boundary_gaps()
+        self.map_gap_remaining = max([gap["run_m"] for gap in gaps] or [0.0])
+        # 剩下的缺口全是"被禁区挡住看不到"的话，把原因说清楚，
+        # 免得用户以为机器人偷懒没扫
+        if gaps and all(self._gap_blocked_by_no_go(gap) for gap in gaps):
+            self._log(
+                "warn",
+                "建图完成：边界探明 {:.0f}%，剩下 {:.1f} m 墙面被禁区挡住视线扫不到".format(
+                    self.grid.boundary_discovery() * 100.0, self.map_gap_remaining
+                ),
+            )
         # 先回充电桩，到桩停稳之后再分区：分区要用到"停在哪"这个信息，
         # 而且回桩路上还在继续扫描，等停稳再切区域边界更准。
         self._log(
@@ -2260,6 +2468,11 @@ class TaskManager(object):
         """
         if self.grid.boundary_discovery() >= MAP_FILL_TRIGGER:
             return False
+        gaps = self.grid.boundary_gaps()
+        if gaps and all(self._gap_blocked_by_no_go(gap) for gap in gaps):
+            # 剩下的"未探明边界"全是被禁区挡死、1 m 视场永远看不到的墙：
+            # 探明率因此永远到不了 95%，以前会一直触发兜底补看、开进去空扫 300 s。
+            return False
         if self.map_fill_passes >= MAP_FILL_MAX_PASSES:
             return False
         if self.map_fill_start_sim is not None:
@@ -2314,29 +2527,34 @@ class TaskManager(object):
 
     def _map_fill_step(self, dt):
         v, w = self._map_fill_command()
-        # 扫描线常常正对墙面：命令前进却原地不动就换下一条，别一边撞一边磨
+        # 扫描线常常正对墙面：开不过去就换下一条，别一边撞一边磨。
+        # 这里**不要求命令速度为正**：命令被避障/禁区保护压成 0、或角速度被
+        # 两项抵消成 0 时，机器人一样是原地不动，以前这类情形完全没人管，
+        # 于是一动不动地干等到看门狗超时（实测卡了 229 s）。
         x, y = self._pose()[:2]
-        if v > 0.05 and self.map_fill_cmd_v > 0.05:
-            progress = self.map_fill_progress
-            if progress is None:
-                self.map_fill_progress = [self.robot.sim_time, x, y, 0.0]
-            elif math.hypot(x - progress[1], y - progress[2]) >= MAP_FILL_STALL_DISTANCE:
-                progress[0], progress[1], progress[2], progress[3] = (
-                    self.robot.sim_time,
-                    x,
-                    y,
-                    0.0,
-                )
-            else:
-                progress[3] += dt
-                if progress[3] >= MAP_FILL_STALL_SECONDS:
-                    self.map_fill_progress = None
-                    self.map_fill_cmd_v = v
-                    self._log("warn", "补看这条扫描线开不过去，跳过")
-                    self._drop_map_fill_segment()
-                    return 0.0, 0.0
+        progress = self.map_fill_progress
+        if progress is None:
+            self.map_fill_progress = [self.robot.sim_time, x, y, 0.0]
+        elif math.hypot(x - progress[1], y - progress[2]) >= MAP_FILL_STALL_DISTANCE:
+            progress[0], progress[1], progress[2], progress[3] = (
+                self.robot.sim_time,
+                x,
+                y,
+                0.0,
+            )
         else:
-            self.map_fill_progress = None
+            progress[3] += dt
+            if progress[3] >= MAP_FILL_STALL_SECONDS:
+                self.map_fill_progress = None
+                self.map_fill_cmd_v = v
+                self.map_fill_skipped += 1
+                self._note_spin_site((x, y))
+                self._log(
+                    "warn",
+                    "补看这条扫描线开不过去，跳过（第 {} 条）".format(self.map_fill_skipped),
+                )
+                self._drop_map_fill_segment()
+                return 0.0, 0.0
         self.map_fill_cmd_v = v
         return v, w
 
@@ -2363,6 +2581,10 @@ class TaskManager(object):
                 self._finish_mapping()
                 return 0.0, 0.0
             a, b = self.map_fill_segments[0]
+            if self._near_spin_site(a[0], a[1]) or self._near_spin_site(b[0], b[1]):
+                # 这条线要去的地方"转两圈都出不去"：直接换下一条
+                self._drop_map_fill_segment()
+                return 0.0, 0.0
             self.map_fill_target = b
             if math.hypot(a[0] - x, a[1] - y) < 0.8:
                 self.map_fill_stage = "along"
@@ -3177,8 +3399,15 @@ class TaskManager(object):
         else:
             limit = 0.28
         if distance < limit:
-            steer = -1.4 if relative >= 0.0 else 1.4
-            return 0.0, world.clamp(w + steer, -1.6, 1.6)
+            # 障碍在左侧 → 往右转（负角速度），在右侧 → 往左转。
+            # 注意不能简单地把 steer 加在期望角速度上：期望往左、障碍在右边时
+            # 两者正好抵消（实测 map_fill 里 w = -1.4 + 1.4 = 0），机器人就
+            # 原地纹丝不动地卡在那里，直到看门狗超时。
+            safe = -1.0 if relative >= 0.0 else 1.0
+            turned = world.clamp(w + safe * 1.4, -1.6, 1.6)
+            if turned * safe < WALL_GUARD_MIN_TURN:
+                turned = WALL_GUARD_MIN_TURN * safe
+            return 0.0, turned
         return v, w
 
     # ----------------------------------------------------------- 弓字覆盖
@@ -4230,6 +4459,27 @@ class TaskManager(object):
         if self.phase in ("zone_stripes", "zone_edge", "to_segment", "detour", "ring"):
             pose = self._pose()
             self.grid.relax_around(pose[0], pose[1], 0.45)
+        if self.phase in ("map_seek", "map_follow", "map_fill"):
+            # 建图阶段撞一次就记位置：同一个地方撞第二次说明是顶死了（墙角、
+            # 禁区边上），立刻沿来路倒退，而不是等 stuck_time 攒够再退——
+            # 以前会在这类地方每 0.6 s 撞一次，连撞十几次。
+            pose = self._pose()
+            near = False
+            for item in self.map_bump_spots:
+                if math.hypot(pose[0] - item[0], pose[1] - item[1]) < 0.45:
+                    item[0], item[1] = pose[0], pose[1]
+                    near = True
+                    break
+            if not near:
+                self.map_bump_spots.append([pose[0], pose[1]])
+                if len(self.map_bump_spots) > 16:
+                    self.map_bump_spots.pop(0)
+            elif self._begin_escape(self.phase, distance=ESCAPE_DISTANCE * 1.5):
+                self.stats["stuck_recoveries"] += 1
+                self.stuck_time = 0.0
+                self.stuck_ref = None
+                self._log("warn", "建图时同一处连续碰撞，就地倒退脱困")
+                return
         if (
             self.stuck_time > BUMP_STUCK_SECONDS
             and self.phase in self.BUMP_ESCAPE_PHASES
@@ -4770,8 +5020,13 @@ class TaskManager(object):
         if readings and v > 0.05:
             relative, distance = min(readings, key=lambda item: item[1])
             if distance < 0.30:
-                # 导航膨胀变小后规划路线会更贴墙，这里必须真的让开而不是只减速
-                return 0.0, world.clamp(w + (-1.4 if relative >= 0.0 else 1.4), -1.6, 1.6)
+                # 导航膨胀变小后规划路线会更贴墙，这里必须真的让开而不是只减速。
+                # 同样要防"期望角速度与避让方向抵消成 0"（见 _wall_guard）。
+                safe = -1.0 if relative >= 0.0 else 1.0
+                turned = world.clamp(w + safe * 1.4, -1.6, 1.6)
+                if turned * safe < WALL_GUARD_MIN_TURN:
+                    turned = WALL_GUARD_MIN_TURN * safe
+                return 0.0, turned
             if distance < 0.34:
                 v = min(v, 0.18)
                 w += -1.3 if relative >= 0.0 else 1.3

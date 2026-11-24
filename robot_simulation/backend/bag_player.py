@@ -33,6 +33,12 @@ REPLAY_TIME_RATE_MIN = 0.10
 REPLAY_TIME_RATE_MAX = 1.00
 REPLAY_TIME_LAG_GAIN = 1.60
 REPLAY_GAP_FREEZE = 0.80
+# 跟随误差连续超过这个量就把机器人直接摆回日志位姿。
+# 回放是"重现当时发生了什么"：四轮后驱车在急转、打滑、被卡住那几段本来就跟不住
+# （实测沿边被困那批日志偏差一路涨到 3.9 m，画出来的轨迹和地图完全对不上）。
+# 跟得住的日志不会触发（实测偏差 < 0.05 m），吻合度统计照常有意义。
+REPLAY_RESYNC_GAP = 0.20
+REPLAY_RESYNC_HOLD = 0.25
 # 位姿轨迹预处理：中值去毛刺 / 滑动平均 / 限速
 REPLAY_DESPIKE_RADIUS = 2
 REPLAY_SMOOTH_RADIUS = 2
@@ -358,6 +364,8 @@ class BagReplay(object):
         self.relocations = []
         self._bridges = []
         self._lag = 0.0
+        self._resync_hold = 0.0
+        self.resyncs = 0
         self._cut_index = 0
         self.scale = 1.0
         # 日志当时的墙钟时间起点（"世界时间"用它，不是仿真时钟）
@@ -841,6 +849,8 @@ class BagReplay(object):
         self.relocations = []
         self._bridges = []
         self._lag = 0.0
+        self._resync_hold = 0.0
+        self.resyncs = 0
         self._cut_index = 0
         self.alignment = "none"
         self.pose_frame = "local"
@@ -862,6 +872,7 @@ class BagReplay(object):
         self.time = time
         self.last_sample = -1.0
         self._lag = 0.0
+        self._resync_hold = 0.0
         self._cut_index = len([cut for cut in self.relocations if cut <= time])
         self.finished = False
         if reference is not None:
@@ -899,6 +910,24 @@ class BagReplay(object):
         gap = math.hypot(
             self.robot.pose[0] - current[0], self.robot.pose[1] - current[1]
         )
+        if gap > REPLAY_RESYNC_GAP:
+            self._resync_hold = getattr(self, "_resync_hold", 0.0) + dt
+            if self._resync_hold >= REPLAY_RESYNC_HOLD:
+                # 跟不住了：直接摆回日志位姿，保证画面上的轨迹就是日志轨迹
+                self._resync_hold = 0.0
+                self._lag = 0.0
+                self.robot.pose = [current[0], current[1], current[2]]
+                self.robot.v = 0.0
+                self.robot.w = 0.0
+                self.robot.target_v = 0.0
+                self.robot.target_w = 0.0
+                # 不计进 teleports：那个计数是"日志自己发生重定位"，界面据此画红色
+                # 跳线；这里只是仿真跟不上了，画红跳线反而让人以为日志有跳变。
+                self.resyncs += 1
+                self._sample(force=True)
+                return 0.0, 0.0
+        else:
+            self._resync_hold = 0.0
         rate = _clamp(
             1.0 - REPLAY_TIME_LAG_GAIN * self._lag,
             REPLAY_TIME_RATE_MIN,

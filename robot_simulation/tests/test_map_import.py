@@ -96,6 +96,56 @@ class OpenFieldTest(unittest.TestCase):
         self.assertGreater(huge["width"], small["width"])
         self.assertGreaterEqual(huge["width"], 180.0)
 
+    def test_open_field_matches_raster_pipeline(self):
+        """空白场地直接按矩形构造：结果必须和"栅格 → 提边界 → 简化"那套完全一致。
+
+        100 万格的空白栅格跑一遍通用流程要 4 s，连续播包切到无图日志时界面就卡在
+        这一次上，所以改成了几何直出；字段值必须一模一样，否则场地尺寸/边缘会漂。
+        """
+
+        def legacy(span_x, span_y):
+            width = max(
+                map_import.OPEN_FIELD_MIN, float(span_x) + map_import.OPEN_FIELD_MARGIN
+            )
+            height = max(
+                map_import.OPEN_FIELD_MIN, float(span_y) + map_import.OPEN_FIELD_MARGIN
+            )
+            cols = max(8, int(round(width / world.CELL)))
+            rows = max(8, int(round(height / world.CELL)))
+            raw = bytearray([254]) * (cols * rows)
+            tag = "{}x{}".format(round(width, 1), round(height, 1))
+            definition = map_import._definition(
+                cols,
+                rows,
+                raw,
+                world.CELL,
+                "probe",
+                source_path="bag:open:{}".format(tag),
+                map_file="open:{}".format(tag),
+                max_extent=max(width, height) + 1.0,
+            )
+            definition["name"] = "probe"
+            definition["open_field"] = True
+            cx = round(definition["width"] / 2.0, 3)
+            cy = round(definition["height"] / 2.0, 3)
+            definition["dock"] = {"x": cx, "y": cy, "r": 0.45}
+            definition["start"] = {"x": cx, "y": cy, "theta": 0.0}
+            return definition
+
+        for span in ((0.0, 0.0), (0.2, 0.3), (28.0, 4.0), (86.0, 86.0)):
+            expected = legacy(*span)
+            got = map_import.build_open_field(*span, name="probe")
+            self.assertEqual(got["width"], expected["width"], "span {}".format(span))
+            self.assertEqual(got["height"], expected["height"], "span {}".format(span))
+            self.assertEqual(
+                [tuple(round(v, 4) for v in point) for point in got["polygon"]],
+                [tuple(round(v, 4) for v in point) for point in expected["polygon"]],
+                "span {}".format(span),
+            )
+            self.assertEqual(got["import_meta"], expected["import_meta"])
+            self.assertEqual(got["dock"], expected["dock"])
+            self.assertEqual(got["start"], expected["start"])
+
 
 if __name__ == "__main__":
     unittest.main()

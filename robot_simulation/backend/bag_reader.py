@@ -11,6 +11,7 @@
 
 import datetime
 import glob
+import hashlib
 import math
 import os
 import re
@@ -28,6 +29,13 @@ TF_POSE_CHILDREN = ("base_link1", "base_link", "base_car_link", "wio_link_local"
 TF_MIN_SPAN = 2.0
 TF_MIN_FREE_RATIO = 0.90
 TF_MAX_WINDOW_GAP = 0.60
+# "窗口中心 ≈ 位姿"到这个精度就是硬证据：代价地图窗口是**以车为中心**发布的，
+# 只有真正的机器人位姿才会和窗口中心重合（实测正确的那一帧 0.01~0.05 m，
+# 其它孩子帧 1.3~70 m）。拿到这种证据时不再看"轨迹落在地图自由格"的比例——
+# 有些日志的 whole_map 里未探明区域也是 100（和占据同值），拿自由格比例判会把
+# 正确的 tf 位姿否掉（沿边被困那批日志就是这样：gap 0.01 却被 0.57 的自由率否死，
+# 退回局部坐标后轨迹和地图完全对不上）。
+TF_TIGHT_WINDOW_GAP = 0.25
 # 代价地图窗口"随车滚动"的判定：原点跨度超过这么多就算滚动窗口
 COSTMAP_MIN_ROLL = 1.0
 # 一帧代价地图至少要有这么多"非致命格"才算有内容（全致命 = 空窗口）
@@ -312,6 +320,17 @@ def _decode_grid(blob):
         "origin": (float(origin_x), float(origin_y)),
         "data": data[: width * height],
     }
+
+
+def _grid_signature(grid):
+    return (
+        round(grid["resolution"], 6),
+        grid["width"],
+        grid["height"],
+        round(grid["origin"][0], 3),
+        round(grid["origin"][1], 3),
+        hashlib.blake2b(grid["data"], digest_size=16).digest(),
+    )
 
 
 def encode_cells(data, width, height, step=1, kind="occupancy"):
@@ -976,9 +995,18 @@ def _tf_track(tracks):
         span = max(max(xs) - min(xs), max(ys) - min(ys))
         sample = points[:: max(1, len(points) // 200)]
         free_ratio = _free_ratio_of(grid, sample) if grid else None
+        gap = _window_gap(frames, points) if rolling else None
+        if gap is not None and gap <= TF_TIGHT_WINDOW_GAP and span >= TF_MIN_SPAN:
+            # 窗口中心与位姿几乎重合 + 真的在动：硬证据，直接认，
+            # **不再看"轨迹落在地图自由格"的比例**（有些日志的 whole_map 把未探明
+            # 区域也写成 100，和占据同值，用自由率判会把正确的 tf 位姿否掉）。
+            score = (2, free_ratio if free_ratio is not None else 1.0, span)
+            candidate = (score, name, span, free_ratio, gap)
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+            continue
         if free_ratio is not None and free_ratio < TF_MIN_FREE_RATIO:
             continue
-        gap = _window_gap(frames, points) if rolling else None
         if gap is not None and gap > TF_MAX_WINDOW_GAP:
             continue
         # 跨度只用来兜底：车没怎么动（被卡住/侧翻那几包）时 span≈0，但只要
@@ -1036,6 +1064,39 @@ def _free_ratio_of(grid, points):
         if 0 <= col < width and 0 <= row < height and data[row * width + col] < 50:
             inside += 1
     return inside / float(len(points))
+
+
+def _pick_whole_map(whole_maps, poses):
+    """从去重后的静态地图快照里选一帧。
+
+    同一 bag 的 `whole_map` 会发布几十到上百帧，其中混着内容不同的几帧（地图被重
+    新发布/合并）。按"占据格最多"挑会选中这些偶发帧：位姿（tf）其实没错，画出来
+    却是轨迹压在地图的占据区里。
+
+    * 有位姿坐标系（``poses`` 是地图坐标系位姿）时：先排除只发布过一次的偶发快照，
+      剩下的按"轨迹落在自由格的比例"取最优，同分看发布次数；
+    * 没有地图坐标系位姿时无法判断吻合度，取发布次数最多的那一帧。
+    """
+    if poses is None:
+        return max(whole_maps.values(), key=lambda entry: (entry[0], entry[1]))[2]
+    sample = poses[:: max(1, len(poses) // 200)]
+    scored = {
+        signature: (
+            entry[0],
+            _free_ratio_of(entry[2], sample),
+            sum(value < 50 for value in entry[2]["data"]),
+            entry[1],
+        )
+        for signature, entry in whole_maps.items()
+    }
+    pool = {
+        signature: score for signature, score in scored.items() if score[0] > 1
+    } or scored
+    best_signature = max(
+        pool,
+        key=lambda signature: (pool[signature][1], pool[signature][0], pool[signature][2]),
+    )
+    return whole_maps[best_signature][2]
 
 
 def _window_gap(frames, points):
@@ -1120,6 +1181,8 @@ def read_bag(path):
             commands.append((float(timestamp), linear, angular))
 
         maps = {}
+        # whole_map 常发布几十到上百帧，先按内容去重（内存只跟"内容不同的帧数"走）
+        whole_maps = {}
         for topic in MAP_TOPICS:
             best = None
             frames = []
@@ -1129,13 +1192,25 @@ def read_bag(path):
                     continue
                 if topic == COSTMAP_TOPIC:
                     frames.append((float(timestamp), grid))
+                elif topic == "whole_map":
+                    signature = _grid_signature(grid)
+                    entry = whole_maps.get(signature)
+                    if entry is None:
+                        whole_maps[signature] = [1, float(timestamp), grid]
+                    else:
+                        entry[0] += 1
+                        entry[1] = float(timestamp)
                 elif best is None or grid["data"].count(100) >= best["data"].count(100):
-                    # 取占据最完整的一帧作为该日志的地图
+                    # 其他栅格话题沿用原有的代表帧选择方式
                     best = grid
             if topic == COSTMAP_TOPIC and frames:
                 maps[topic] = frames
             elif best is not None:
                 maps[topic] = best
+        if whole_maps:
+            # 先给 tf 位姿判据一帧代表地图（发布次数最多的那帧），挑位姿要用到它；
+            # 位姿定下来之后再用"谁和轨迹吻合"重选一次（见 _pick_whole_map）。
+            maps["whole_map"] = _pick_whole_map(whole_maps, None)
 
         # 地图坐标系下的真实位姿（tf_dynamic 的 world → base_link1）。
         # base_pose / odom_data 常常是另一套局部坐标系，用它们回放会把轨迹摆错地方、
@@ -1176,6 +1251,10 @@ def read_bag(path):
         pose_topic = "base_pose" if "base_pose" in tracks else "odom_data"
         poses = tracks[pose_topic]
         pose_frame = "local"
+    if whole_maps:
+        maps["whole_map"] = _pick_whole_map(
+            whole_maps, poses if pose_frame == "map" else None
+        )
     start = poses[0][0]
     try:
         images = _read_images(con, tables, start)

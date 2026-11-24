@@ -13,7 +13,7 @@ import config  # noqa: E402
 import map_editor  # noqa: E402
 import mow_report  # noqa: E402
 import world  # noqa: E402
-from grid_map import GridMap  # noqa: E402
+from grid_map import UNKNOWN, GridMap  # noqa: E402
 from robot_car import RobotCar  # noqa: E402
 import tasks  # noqa: E402
 from tasks import PLAN_STUCK_LIMIT, TaskManager  # noqa: E402
@@ -104,6 +104,120 @@ class MappingTaskTest(unittest.TestCase):
             x2, y2 = poses[(index + 1) % len(poses)]
             area += x1 * y2 - x2 * y1
         self.assertGreater(area, 0.0, "巡边方向应为逆时针")
+
+    def test_mapping_closes_wall_band_without_gap(self):
+        """建图收工时墙体带上不能留"小豁口"（界面上一眼能看到的那个洞）。
+
+        以前"缺口 ≥0.3 m 才算数、残留 <0.25 m 就收工"，1~2 格的缝永远补不上；
+        更隐蔽的是探明率按"隔壁有占据格就算探明"统计，这种缝明明是 UNKNOWN 却报
+        100%，于是收工、地图上破个洞。现在要求零残留，收工前再把小豁口补平。
+        """
+        for map_id in (1, 2, 3):
+            robot, grid, manager = make_system(map_id)
+            manager.start_mapping()
+            advance(manager, 1400.0, keep_battery=True)
+            self.assertEqual(manager.phase, "done", "map{}".format(map_id))
+            self.assertAlmostEqual(grid.boundary_discovery(), 1.0, places=6)
+            self.assertEqual(grid.boundary_gaps(max_gaps=8), [])
+            leftovers = [
+                (col, row)
+                for col, row in grid.wall_cells
+                if grid.data[grid.index(col, row)] == UNKNOWN
+            ]
+            self.assertEqual(leftovers, [], "map{} 墙体带还有洞".format(map_id))
+
+    def test_mapping_with_no_go_zone_does_not_stall(self):
+        """禁区贴着墙时：那段墙永远扫不到，建图要按"看不到"收尾，不能反复去补扫。
+
+        以前禁区挡住视线的那段墙会一直算"未探明"，机器人反复开过去补扫、
+        在墙角原地磨（实测 430~559 s、十几次碰撞，最后仍停在 96%）。
+        """
+        world.clear_edits()
+        world.select_map(1)
+        world.add_no_go_zone(3.0, 11.0, 8.0, 11.8)
+        robot = RobotCar()
+        grid = GridMap()
+        manager = TaskManager(robot, grid)
+        try:
+            manager.start_mapping()
+            # 自己推进：统计"多久没真正挪窝"——卡住就是这一项爆掉
+            stuck_longest = 0.0
+            anchor = None
+            held = 0.0
+            for index in range(int(900.0 / DT)):
+                if index % 50 == 0:
+                    robot.battery = 100.0
+                manager.tick(DT)
+                pose = (robot.pose[0], robot.pose[1])
+                if anchor is None or math.hypot(
+                    pose[0] - anchor[0], pose[1] - anchor[1]
+                ) > 0.5:
+                    anchor = pose
+                    held = 0.0
+                else:
+                    held += DT
+                stuck_longest = max(stuck_longest, held)
+                if manager.phase == "done":
+                    break
+            self.assertEqual(manager.phase, "done", "禁区挡住的墙不该把建图卡住")
+            # 不许长时间原地磨（以前会一动不动干等 229 s、在墙角反复转圈）
+            self.assertLess(stuck_longest, 20.0)
+            # 同一处最多原地打转两次
+            self.assertLessEqual(
+                max([site["count"] for site in manager.spin_sites] or [0]),
+                tasks.MAX_SPIN_EPISODES,
+            )
+        finally:
+            world.clear_edits()
+
+    def test_no_go_blocked_gap_is_not_counted_as_residual(self):
+        """禁区挡住视线的墙：不算"还没建完"，也不会反复去补扫。"""
+        robot, grid, manager = make_system(1)
+        world.select_map(1)
+        world.add_no_go_zone(3.0, 11.0, 8.0, 11.8)
+        try:
+            # 场地上沿 y≈12.0 那段墙全部未探明
+            gap = {"cells": 40, "run_m": 4.0, "x": 5.5, "y": 11.95}
+            self.assertTrue(manager._gap_blocked_by_no_go(gap))
+            # 换到没有禁区挡着的墙角（场地左下角）就不该判成"看不见"
+            world.clear_edits()
+            self.assertFalse(manager._gap_blocked_by_no_go(gap))
+        finally:
+            world.clear_edits()
+
+    def test_spin_site_is_blacklisted_after_two_episodes(self):
+        """同一处最多转两圈：第二次就把这一带拉黑，不再往回指目标。"""
+        robot, grid, manager = make_system(1)
+        site = (robot.pose[0] + 1.0, robot.pose[1])
+        # 第一次只是记一笔；第二次就拉黑这一带，并顺手丢掉指向这里的寻边/补扫目标
+        manager.map_fill_segments = [[site, (site[0] + 1.0, site[1])]]
+        manager.map_fill_target = site
+        self.assertFalse(manager._note_spin_site(site))
+        self.assertEqual(len(manager.map_fill_segments), 1)
+        self.assertTrue(manager._note_spin_site((site[0] + 0.1, site[1])))
+        self.assertTrue(manager._near_spin_site(site[0], site[1]))
+        self.assertFalse(manager._near_spin_site(site[0] + 6.0, site[1]))
+        self.assertIsNone(manager.map_fill_target)
+        self.assertEqual(manager.map_fill_segments, [])
+        # 拉黑后再转回同一处：计数不再增长（对用户就是"最多转两次"）
+        self.assertTrue(manager._note_spin_site(site))
+        self.assertTrue(manager._note_spin_site(site))
+        counts = [item["count"] for item in manager.spin_sites]
+        self.assertEqual(max(counts), tasks.MAX_SPIN_EPISODES)
+
+    def test_wall_guard_never_cancels_its_turn(self):
+        """期望角速度与避让方向相反时不能互相抵消成 0（那会让车原地不动）。"""
+        robot, grid, manager = make_system(1)
+        # 右侧贴墙：relative < 0
+        robot.vision = [(-0.4, 0.15), (0.3, 0.9)]
+        v, w = manager._wall_guard(0.45, -1.4)
+        self.assertEqual(v, 0.0)
+        self.assertGreater(w, 0.5, "必须真的往安全方向转，不能被 -1.4 抵消")
+        # 左侧贴墙：relative > 0，期望角速度也是负的（同方向）
+        robot.vision = [(0.4, 0.15), (-0.3, 0.9)]
+        v, w = manager._wall_guard(0.45, -1.4)
+        self.assertEqual(v, 0.0)
+        self.assertLess(w, -0.5)
 
     def test_mapping_low_battery_returns_to_breakpoint(self):
         robot, grid, manager = make_system()
